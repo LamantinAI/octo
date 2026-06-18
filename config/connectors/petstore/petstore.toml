@@ -1,0 +1,77 @@
+# Petstore — dynamic HTTP connector manifest.
+#
+# One file describes a whole multi-route REST API. Loaded by the
+# `octo-connector-http` crate via `HttpConnector::from_file("petstore.toml")`.
+# See research/drafts/petstore_case.md for the design rationale.
+
+# ── Header: shared API properties ─────────────────────────────────────────────
+
+[connector]
+id = "petstore"
+type = "http"
+base_url = "https://petstore3.swagger.io/api/v3"
+# Model schemas live next to this file; path is relative to the manifest.
+models_dir = "./models"
+
+[connector.auth]
+type = "api_key"
+header = "api-key"
+secret_var = "${secret.petstore_key}"
+
+[connector.retry]
+max_attempts = 3
+backoff_initial_ms = 500
+backoff_max_ms = 5000
+# Only these statuses retry; everything else surfaces as petstore.event.error.
+retry_on_status = [429, 502, 503, 504]
+
+[connector.timeout]
+request_ms = 10000
+
+# ── Outbound endpoints (CQRS: cmd_kind → HTTP → response_kind) ─────────────────
+
+[[connector.endpoint]]
+cmd_kind = "petstore.cmd.add_pet"
+method = "POST"
+path = "/pet"
+request_schema = "pet"
+response_kind = "petstore.event.pet_added"
+response_schema = "pet"
+
+[[connector.endpoint]]
+cmd_kind = "petstore.cmd.fetch_pet"
+method = "GET"
+path = "/pet/{petId}"
+# {petId} is pulled from the command payload by JSONPath.
+path_params = { petId = "$.id" }
+response_kind = "petstore.event.pet_fetched"
+response_schema = "pet"
+
+[[connector.endpoint]]
+cmd_kind = "petstore.cmd.find_pets_by_status"
+method = "GET"
+path = "/pet/findByStatus"
+query_params = { status = "$.status" }
+response_kind = "petstore.event.pets_found"
+response_schema = "pet_array"
+
+[[connector.endpoint]]
+cmd_kind = "petstore.cmd.update_pet"
+method = "PUT"
+path = "/pet"
+request_schema = "pet"
+response_kind = "petstore.event.pet_updated"
+response_schema = "pet"
+
+[[connector.endpoint]]
+cmd_kind = "petstore.cmd.delete_pet"
+method = "DELETE"
+path = "/pet/{petId}"
+path_params = { petId = "$.id" }
+response_kind = "petstore.event.pet_deleted"
+# No response_schema → DELETE has no useful body → payload = null.
+
+# ── Secrets ───────────────────────────────────────────────────────────────────
+
+[connector.secrets]
+petstore_key = { env = "PETSTORE_API_KEY" }

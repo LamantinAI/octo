@@ -1,0 +1,24 @@
+[package]
+name = "octo-connector-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Dynamic, TOML-configured HTTP connector for the Octo runtime — one crate, many instances. Describes a whole multi-route REST API (endpoints, JSONPath path/query params, JSON-schema models) declaratively, no Rust code per integration."
+
+[dependencies]
+octo-core = { path = "../../octo-core" }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# A dependency-free tokio mock HTTP server is used in tests; needs net + io-util.
+tokio = { workspace = true, features = ["net", "io-util", "rt-multi-thread", "macros"] }

@@ -1,0 +1,7 @@
+# Test fixture manifest — drives the config-driven round-trip test.
+[runtime]
+bus_capacity = 32
+config_reload = "manual"
+
+[connectors]
+dir = "./connectors/"

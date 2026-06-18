@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pet",
+  "type": "object",
+  "required": ["name", "photoUrls"],
+  "properties": {
+    "id":        { "type": "integer", "format": "int64", "example": 10 },
+    "name":      { "type": "string", "example": "doggie" },
+    "category":  { "$ref": "category.json" },
+    "photoUrls": { "type": "array", "items": { "type": "string" } },
+    "tags":      { "type": "array", "items": { "$ref": "tag.json" } },
+    "status":    { "type": "string", "enum": ["available", "pending", "sold"] }
+  }
+}

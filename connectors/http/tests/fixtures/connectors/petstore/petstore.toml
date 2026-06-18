@@ -1,0 +1,26 @@
+# Test fixture: base_url comes from an env var so the test can point it at a
+# local mock server. Subset of the real config/ manifest (no models needed here).
+[connector]
+id = "petstore"
+type = "http"
+base_url = "${env.OCTO_HTTP_TEST_BASE}"
+
+[[connector.endpoint]]
+cmd_kind = "petstore.cmd.find_pets_by_status"
+method = "GET"
+path = "/pet/findByStatus"
+query_params = { status = "$.status" }
+response_kind = "petstore.event.pets_found"
+
+[[connector.endpoint]]
+cmd_kind = "petstore.cmd.add_pet"
+method = "POST"
+path = "/pet"
+response_kind = "petstore.event.pet_added"
+
+[[connector.endpoint]]
+cmd_kind = "petstore.cmd.delete_pet"
+method = "DELETE"
+path = "/pet/{petId}"
+path_params = { petId = "$.id" }
+response_kind = "petstore.event.pet_deleted"

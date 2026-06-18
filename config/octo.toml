@@ -1,0 +1,29 @@
+# Main runtime manifest.
+#
+# Loaded by `OctoBuilder::from_config_file("config/octo.toml")`: applies
+# [runtime], scans [connectors], and instantiates each dyn connector via its
+# registered factory (`register_connector_type("http", octo_connector_http::factory())`).
+#
+# `config_reload = "manual"` = read once at startup. "file_watch" (hot-reload
+# watcher) is a later step.
+
+[runtime]
+bus_capacity = 1024
+config_reload = "manual"   # "file_watch" once the watcher lands
+
+# Declarative routing table — the *hard* layer. `predicate (when) → action (then)`
+# as data. Content-aware routing stays the cogitator's job (see router.md).
+# No active routes shipped here; example syntax:
+#
+# [[router.routes]]
+# id = "incident_to_telegram"
+# priority = "high"            # high | normal | low
+# strategy = "terminate"      # terminate | enrich | observe
+# when = { kind = "vision.incident.*", tags_required = { severity = "high" } }
+# then = { target = "telegram_main", override_kind = "alert.telegram", copy_payload = true }
+[router]
+strict = false
+
+# Dynamic connectors: every connectors/<id>/<id>.toml folder is one instance.
+[connectors]
+dir = "./connectors/"

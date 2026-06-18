@@ -1,0 +1,23 @@
+[package]
+name = "octo-connector-petstore"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Testbed binary connector against petstore3.swagger.io for octo runtime — exercises request/response, correlation, and error patterns for future Telegram/SMTP-style connectors."
+
+[dependencies]
+octo-core = { path = "../../octo-core" }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# Dependency-free tokio mock HTTP server for deterministic round-trip tests.
+tokio = { workspace = true, features = ["net", "io-util", "rt-multi-thread", "macros"] }

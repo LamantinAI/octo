@@ -1,0 +1,11 @@
+# Fixture: a runtime whose only config is a declarative router table.
+# No [connectors] — the emitter/subscriber are added in code by the test.
+[runtime]
+bus_capacity = 32
+
+[[router.routes]]
+id = "incident_to_alerter"
+priority = "high"
+strategy = "terminate"
+when = { kind = "vision.incident.*" }
+then = { target = "alerter", override_kind = "alert.text", copy_payload = true }
