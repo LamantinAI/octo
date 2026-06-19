@@ -73,7 +73,10 @@ impl HttpConnector {
 
         let capabilities = ConnectorCapabilities::output_only()
             .with_accept_kinds(accept_kinds)
-            .with_emit_kinds(emit_kinds);
+            .with_emit_kinds(emit_kinds)
+            // Advertise as an agent-callable tool: the command kinds + payload
+            // fields, so the runtime's introspection surfaces it to a cogitator.
+            .with_description(catalog(&spec));
 
         Arc::new(Self {
             id,
@@ -448,6 +451,42 @@ fn envelope_field(envelope: &Envelope, field: &str) -> Option<String> {
         "target" => envelope.target.as_ref().map(|t| t.as_str().to_string()),
         _ => None,
     }
+}
+
+/// Build the agent-facing tool description from the spec: one line per command
+/// kind with the payload fields the LLM must fill (derived from the endpoints'
+/// JSONPath path/query params, or "object" for body endpoints). Surfaced via
+/// [`ConnectorCapabilities::description`] so the runtime's introspection makes
+/// the connector visible to a cogitator without per-agent wiring.
+fn catalog(spec: &HttpSpec) -> String {
+    spec.endpoints
+        .iter()
+        .map(|ep| {
+            let mut fields: Vec<String> = ep
+                .path_params
+                .values()
+                .chain(ep.query_params.values())
+                .filter_map(|jp| jp.as_str().strip_prefix("$.").map(|s| s.to_string()))
+                .collect();
+            fields.sort();
+            fields.dedup();
+
+            let payload = if ep.method.has_body() {
+                if fields.is_empty() {
+                    "a JSON object with the resource fields".to_string()
+                } else {
+                    format!("a JSON object with {}", fields.join(", "))
+                }
+            } else if fields.is_empty() {
+                "{} (no fields)".to_string()
+            } else {
+                fields.join(", ")
+            };
+
+            format!("    {} — payload: {}", ep.cmd_kind.as_str(), payload)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Minimal percent-encoding for path segments (RFC 3986 unreserved set is left

@@ -4,6 +4,13 @@ members = [
     "octo-core",
     "connectors/petstore",
     "connectors/http",
+    "octo-rig",
+]
+# Keep `cargo test` (no --workspace) light — octo-rig pulls the rig/LLM tree.
+default-members = [
+    "octo-core",
+    "connectors/petstore",
+    "connectors/http",
 ]
 
 [workspace.package]

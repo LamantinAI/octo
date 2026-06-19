@@ -53,6 +53,14 @@ pub trait Connector: Send + Sync + 'static {
     /// gracefully on cancellation.
     async fn run(self: Arc<Self>, ctx: ConnectorContext) -> OctoResult<()>;
 
+    /// Restart policy the runtime's supervisor applies when this connector's
+    /// `run` returns an error or panics. Default: exponential backoff with no
+    /// attempt limit — keep an always-on connector trying. A clean exit
+    /// (`Ok(())`, e.g. on shutdown) is never restarted.
+    fn restart_policy(&self) -> RestartPolicy {
+        RestartPolicy::default()
+    }
+
     /// Register this connector's payload kinds (and any schemas) in the shared
     /// [`PayloadRegistry`](crate::PayloadRegistry). Builder-style: consumes and
     /// returns the registry. Default is a no-op so existing connectors need no
@@ -127,6 +135,11 @@ pub struct ConnectorCapabilities {
     pub query: bool,
     /// Replay support.
     pub replay: ReplayMode,
+    /// Human/LLM-facing description of what this connector offers as an
+    /// agent-callable tool (e.g. its command kinds and payload fields). When
+    /// `Some`, the connector opts into the cogitator's env-as-tools catalog;
+    /// `None` means "not an agent tool" (e.g. a user chat channel).
+    pub description: Option<String>,
 }
 
 impl ConnectorCapabilities {
@@ -183,6 +196,13 @@ impl ConnectorCapabilities {
 
     pub fn with_replay(mut self, replay: ReplayMode) -> Self {
         self.replay = replay;
+        self
+    }
+
+    /// Advertise this connector to the agent's env-as-tools catalogue with a
+    /// description of how to call it (command kinds, payload fields).
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
         self
     }
 }

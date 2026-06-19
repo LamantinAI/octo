@@ -12,6 +12,7 @@
 //!
 //! See `runtime_architecture` and `envelope_decision` vault drafts.
 
+pub mod blob;
 pub mod kind;
 pub mod metadata;
 pub mod payload;
@@ -19,6 +20,7 @@ pub mod registry;
 pub mod stream;
 pub mod trail;
 
+pub use blob::Blob;
 pub use kind::EventKind;
 pub use metadata::{ChannelMetadata, Priority, ReplyChannel, TrustLevel};
 pub use payload::Payload;

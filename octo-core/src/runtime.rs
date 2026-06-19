@@ -15,14 +15,18 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
+use futures::FutureExt;
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     bus::{EventBus, Filter, InProcessBus, Subscription},
     config::{self, ConfigError, ConnectorFactory},
-    Cogitator, CogitatorContext, Connector, ConnectorContext, EmptyCogitator, OctoResult,
-    PayloadRegistry, Router, RouterContext, SubscribeOptions,
+    control, Cogitator, CogitatorContext, Connector, ConnectorContext, ConnectorInfo,
+    EmptyCogitator, OctoResult, PayloadRegistry, RestartPolicy, Router, RouterContext,
+    SubscribeOptions,
 };
 
 /// The runtime — owns the in-process bus, the cogitator, the optional router
@@ -91,7 +95,16 @@ impl Octo {
             let id = cog.id().to_string();
             let cog_filter = cog.filter();
             let cog_sub = self.bus.subscribe_sync(cog_filter);
-            let cog_ctx = CogitatorContext::new(self.shutdown.clone(), Arc::clone(&self.bus));
+            let connectors_info: Vec<ConnectorInfo> = self
+                .connectors
+                .iter()
+                .map(|c| ConnectorInfo {
+                    id: c.id().clone(),
+                    capabilities: c.capabilities().clone(),
+                })
+                .collect();
+            let cog_ctx =
+                CogitatorContext::new(self.shutdown.clone(), Arc::clone(&self.bus), connectors_info);
 
             tokio::spawn(async move {
                 if let Err(e) = cog.run(cog_ctx, cog_sub).await {
@@ -116,18 +129,63 @@ impl Octo {
             })
         });
 
-        // 3) Spawn connectors.
+        // 3) Per-connector restart signals + a control-plane listener: an
+        //    inhabitant emits octo.control.* to restart a connector or the
+        //    whole process. The environment carries it out.
+        let restart_notifies: HashMap<String, Arc<Notify>> = self
+            .connectors
+            .iter()
+            .map(|c| (c.id().as_str().to_string(), Arc::new(Notify::new())))
+            .collect();
+
+        let ctrl_handle = {
+            let mut ctrl_sub = self.bus.subscribe_sync(Filter::by_kind(control::CONTROL_GLOB));
+            let ctrl_shutdown = self.shutdown.clone();
+            let notifies = restart_notifies.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        next = ctrl_sub.next() => match next {
+                            Some(env) => match env.kind.as_str() {
+                                control::RESTART_CONNECTOR => {
+                                    if let Some(id) = env.payload_as::<String>() {
+                                        match notifies.get(id) {
+                                            Some(n) => {
+                                                tracing::info!(connector = %id, "control: restart_connector");
+                                                n.notify_one();
+                                            }
+                                            None => tracing::warn!(connector = %id, "control: restart_connector for unknown connector"),
+                                        }
+                                    }
+                                }
+                                control::RESTART_PROCESS => {
+                                    tracing::info!("control: restart_process → graceful shutdown");
+                                    ctrl_shutdown.cancel();
+                                    return;
+                                }
+                                _ => {}
+                            },
+                            None => return,
+                        },
+                        _ = ctrl_shutdown.cancelled() => return,
+                    }
+                }
+            })
+        };
+
+        // 4) Spawn connectors under supervision — restart on failure/panic per
+        //    each connector's RestartPolicy (clean exit is not restarted), and
+        //    on an explicit control restart signal.
         let mut conn_handles = Vec::with_capacity(self.connectors.len());
         for connector in &self.connectors {
             let conn = Arc::clone(connector);
-            let id = conn.id().clone();
-            let ctx = ConnectorContext::new(self.shutdown.clone(), Arc::clone(&self.bus));
-
-            conn_handles.push(tokio::spawn(async move {
-                if let Err(e) = conn.run(ctx).await {
-                    tracing::error!(connector = %id, error = %e, "connector failed");
-                }
-            }));
+            let shutdown = self.shutdown.clone();
+            let bus = Arc::clone(&self.bus);
+            let restart = restart_notifies
+                .get(conn.id().as_str())
+                .cloned()
+                .unwrap_or_else(|| Arc::new(Notify::new()));
+            conn_handles.push(tokio::spawn(supervise(conn, shutdown, bus, restart)));
         }
 
         // 4) Wait for connectors. They drive the lifecycle.
@@ -146,6 +204,9 @@ impl Octo {
         if let Some(h) = router_handle {
             let _ = h.await;
         }
+
+        // 8) Wait for the control listener.
+        let _ = ctrl_handle.await;
 
         Ok(())
     }
@@ -305,5 +366,85 @@ impl OctoBuilder {
 impl Default for OctoBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Supervise one connector. It is restarted on:
+/// - **failure / panic** — per its [`RestartPolicy`] (with backoff), and
+/// - an explicit **control restart** signal (`restart`) — gracefully (the
+///   connector's `ctx.shutdown` is cancelled so it can wind down), no backoff.
+///
+/// A clean `Ok(())` exit (e.g. on global shutdown) ends supervision. Global
+/// shutdown also ends it — no restart while the runtime is winding down.
+async fn supervise(
+    conn: Arc<dyn Connector>,
+    shutdown: CancellationToken,
+    bus: Arc<InProcessBus>,
+    restart: Arc<Notify>,
+) {
+    let id = conn.id().clone();
+    let policy = conn.restart_policy();
+    let mut attempt: u32 = 0;
+
+    loop {
+        attempt += 1;
+        // A child token so the connector stops on global shutdown OR on a
+        // control restart of just this connector.
+        let conn_token = shutdown.child_token();
+        let ctx = ConnectorContext::new(conn_token.clone(), Arc::clone(&bus));
+        let run_fut = std::panic::AssertUnwindSafe(Arc::clone(&conn).run(ctx)).catch_unwind();
+        tokio::pin!(run_fut);
+
+        tokio::select! {
+            outcome = &mut run_fut => {
+                if shutdown.is_cancelled() {
+                    return;
+                }
+                match outcome {
+                    Ok(Ok(())) => return, // clean exit — done.
+                    Ok(Err(e)) => tracing::error!(connector = %id, error = %e, "connector failed"),
+                    Err(_) => tracing::error!(connector = %id, "connector panicked"),
+                }
+                let (do_restart, delay_ms) = restart_decision(policy, attempt);
+                if !do_restart {
+                    tracing::warn!(connector = %id, attempts = attempt, "restart policy exhausted; giving up");
+                    return;
+                }
+                tracing::warn!(connector = %id, attempt, delay_ms, "restarting connector (failure)");
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+                    _ = shutdown.cancelled() => return,
+                }
+            }
+            _ = restart.notified() => {
+                // Intentional restart: cancel this run gracefully, let it finish.
+                tracing::info!(connector = %id, "restart requested via control");
+                conn_token.cancel();
+                let _ = run_fut.await;
+                if shutdown.is_cancelled() {
+                    return;
+                }
+                attempt = 0; // not a failure — reset the backoff counter.
+            }
+        }
+    }
+}
+
+/// `(should_restart, backoff_ms)` for an attempt under a policy.
+fn restart_decision(policy: RestartPolicy, attempt: u32) -> (bool, u64) {
+    match policy {
+        RestartPolicy::Never => (false, 0),
+        RestartPolicy::Always => (true, 0),
+        RestartPolicy::MaxAttempts(n) => (attempt < n, 0),
+        RestartPolicy::ExponentialBackoff {
+            initial_ms,
+            max_ms,
+            max_attempts,
+        } => {
+            let allowed = max_attempts.map_or(true, |m| attempt < m);
+            let shift = (attempt - 1).min(16);
+            let delay = initial_ms.saturating_mul(1u64 << shift).min(max_ms);
+            (allowed, delay)
+        }
     }
 }

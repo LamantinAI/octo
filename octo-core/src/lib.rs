@@ -19,6 +19,7 @@ pub mod bus;
 pub mod cogitator;
 pub mod config;
 pub mod connector;
+pub mod control;
 pub mod envelope;
 pub mod error;
 pub mod ids;
@@ -27,7 +28,7 @@ pub mod runtime;
 
 // Re-exports — keep the public surface flat for ergonomic `use octo_core::*`.
 pub use bus::{EventBus, Filter, InProcessBus, KindPattern, Subscription};
-pub use cogitator::{Cogitator, CogitatorContext, EmptyCogitator};
+pub use cogitator::{Cogitator, CogitatorContext, ConnectorInfo, EmptyCogitator};
 pub use config::{ConfigError, ConnectorFactory, FactoryContext};
 pub use connector::{
     BackpressureStrategy, ChannelDescriptor, Connector, ConnectorCapabilities, ConnectorContext,
@@ -35,7 +36,7 @@ pub use connector::{
     SubscribeOptions,
 };
 pub use envelope::{
-    ChannelMetadata, Envelope, EventKind, Payload, PayloadRegistry, Priority, RegistryEntry,
+    Blob, ChannelMetadata, Envelope, EventKind, Payload, PayloadRegistry, Priority, RegistryEntry,
     RegistryError, ReplyChannel, StreamFrame, TrailAction, TrailActor, TrailEntry, TrustLevel,
 };
 pub use error::{OctoError, OctoResult};
@@ -559,6 +560,127 @@ mod tests {
         let octo = Octo::builder().build();
         assert!(octo.router_id().is_none());
         octo.run().await.unwrap();
+    }
+
+    /// A connector that fails on its first run is restarted by the supervisor;
+    /// on the second run it exits cleanly and stops the runtime.
+    struct FlakyConnector {
+        id: ConnectorId,
+        capabilities: ConnectorCapabilities,
+        attempts: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    #[async_trait]
+    impl Connector for FlakyConnector {
+        fn id(&self) -> &ConnectorId {
+            &self.id
+        }
+        fn capabilities(&self) -> &ConnectorCapabilities {
+            &self.capabilities
+        }
+        fn restart_policy(&self) -> RestartPolicy {
+            // Fast backoff so the test doesn't wait.
+            RestartPolicy::ExponentialBackoff {
+                initial_ms: 10,
+                max_ms: 50,
+                max_attempts: None,
+            }
+        }
+        async fn run(self: Arc<Self>, ctx: ConnectorContext) -> OctoResult<()> {
+            let n = self.attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n == 1 {
+                return Err(OctoError::Connector("boom".into()));
+            }
+            // Recovered — wind the runtime down.
+            ctx.shutdown.cancel();
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn supervisor_restarts_failed_connector() {
+        let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let conn = Arc::new(FlakyConnector {
+            id: ConnectorId::new("flaky"),
+            capabilities: ConnectorCapabilities::input_only(),
+            attempts: Arc::clone(&attempts),
+        });
+
+        let octo = Octo::builder().add_connector(conn).build();
+        tokio::time::timeout(std::time::Duration::from_secs(5), octo.run())
+            .await
+            .expect("runtime should finish in time")
+            .expect("run ok");
+
+        assert!(
+            attempts.load(std::sync::atomic::Ordering::Relaxed) >= 2,
+            "connector should restart after failing once"
+        );
+    }
+
+    /// A connector that emits control signals: on its first run it requests its
+    /// own restart; on the second it requests a process restart (graceful
+    /// shutdown). Exercises both `octo.control.*` paths through the runtime.
+    struct SelfRestartConnector {
+        id: ConnectorId,
+        capabilities: ConnectorCapabilities,
+        attempts: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    #[async_trait]
+    impl Connector for SelfRestartConnector {
+        fn id(&self) -> &ConnectorId {
+            &self.id
+        }
+        fn capabilities(&self) -> &ConnectorCapabilities {
+            &self.capabilities
+        }
+        async fn run(self: Arc<Self>, ctx: ConnectorContext) -> OctoResult<()> {
+            let n = self.attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n == 1 {
+                // Restart just me.
+                ctx.publish(Envelope::new(
+                    self.id.clone(),
+                    EventKind::from_static(crate::control::RESTART_CONNECTOR),
+                    self.id.as_str().to_string(),
+                ))
+                .await?;
+            } else {
+                // Restart the whole process (graceful shutdown).
+                ctx.publish(Envelope::new(
+                    self.id.clone(),
+                    EventKind::from_static(crate::control::RESTART_PROCESS),
+                    (),
+                ))
+                .await?;
+            }
+            // Wait until the supervisor (or global shutdown) cancels us.
+            ctx.shutdown.cancelled().await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn control_signals_restart_connector_then_process() {
+        let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let conn = Arc::new(SelfRestartConnector {
+            id: ConnectorId::new("self_restart"),
+            capabilities: ConnectorCapabilities::input_only(),
+            attempts: Arc::clone(&attempts),
+        });
+
+        let octo = Octo::builder().bus_capacity(16).add_connector(conn).build();
+        tokio::time::timeout(std::time::Duration::from_secs(5), octo.run())
+            .await
+            .expect("runtime should finish in time")
+            .expect("run ok");
+
+        // First run → restart_connector → second run → restart_process → stop.
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "connector should run twice (restart_connector, then restart_process)"
+        );
     }
 
     /// Streaming protocol smoke-test: a connector emits 3 chunks of one stream

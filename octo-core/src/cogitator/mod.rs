@@ -23,8 +23,18 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     bus::{EventBus, Filter, InProcessBus, Subscription},
-    Envelope, OctoResult, SubscribeOptions,
+    ConnectorCapabilities, ConnectorId, Envelope, OctoResult, SubscribeOptions,
 };
+
+/// A runtime snapshot of one registered connector, handed to the cogitator so
+/// it can build its env-as-tools catalogue from the live runtime (not from
+/// hand-wiring). Connectors that set [`ConnectorCapabilities::description`]
+/// advertise themselves as agent-callable tools.
+#[derive(Debug, Clone)]
+pub struct ConnectorInfo {
+    pub id: ConnectorId,
+    pub capabilities: ConnectorCapabilities,
+}
 
 /// A cogitator — the actor inhabiting the cognition tier.
 ///
@@ -57,11 +67,33 @@ pub trait Cogitator: Send + Sync + 'static {
 pub struct CogitatorContext {
     pub shutdown: CancellationToken,
     bus: Arc<InProcessBus>,
+    connectors: Vec<ConnectorInfo>,
 }
 
 impl CogitatorContext {
-    pub fn new(shutdown: CancellationToken, bus: Arc<InProcessBus>) -> Self {
-        Self { shutdown, bus }
+    pub fn new(
+        shutdown: CancellationToken,
+        bus: Arc<InProcessBus>,
+        connectors: Vec<ConnectorInfo>,
+    ) -> Self {
+        Self {
+            shutdown,
+            bus,
+            connectors,
+        }
+    }
+
+    /// The connectors registered in the runtime — the cogitator's environment.
+    /// Build the env-as-tools catalogue from those with a `description`.
+    pub fn connectors(&self) -> &[ConnectorInfo] {
+        &self.connectors
+    }
+
+    /// A clone of the runtime's bus handle. Lets a cogitator hand dispatch
+    /// capability to a sub-component (e.g. an LLM tool that emits commands to
+    /// connectors and awaits the response).
+    pub fn bus(&self) -> Arc<InProcessBus> {
+        Arc::clone(&self.bus)
     }
 
     /// Publish an envelope onto the bus (typically the cogitator's
