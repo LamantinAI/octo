@@ -1,0 +1,17 @@
+[package]
+name = "octo-connector-telegram"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Bidirectional Telegram Bot API connector for the Octo runtime (teloxide long polling). Inbound messages → chat.message; chat.reply envelopes → Telegram text/photo/document."
+
+[dependencies]
+octo-core = { path = "../../octo-core" }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+teloxide = { workspace = true }

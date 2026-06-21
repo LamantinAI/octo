@@ -4,9 +4,12 @@ members = [
     "octo-core",
     "connectors/petstore",
     "connectors/http",
+    "connectors/telegram",
     "octo-rig",
+    "octolab",
 ]
-# Keep `cargo test` (no --workspace) light — octo-rig pulls the rig/LLM tree.
+# Keep `cargo test` (no --workspace) light — octo-rig/telegram/octolab pull the
+# rig/LLM and teloxide trees.
 default-members = [
     "octo-core",
     "connectors/petstore",
@@ -36,3 +39,4 @@ parking_lot = "0.12"
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 toml = "0.8"
+teloxide = "0.17"

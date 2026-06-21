@@ -1,0 +1,133 @@
+//! `octo-connector-telegram` — bidirectional connector over the Telegram Bot
+//! API (teloxide long polling).
+//!
+//! Speaks the runtime's generic chat shapes, so any cogitator works unchanged —
+//! only the `channel` carries transport detail: here it's the `chat_id`. Inbound
+//! text messages become `chat.message` (with `reply_to = chat_id`); `chat.reply`
+//! envelopes targeted at us are sent back to their `channel`'s chat (a `Blob`
+//! payload → photo/document, a `String` → text).
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use futures::StreamExt;
+use octo_core::{
+    Blob, ChannelId, Connector, ConnectorCapabilities, ConnectorContext, ConnectorId, Envelope,
+    EventKind, Filter, OctoResult, ReplyChannel, SubscribeOptions,
+};
+use teloxide::prelude::*;
+use teloxide::types::{ChatId, InputFile, UpdateKind};
+use teloxide::update_listeners::{polling_default, AsUpdateStream};
+
+pub struct TelegramConnector {
+    id: ConnectorId,
+    capabilities: ConnectorCapabilities,
+    token: String,
+}
+
+impl TelegramConnector {
+    pub fn new(id: impl Into<String>, token: impl Into<String>) -> Arc<Self> {
+        let capabilities = ConnectorCapabilities::bidirectional()
+            .with_emit_kinds([EventKind::from_static("chat.message")])
+            .with_accept_kinds([EventKind::from_static("chat.reply")]);
+        Arc::new(Self {
+            id: ConnectorId::new(id),
+            capabilities,
+            token: token.into(),
+        })
+    }
+}
+
+#[async_trait]
+impl Connector for TelegramConnector {
+    fn id(&self) -> &ConnectorId {
+        &self.id
+    }
+
+    fn capabilities(&self) -> &ConnectorCapabilities {
+        &self.capabilities
+    }
+
+    async fn run(self: Arc<Self>, ctx: ConnectorContext) -> OctoResult<()> {
+        let bot = Bot::new(self.token.clone());
+
+        // ── Outbound: chat.reply → Telegram message ──────────────────────────
+        let mut replies = ctx
+            .subscribe(Filter::by_target(self.id.clone()), SubscribeOptions::default())
+            .await?;
+        let out_bot = bot.clone();
+        let out_shutdown = ctx.shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    reply = replies.next() => match reply {
+                        Some(env) => {
+                            // The chat id rides on the envelope's channel.
+                            let Some(chat) = env.channel.as_ref().and_then(|c| c.as_str().parse::<i64>().ok()) else {
+                                tracing::warn!("chat.reply without a numeric channel; dropped");
+                                continue;
+                            };
+                            let chat_id = ChatId(chat);
+
+                            // A media payload → photo/document; a String → text.
+                            if let Some(blob) = env.payload_as::<Blob>() {
+                                let file = InputFile::memory(blob.bytes().clone())
+                                    .file_name(blob.filename().unwrap_or("file").to_string());
+                                let sent = if blob.is_image() {
+                                    out_bot.send_photo(chat_id, file).await.map(|_| ())
+                                } else {
+                                    out_bot.send_document(chat_id, file).await.map(|_| ())
+                                };
+                                match sent {
+                                    Ok(_) => tracing::info!(chat, ct = blob.content_type(), "sent media"),
+                                    Err(e) => tracing::warn!(error = %e, "telegram media send failed"),
+                                }
+                            } else if let Some(text) = env.payload_as::<String>() {
+                                match out_bot.send_message(chat_id, text.clone()).await {
+                                    Ok(_) => tracing::info!(chat, "sent reply"),
+                                    Err(e) => tracing::warn!(error = %e, "telegram send failed"),
+                                }
+                            }
+                        }
+                        None => break,
+                    },
+                    _ = out_shutdown.cancelled() => break,
+                }
+            }
+        });
+
+        // ── Inbound: long-poll updates → chat.message ────────────────────────
+        let mut listener = polling_default(bot.clone()).await;
+        let stream = listener.as_stream();
+        // PollingStream is !Unpin; pin it on the stack to poll in select!.
+        tokio::pin!(stream);
+        tracing::info!(connector = %self.id, "telegram polling started");
+        loop {
+            tokio::select! {
+                update = stream.next() => match update {
+                    Some(Ok(update)) => {
+                        if let UpdateKind::Message(msg) = update.kind {
+                            if let Some(text) = msg.text() {
+                                let chat = msg.chat.id.0.to_string();
+                                tracing::info!(%chat, "recv: {text}");
+                                let env = Envelope::new(
+                                    self.id.clone(),
+                                    EventKind::from_static("chat.message"),
+                                    text.to_string(),
+                                )
+                                .with_channel(ChannelId::new(chat.clone()))
+                                .with_reply_to(ReplyChannel::new(ChannelId::new(chat)));
+                                if let Err(e) = ctx.publish(env).await {
+                                    tracing::warn!(error = %e, "failed to publish chat.message");
+                                }
+                            }
+                        }
+                    }
+                    Some(Err(e)) => tracing::warn!(error = %e, "telegram update error"),
+                    None => return Ok(()),
+                },
+                _ = ctx.shutdown.cancelled() => return Ok(()),
+            }
+        }
+    }
+}
