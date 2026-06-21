@@ -53,7 +53,8 @@ dot-namespaced with glob matching (`vision.**`, `mqtt.factory.*`). An optional
   pre-subscribes it so it observes every matching envelope. Perception scope is
   the cogitator's filter (narrow inbox → whole bus).
 - **Rule-based reflex routing** — `RuleBasedRouter` rewrites/targets envelopes
-  deterministically (e.g. `vision.incident.* → alerter`), recording its action in
+  deterministically (e.g. `vision.incident.* → alerter`) on kind/source/tag and
+  numeric JSON-payload predicates (e.g. `celsius > 80`), recording its action in
   the envelope's trail.
 - **Supervision + control-plane** — per-connector `RestartPolicy` with backoff and
   panic isolation, plus `octo.control.restart_connector` / `restart_process`
@@ -88,7 +89,9 @@ octo/                       ← workspace root
 ├── octo-rig/               ← a rig Tool bridging native LLM tool-calling → connector dispatch
 ├── connectors/
 │   ├── http/               ← dynamic, TOML-configured HTTP connector (one crate, many APIs)
+│   ├── mqtt/               ← MQTT subscriber: broker topics → envelopes (rumqttc)
 │   ├── petstore/           ← example HTTP connector instance
+│   ├── scheduler/          ← timer/scheduler: emits timer.tick / timer.fire (lives in time)
 │   └── telegram/           ← bidirectional Telegram connector (teloxide)
 └── octolab/                ← playground: a real ReAct LLM agent over the runtime
 ```
@@ -130,8 +133,12 @@ async fn main() -> OctoResult<()> {
 `octolab/` is the playground that exercises the runtime as a real online agent:
 a rig + OpenRouter ReAct cogitator with native tool-calling, the official Telegram
 connector (console fallback), env-as-tools dispatch to an HTTP connector, modular
-per-channel history, and configurable perception. It is excluded from
-`default-members`, so a plain `cargo test` stays light:
+per-channel history, and configurable perception. It also **lives in time and acts
+on its own initiative**: a scheduler connector emits `timer.fire`, and the
+cogitator escalates configured non-chat kinds (`OCTO_ACTIONABLE`) — e.g. a factory
+reading the reflex router rewrites to `sensor.anomaly` when out of range — into a
+proactive message. It is excluded from `default-members`, so a plain `cargo test`
+stays light:
 
 ```sh
 cargo test                 # kernel + light crates
