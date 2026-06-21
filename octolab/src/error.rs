@@ -14,6 +14,9 @@ pub enum Error {
     #[error("http connector spec: {0}")]
     HttpSpec(#[from] octo_connector_http::SpecError),
 
+    #[error("history: {0}")]
+    History(#[from] octo_history::HistoryError),
+
     #[error("llm client: {0}")]
     LlmClient(#[from] rig::http_client::Error),
 

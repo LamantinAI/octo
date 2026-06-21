@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "octo-core",
+    "octo-history",
     "connectors/petstore",
     "connectors/http",
     "connectors/telegram",
@@ -9,9 +10,10 @@ members = [
     "octolab",
 ]
 # Keep `cargo test` (no --workspace) light — octo-rig/telegram/octolab pull the
-# rig/LLM and teloxide trees.
+# rig/LLM and teloxide trees. octo-history is light, so it stays in the default set.
 default-members = [
     "octo-core",
+    "octo-history",
     "connectors/petstore",
     "connectors/http",
 ]
