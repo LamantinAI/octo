@@ -1,0 +1,23 @@
+[package]
+name = "octolab"
+version = "0.1.0"
+edition = "2021"
+description = "Playground for exercising the Octo runtime with a simple ReAct LLM agent (rig + OpenRouter) over the official Telegram connector (or console fallback)."
+
+[dependencies]
+octo-core = { path = "../octo-core" }
+octo-connector-http = { path = "../connectors/http" }
+octo-connector-telegram = { path = "../connectors/telegram" }
+octo-rig = { path = "../octo-rig" }
+tokio = { version = "1.40", features = ["full"] }
+async-trait = "0.1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenvy = "0.15"
+config = { version = "0.14", default-features = false }
+bytes = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+rig-core = "0.35"
