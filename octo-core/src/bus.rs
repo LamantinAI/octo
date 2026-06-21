@@ -4,16 +4,18 @@
 //! observability, cognition) read independently. The bus does not interpret
 //! envelopes — it only routes them by header fields.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
 
+use crate::bus_queue::SubscriberInner;
 use crate::{
-    ChannelId, ConnectorId, Envelope, EventId, EventKind, OctoError, OctoResult, PayloadRegistry,
-    SubscribeOptions,
+    BackpressureStrategy, ChannelId, ConnectorId, Envelope, EventId, EventKind, OctoError,
+    OctoResult, PayloadRegistry, SubscribeOptions,
 };
 
 /// Abstraction over the in-process bus — the medium between connector actors
@@ -212,61 +214,72 @@ impl From<EventKind> for KindPattern {
 
 /// Subscriber-side stream over filtered envelopes.
 ///
-/// Returned by [`EventBus::subscribe`]. Drop to unsubscribe.
+/// Returned by [`EventBus::subscribe`]. Each subscription has its own bounded
+/// intake whose overflow behaviour is set by [`SubscribeOptions::backpressure`].
+/// Drop to unsubscribe — the bus prunes the slot on its next publish and any
+/// publisher blocked on this subscriber (under `Block`) is released.
 pub struct Subscription {
-    rx: broadcast::Receiver<Arc<Envelope>>,
-    filter: Filter,
+    inner: Arc<SubscriberInner>,
 }
 
 impl Subscription {
-    /// Receive the next matching envelope. Returns `None` when the bus closes.
+    /// Receive the next matching envelope. Returns `None` once the subscription
+    /// is closed (dropped or bus shutdown) and drained.
     ///
-    /// On lag (subscriber fell behind broadcast capacity) the lagged events
-    /// are silently skipped; this matches `DropOldest` semantics in
-    /// `tokio::sync::broadcast`. More elaborate per-subscriber backpressure
-    /// modes are not yet wired in the in-process impl — see TODO in `InProcessBus`.
+    /// Envelopes are pre-filtered at publish time, so every value returned here
+    /// already matches [`filter`](Self::filter). If this subscriber fell behind
+    /// under a lossy strategy, the lag is counted in [`dropped_count`](Self::dropped_count)
+    /// and warned about — never silently swallowed.
     pub async fn next(&mut self) -> Option<Arc<Envelope>> {
-        loop {
-            match self.rx.recv().await {
-                Ok(env) => {
-                    if self.filter.matches(&env) {
-                        return Some(env);
-                    }
-                }
-                Err(broadcast::error::RecvError::Closed) => return None,
-                Err(broadcast::error::RecvError::Lagged(_skipped)) => {
-                    // TODO: surface lag count via tracing / metrics
-                    continue;
-                }
-            }
-        }
+        self.inner.pop().await
     }
 
     pub fn filter(&self) -> &Filter {
-        &self.filter
+        &self.inner.filter
+    }
+
+    /// Number of envelopes dropped for this subscriber because its buffer was
+    /// full (always `0` under [`BackpressureStrategy::Block`]).
+    pub fn dropped_count(&self) -> u64 {
+        self.inner.dropped_count()
     }
 }
 
-/// In-process event bus — `tokio::sync::broadcast` based.
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        self.inner.close();
+    }
+}
+
+/// In-process event bus — a registry of per-subscriber bounded queues.
 ///
 /// The bus is the medium between actors inside the runtime ("бульон с веществами").
 /// Not a transport abstraction — distributed messaging is explicitly out of scope.
 ///
-/// TODO: per-subscriber backpressure modes from [`SubscribeOptions`] are not
-/// yet honored — broadcast inherently has drop-oldest semantics on lag; `Block`
-/// / `Throttle` / `Steer` need a shim layer with per-subscriber mpsc fan-out.
+/// `publish` is the fan-out pump: it snapshots the live subscribers whose
+/// [`Filter`] matches and pushes a shared `Arc<Envelope>` into each one's intake,
+/// applying that subscriber's [`BackpressureStrategy`] on overflow. A `Block`
+/// subscriber backpressures the *publishing task*; lossy subscribers drop and
+/// count it (see [`Subscription::dropped_count`]).
+///
+/// Supported strategies: `DropOldest`, `DropNewest`, `Block`. `Throttle` and
+/// `Steer` are accepted but downgraded to `DropOldest` (with a warning) until
+/// implemented.
 pub struct InProcessBus {
-    sender: broadcast::Sender<Arc<Envelope>>,
+    subscribers: Mutex<Vec<Arc<SubscriberInner>>>,
+    /// Default intake buffer for subscribers that don't set one explicitly
+    /// (e.g. the runtime's pre-subscribed cogitator/router/control).
     capacity: usize,
+    next_id: AtomicU64,
     registry: Option<Arc<PayloadRegistry>>,
 }
 
 impl InProcessBus {
     pub fn new(capacity: usize) -> Self {
-        let (sender, _) = broadcast::channel(capacity);
         Self {
-            sender,
-            capacity,
+            subscribers: Mutex::new(Vec::new()),
+            capacity: capacity.max(1),
+            next_id: AtomicU64::new(0),
             registry: None,
         }
     }
@@ -279,26 +292,48 @@ impl InProcessBus {
         self
     }
 
+    /// Default intake buffer size for subscribers created without explicit opts.
     pub fn capacity(&self) -> usize {
         self.capacity
     }
 
+    /// Number of live (not-yet-dropped) subscriptions.
     pub fn subscriber_count(&self) -> usize {
-        self.sender.receiver_count()
+        let mut subs = self.subscribers.lock();
+        subs.retain(|s| !s.is_closed());
+        subs.len()
     }
 
     pub fn registry(&self) -> Option<&Arc<PayloadRegistry>> {
         self.registry.as_ref()
     }
 
+    /// Register a new subscriber slot and return its [`Subscription`]. Shared by
+    /// the sync and async subscribe paths.
+    fn register(&self, filter: Filter, opts: SubscribeOptions) -> Subscription {
+        let strategy = effective_strategy(opts.backpressure);
+        let buffer = opts.buffer.max(1);
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let inner = SubscriberInner::new(id, filter, strategy, buffer);
+        self.subscribers.lock().push(Arc::clone(&inner));
+        Subscription { inner }
+    }
+
     /// Synchronously create a subscription. Useful when a subscriber needs
     /// to register **before** any publisher starts emitting (e.g. the runtime
-    /// pre-subscribes the cogitator before spawning connector tasks).
+    /// pre-subscribes the cogitator before spawning connector tasks). Uses the
+    /// default backpressure strategy with the bus's default buffer size.
     pub fn subscribe_sync(&self, filter: Filter) -> Subscription {
-        Subscription {
-            rx: self.sender.subscribe(),
+        self.subscribe_sync_with(
             filter,
-        }
+            SubscribeOptions::default().with_buffer(self.capacity),
+        )
+    }
+
+    /// As [`subscribe_sync`](Self::subscribe_sync), but with explicit options
+    /// (buffer size / backpressure strategy).
+    pub fn subscribe_sync_with(&self, filter: Filter, opts: SubscribeOptions) -> Subscription {
+        self.register(filter, opts)
     }
 }
 
@@ -309,21 +344,56 @@ impl EventBus for InProcessBus {
             // Validation errors are hard — caller should fix the mismatch.
             reg.validate(&envelope)?;
         }
-        // `send` returns Err only if there are zero receivers — that's not an
-        // error for a fanout bus (events with no subscribers are silently dropped).
-        let _ = self.sender.send(Arc::new(envelope));
+        let env = Arc::new(envelope);
+
+        // Snapshot the matching, live subscribers and prune dead slots — all
+        // under the lock — then release it before any push so a `Block`
+        // subscriber can never stall the registry or other publishers'
+        // enumeration. A push to a zero-subscriber bus is a no-op, not an error.
+        let targets: Vec<Arc<SubscriberInner>> = {
+            let mut subs = self.subscribers.lock();
+            subs.retain(|s| !s.is_closed());
+            subs.iter()
+                .filter(|s| s.filter.matches(&env))
+                .cloned()
+                .collect()
+        };
+
+        for target in targets {
+            // Outcome is advisory: drops are counted inside the subscriber, and a
+            // `Closed` slot is reaped on the next publish's retain.
+            let _ = target.push(Arc::clone(&env)).await;
+        }
         Ok(())
     }
 
-    async fn subscribe(
-        &self,
-        filter: Filter,
-        _opts: SubscribeOptions,
-    ) -> OctoResult<Subscription> {
-        // TODO: opts ignored — see struct-level TODO.
-        Ok(Subscription {
-            rx: self.sender.subscribe(),
-            filter,
-        })
+    async fn subscribe(&self, filter: Filter, opts: SubscribeOptions) -> OctoResult<Subscription> {
+        Ok(self.register(filter, opts))
+    }
+}
+
+impl Drop for InProcessBus {
+    fn drop(&mut self) {
+        // Closing each subscriber makes a parked `Subscription::next` return
+        // `None` (preserving the old "bus closed → stream ends" semantics) and
+        // releases any publisher blocked on a `Block` subscriber.
+        for s in self.subscribers.lock().iter() {
+            s.close();
+        }
+    }
+}
+
+/// Map a requested strategy to one the in-process bus implements, warning once
+/// when a not-yet-supported mode is downgraded.
+fn effective_strategy(requested: BackpressureStrategy) -> BackpressureStrategy {
+    match requested {
+        BackpressureStrategy::Throttle { .. } | BackpressureStrategy::Steer => {
+            tracing::warn!(
+                requested = ?requested,
+                "backpressure strategy not yet implemented by InProcessBus; using DropOldest"
+            );
+            BackpressureStrategy::DropOldest
+        }
+        other => other,
     }
 }

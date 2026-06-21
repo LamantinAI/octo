@@ -16,6 +16,7 @@
 
 // Top-level groups (logical clusters)
 pub mod bus;
+mod bus_queue;
 pub mod cogitator;
 pub mod config;
 pub mod connector;
@@ -936,5 +937,168 @@ mod tests {
         assert_eq!(response.correlation_id, Some(request_id));
         assert_eq!(response.kind.as_str(), "test.event.done");
         assert_eq!(response.payload_as::<String>(), Some(&"real".to_string()));
+    }
+
+    // ─── Per-subscriber backpressure ───────────────────────────────────────
+
+    /// An envelope tagged with a sequence number, for asserting which survived.
+    fn seq_env(n: i32) -> Envelope {
+        Envelope::new(ConnectorId::new("src"), EventKind::from_static("bp.seq"), n)
+    }
+    fn seq_of(env: &Arc<Envelope>) -> i32 {
+        *env.payload_as::<i32>().expect("i32 payload")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn drop_newest_drops_arrivals_without_blocking() {
+        let bus = InProcessBus::new(16);
+        let mut sub = bus
+            .subscribe(
+                Filter::all(),
+                SubscribeOptions::default()
+                    .with_backpressure(BackpressureStrategy::DropNewest)
+                    .with_buffer(2),
+            )
+            .await
+            .unwrap();
+
+        // Buffer holds 2; the next 3 arrivals are dropped. None of these block.
+        for i in 0..5 {
+            bus.publish(seq_env(i)).await.unwrap();
+        }
+        assert_eq!(sub.dropped_count(), 3);
+
+        // The two *earliest* survive (newest dropped).
+        assert_eq!(seq_of(&sub.next().await.unwrap()), 0);
+        assert_eq!(seq_of(&sub.next().await.unwrap()), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn drop_oldest_keeps_the_newest() {
+        let bus = InProcessBus::new(16);
+        let mut sub = bus
+            .subscribe(
+                Filter::all(),
+                SubscribeOptions::default()
+                    .with_backpressure(BackpressureStrategy::DropOldest)
+                    .with_buffer(2),
+            )
+            .await
+            .unwrap();
+
+        for i in 0..5 {
+            bus.publish(seq_env(i)).await.unwrap();
+        }
+        assert_eq!(sub.dropped_count(), 3);
+
+        // The two *latest* survive (oldest evicted).
+        assert_eq!(seq_of(&sub.next().await.unwrap()), 3);
+        assert_eq!(seq_of(&sub.next().await.unwrap()), 4);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn block_backpressures_the_publisher_then_delivers_all() {
+        let bus = Arc::new(InProcessBus::new(16));
+        let mut sub = bus
+            .subscribe(
+                Filter::all(),
+                SubscribeOptions::default()
+                    .with_backpressure(BackpressureStrategy::Block)
+                    .with_buffer(1),
+            )
+            .await
+            .unwrap();
+
+        let busc = Arc::clone(&bus);
+        let mut producer = tokio::spawn(async move {
+            for i in 0..3 {
+                busc.publish(seq_env(i)).await.unwrap();
+            }
+        });
+
+        // With buffer 1, the producer delivers one then blocks on the second.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut producer)
+                .await
+                .is_err(),
+            "producer should be blocked while the buffer is full"
+        );
+
+        // Draining lets the blocked publisher make progress; all three arrive in
+        // order and nothing is dropped.
+        assert_eq!(seq_of(&sub.next().await.unwrap()), 0);
+        assert_eq!(seq_of(&sub.next().await.unwrap()), 1);
+        assert_eq!(seq_of(&sub.next().await.unwrap()), 2);
+        tokio::time::timeout(std::time::Duration::from_secs(1), producer)
+            .await
+            .expect("producer completes once drained")
+            .unwrap();
+        assert_eq!(sub.dropped_count(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn block_subscriber_does_not_stall_unrelated_publisher() {
+        let bus = Arc::new(InProcessBus::new(16));
+        // A Block subscriber that only wants kind "a", with no room.
+        let _sub_a = bus
+            .subscribe(
+                Filter::by_kind("a"),
+                SubscribeOptions::default()
+                    .with_backpressure(BackpressureStrategy::Block)
+                    .with_buffer(1),
+            )
+            .await
+            .unwrap();
+        bus.publish(Envelope::new(ConnectorId::new("src"), EventKind::from_static("a"), 0))
+            .await
+            .unwrap(); // fills the "a" buffer
+
+        // Publishing unrelated kind "b" must not block on the full "a" subscriber.
+        tokio::time::timeout(std::time::Duration::from_millis(50), async {
+            for i in 0..5 {
+                bus.publish(Envelope::new(
+                    ConnectorId::new("src"),
+                    EventKind::from_static("b"),
+                    i,
+                ))
+                .await
+                .unwrap();
+            }
+        })
+        .await
+        .expect("unrelated publisher is never blocked");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_subscription_unblocks_a_pending_publish() {
+        let bus = Arc::new(InProcessBus::new(16));
+        let sub = bus
+            .subscribe(
+                Filter::all(),
+                SubscribeOptions::default()
+                    .with_backpressure(BackpressureStrategy::Block)
+                    .with_buffer(1),
+            )
+            .await
+            .unwrap();
+
+        let busc = Arc::clone(&bus);
+        let mut producer = tokio::spawn(async move {
+            busc.publish(seq_env(0)).await.unwrap(); // fills
+            busc.publish(seq_env(1)).await.unwrap(); // blocks
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut producer)
+                .await
+                .is_err(),
+            "producer should be blocked"
+        );
+
+        // Unsubscribing releases the blocked publisher.
+        drop(sub);
+        tokio::time::timeout(std::time::Duration::from_secs(1), producer)
+            .await
+            .expect("producer unblocked by unsubscribe")
+            .unwrap();
     }
 }

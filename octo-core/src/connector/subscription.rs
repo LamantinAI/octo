@@ -26,7 +26,10 @@ pub struct SubscribeOptions {
 impl Default for SubscribeOptions {
     fn default() -> Self {
         Self {
-            backpressure: BackpressureStrategy::Block,
+            // `DropOldest`, not `Block`: the default subscriber must never be able
+            // to wedge every publisher just by falling behind. Delivery-critical
+            // consumers opt into `Block` explicitly via [`with_backpressure`].
+            backpressure: BackpressureStrategy::DropOldest,
             buffer: 256,
             concurrency: 1,
             panic_policy: PanicPolicy::Restart,
@@ -68,10 +71,16 @@ pub enum BackpressureStrategy {
     /// Block the producer until space is available; suitable for delivery-critical paths.
     Block,
     /// Throttle to `rate_per_sec` events; mix of block + drop.
+    ///
+    /// Not yet implemented by `InProcessBus` — currently downgraded to
+    /// [`DropOldest`](Self::DropOldest) (with a warning) at subscribe time.
     Throttle { rate_per_sec: u32 },
     /// Merge incoming into the in-flight item — useful for bidirectional channels
     /// where a follow-up message should supersede an earlier one mid-flight.
     /// Borrowed from OpenClaw's "steer" mode.
+    ///
+    /// Not yet implemented by `InProcessBus` — currently downgraded to
+    /// [`DropOldest`](Self::DropOldest) (with a warning) at subscribe time.
     Steer,
 }
 
