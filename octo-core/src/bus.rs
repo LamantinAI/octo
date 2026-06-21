@@ -4,16 +4,18 @@
 //! observability, cognition) read independently. The bus does not interpret
 //! envelopes — it only routes them by header fields.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Notify};
 
 use crate::{
-    ChannelId, ConnectorId, Envelope, EventId, EventKind, OctoError, OctoResult, PayloadRegistry,
-    SubscribeOptions,
+    BackpressureStrategy, ChannelId, ConnectorId, Envelope, EventId, EventKind, OctoError,
+    OctoResult, PayloadRegistry, SubscribeOptions,
 };
 
 /// Abstraction over the in-process bus — the medium between connector actors
@@ -212,39 +214,192 @@ impl From<EventKind> for KindPattern {
 
 /// Subscriber-side stream over filtered envelopes.
 ///
-/// Returned by [`EventBus::subscribe`]. Drop to unsubscribe.
+/// Returned by [`EventBus::subscribe`] / [`InProcessBus::subscribe_sync`]. Drop
+/// to unsubscribe. Two intake modes, chosen by [`SubscribeOptions`]:
+///
+/// - **Raw broadcast** (the default `DropOldest`) — rides the broadcast receiver
+///   directly. Lag drops the oldest, but the dropped count is now surfaced
+///   (warned + counted via [`Subscription::lagged_total`]), never silent.
+/// - **Per-subscriber shim** — a forwarder task drains the broadcast into this
+///   subscriber's own bounded queue, applying its strategy (deep buffer,
+///   drop-newest, throttle, steer, best-effort block) without stalling others.
 pub struct Subscription {
-    rx: broadcast::Receiver<Arc<Envelope>>,
+    inner: SubInner,
     filter: Filter,
+    /// Envelopes dropped for *this* subscriber (broadcast lag + shim policy).
+    lagged: Arc<AtomicU64>,
+}
+
+enum SubInner {
+    /// Native fan-out path: drop-oldest at the broadcast's own capacity.
+    Broadcast(broadcast::Receiver<Arc<Envelope>>),
+    /// Per-subscriber queue fed by a forwarder task (filter applied there).
+    Shim(Arc<ShimChan>),
+}
+
+/// Per-subscriber shim queue + signalling, shared between the forwarder task
+/// (producer) and the [`Subscription`] (consumer).
+struct ShimChan {
+    queue: Mutex<VecDeque<Arc<Envelope>>>,
+    /// Consumer waits here for an item.
+    data: Notify,
+    /// Forwarder waits here for room (only `Block` parks on it).
+    space: Notify,
+    /// Set once the forwarder ends (broadcast closed).
+    closed: AtomicBool,
 }
 
 impl Subscription {
-    /// Receive the next matching envelope. Returns `None` when the bus closes.
-    ///
-    /// On lag (subscriber fell behind broadcast capacity) the lagged events
-    /// are silently skipped; this matches `DropOldest` semantics in
-    /// `tokio::sync::broadcast`. More elaborate per-subscriber backpressure
-    /// modes are not yet wired in the in-process impl — see TODO in `InProcessBus`.
+    /// Receive the next matching envelope. Returns `None` when the bus closes
+    /// (and, for the shim, after draining anything still queued).
     pub async fn next(&mut self) -> Option<Arc<Envelope>> {
-        loop {
-            match self.rx.recv().await {
-                Ok(env) => {
-                    if self.filter.matches(&env) {
-                        return Some(env);
+        match &mut self.inner {
+            SubInner::Broadcast(rx) => loop {
+                match rx.recv().await {
+                    Ok(env) => {
+                        if self.filter.matches(&env) {
+                            return Some(env);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        let total = self.lagged.fetch_add(skipped, Ordering::Relaxed) + skipped;
+                        tracing::warn!(
+                            lagged = skipped,
+                            total,
+                            "bus subscription fell behind — dropped {skipped} envelopes (drop-oldest)"
+                        );
                     }
                 }
-                Err(broadcast::error::RecvError::Closed) => return None,
-                Err(broadcast::error::RecvError::Lagged(_skipped)) => {
-                    // TODO: surface lag count via tracing / metrics
-                    continue;
+            },
+            SubInner::Shim(chan) => loop {
+                if let Some(env) = chan.queue.lock().unwrap().pop_front() {
+                    chan.space.notify_one();
+                    return Some(env);
                 }
-            }
+                if chan.closed.load(Ordering::Acquire) {
+                    // Forwarder gone; hand back any straggler, else end.
+                    return chan.queue.lock().unwrap().pop_front();
+                }
+                chan.data.notified().await;
+            },
         }
     }
 
     pub fn filter(&self) -> &Filter {
         &self.filter
     }
+
+    /// Total envelopes dropped for this subscriber (broadcast lag + shim policy).
+    /// Zero on a healthy, never-overflowing subscription.
+    pub fn lagged_total(&self) -> u64 {
+        self.lagged.load(Ordering::Relaxed)
+    }
+}
+
+/// Key a `Steer` subscriber supersedes on: a follow-up on the same channel (or
+/// correlation) replaces the still-queued earlier one.
+#[derive(PartialEq, Eq)]
+enum SteerKey {
+    Channel(ChannelId),
+    Correlation(EventId),
+}
+
+fn steer_key(env: &Envelope) -> Option<SteerKey> {
+    if let Some(c) = &env.channel {
+        return Some(SteerKey::Channel(c.clone()));
+    }
+    env.correlation_id.map(SteerKey::Correlation)
+}
+
+/// Spawn the forwarder draining a broadcast receiver into a subscriber's shim
+/// queue under its backpressure strategy. Exits when the broadcast closes.
+fn spawn_forwarder(
+    mut rx: broadcast::Receiver<Arc<Envelope>>,
+    filter: Filter,
+    opts: SubscribeOptions,
+    chan: Arc<ShimChan>,
+    lagged: Arc<AtomicU64>,
+) {
+    let buffer = opts.buffer.max(1);
+    tokio::spawn(async move {
+        let mut last_emit: Option<tokio::time::Instant> = None; // Throttle only
+        loop {
+            let env = match rx.recv().await {
+                Ok(env) => env,
+                Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    let total = lagged.fetch_add(skipped, Ordering::Relaxed) + skipped;
+                    tracing::warn!(
+                        lagged = skipped,
+                        total,
+                        "bus shim fell behind upstream — dropped {skipped} envelopes"
+                    );
+                    continue;
+                }
+            };
+            if !filter.matches(&env) {
+                continue;
+            }
+            match &opts.backpressure {
+                BackpressureStrategy::DropOldest => {
+                    let mut q = chan.queue.lock().unwrap();
+                    q.push_back(env);
+                    if q.len() > buffer {
+                        q.pop_front();
+                        lagged.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                BackpressureStrategy::DropNewest => {
+                    let mut q = chan.queue.lock().unwrap();
+                    if q.len() >= buffer {
+                        lagged.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    q.push_back(env);
+                }
+                BackpressureStrategy::Steer => {
+                    let key = steer_key(&env);
+                    let mut q = chan.queue.lock().unwrap();
+                    match key.and_then(|k| q.iter().position(|e| steer_key(e).as_ref() == Some(&k)))
+                    {
+                        // Supersede in place — the latest wins, position kept.
+                        // Not a drop: superseding is the intended Steer behavior.
+                        Some(i) => q[i] = env,
+                        None => {
+                            q.push_back(env);
+                            if q.len() > buffer {
+                                q.pop_front();
+                                lagged.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+                BackpressureStrategy::Throttle { rate_per_sec } => {
+                    let min_gap = Duration::from_secs_f64(1.0 / (*rate_per_sec).max(1) as f64);
+                    let now = tokio::time::Instant::now();
+                    if last_emit.is_some_and(|t| now.duration_since(t) < min_gap) {
+                        lagged.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    last_emit = Some(now);
+                    chan.queue.lock().unwrap().push_back(env);
+                }
+                BackpressureStrategy::Block => {
+                    // Best-effort: park until the consumer makes room. While
+                    // parked we stop draining the broadcast, so *it* (not us)
+                    // may lag — true end-to-end Block is impossible on a fan-out.
+                    while chan.queue.lock().unwrap().len() >= buffer {
+                        chan.space.notified().await;
+                    }
+                    chan.queue.lock().unwrap().push_back(env);
+                }
+            }
+            chan.data.notify_one();
+        }
+        chan.closed.store(true, Ordering::Release);
+        chan.data.notify_one();
+    });
 }
 
 /// In-process event bus — `tokio::sync::broadcast` based.
@@ -252,9 +407,12 @@ impl Subscription {
 /// The bus is the medium between actors inside the runtime ("бульон с веществами").
 /// Not a transport abstraction — distributed messaging is explicitly out of scope.
 ///
-/// TODO: per-subscriber backpressure modes from [`SubscribeOptions`] are not
-/// yet honored — broadcast inherently has drop-oldest semantics on lag; `Block`
-/// / `Throttle` / `Steer` need a shim layer with per-subscriber mpsc fan-out.
+/// Backpressure: the default subscription rides the broadcast directly
+/// (drop-oldest, now with visible lag counts). A subscriber wanting other
+/// semantics (deep buffer, drop-newest, throttle, steer, best-effort block) gets
+/// a per-subscriber shim — a forwarder task + bounded queue — via
+/// [`SubscribeOptions`]; see [`Subscription`]. (Distributed / criticality-lane
+/// guarantees remain out of scope.)
 pub struct InProcessBus {
     sender: broadcast::Sender<Arc<Envelope>>,
     capacity: usize,
@@ -293,12 +451,31 @@ impl InProcessBus {
 
     /// Synchronously create a subscription. Useful when a subscriber needs
     /// to register **before** any publisher starts emitting (e.g. the runtime
-    /// pre-subscribes the cogitator before spawning connector tasks).
-    pub fn subscribe_sync(&self, filter: Filter) -> Subscription {
-        Subscription {
-            rx: self.sender.subscribe(),
-            filter,
+    /// pre-subscribes the cogitator before spawning connector tasks). The
+    /// broadcast receiver is registered synchronously here; any shim forwarder
+    /// then drains it, so the pre-subscribe guarantee holds in both modes.
+    pub fn subscribe_sync(&self, filter: Filter, opts: SubscribeOptions) -> Subscription {
+        self.make_subscription(filter, opts)
+    }
+
+    /// Build a subscription, picking the raw broadcast path or the per-subscriber
+    /// shim per [`SubscribeOptions::needs_shim`].
+    fn make_subscription(&self, filter: Filter, opts: SubscribeOptions) -> Subscription {
+        // Register the broadcast receiver now (before returning) so no publish
+        // is missed between subscribe and the forwarder being scheduled.
+        let rx = self.sender.subscribe();
+        let lagged = Arc::new(AtomicU64::new(0));
+        if !opts.needs_shim(self.capacity) {
+            return Subscription { inner: SubInner::Broadcast(rx), filter, lagged };
         }
+        let chan = Arc::new(ShimChan {
+            queue: Mutex::new(VecDeque::new()),
+            data: Notify::new(),
+            space: Notify::new(),
+            closed: AtomicBool::new(false),
+        });
+        spawn_forwarder(rx, filter.clone(), opts, Arc::clone(&chan), Arc::clone(&lagged));
+        Subscription { inner: SubInner::Shim(chan), filter, lagged }
     }
 }
 
@@ -318,12 +495,8 @@ impl EventBus for InProcessBus {
     async fn subscribe(
         &self,
         filter: Filter,
-        _opts: SubscribeOptions,
+        opts: SubscribeOptions,
     ) -> OctoResult<Subscription> {
-        // TODO: opts ignored — see struct-level TODO.
-        Ok(Subscription {
-            rx: self.sender.subscribe(),
-            filter,
-        })
+        Ok(self.make_subscription(filter, opts))
     }
 }

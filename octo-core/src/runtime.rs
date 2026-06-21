@@ -94,7 +94,7 @@ impl Octo {
             let cog = Arc::clone(&self.cogitator);
             let id = cog.id().to_string();
             let cog_filter = cog.filter();
-            let cog_sub = self.bus.subscribe_sync(cog_filter);
+            let cog_sub = self.bus.subscribe_sync(cog_filter, cog.subscribe_options());
             let connectors_info: Vec<ConnectorInfo> = self
                 .connectors
                 .iter()
@@ -119,7 +119,7 @@ impl Octo {
             let r = Arc::clone(router);
             let id = r.id().to_string();
             let filter = r.filter();
-            let sub = self.bus.subscribe_sync(filter);
+            let sub = self.bus.subscribe_sync(filter, SubscribeOptions::default());
             let ctx = RouterContext::new(self.shutdown.clone(), Arc::clone(&self.bus));
 
             tokio::spawn(async move {
@@ -139,7 +139,11 @@ impl Octo {
             .collect();
 
         let ctrl_handle = {
-            let mut ctrl_sub = self.bus.subscribe_sync(Filter::by_kind(control::CONTROL_GLOB));
+            // Control plane is low-rate; default (drop-oldest, visible) is fine.
+            // A never-drop criticality lane is a deferred option (see fix brief).
+            let mut ctrl_sub = self
+                .bus
+                .subscribe_sync(Filter::by_kind(control::CONTROL_GLOB), SubscribeOptions::default());
             let ctrl_shutdown = self.shutdown.clone();
             let notifies = restart_notifies.clone();
             tokio::spawn(async move {
