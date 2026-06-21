@@ -1313,6 +1313,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "octo-connector-scheduler"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "octo-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "octo-connector-telegram"
 version = "0.0.1"
 dependencies = [

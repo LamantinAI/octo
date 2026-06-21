@@ -1,0 +1,22 @@
+[package]
+name = "octo-connector-scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "A managed bidirectional Octo connector: schedules alarms (one-shot / recurring) and emits `alarm.fired` envelopes on time; mutated via `octo.scheduler.*` control envelopes, persisted to disk."
+
+[dependencies]
+octo-core = { path = "../../octo-core" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio-util = { workspace = true }
