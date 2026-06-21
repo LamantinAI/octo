@@ -1,0 +1,23 @@
+[package]
+name = "octo-connector-scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Timer/scheduler connector for the Octo runtime — emits timer.tick / timer.fire envelopes on configurable cadences so an agent can live in time. Zero external dependencies (pure tokio::time)."
+
+[dependencies]
+octo-core = { path = "../../octo-core" }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
+tokio-util = { workspace = true }

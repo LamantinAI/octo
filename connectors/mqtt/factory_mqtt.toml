@@ -1,0 +1,29 @@
+# Example MQTT connector manifest (type = "mqtt").
+#
+# Register the factory in code, then point the builder at a manifest that scans
+# this file's directory:
+#
+#   Octo::builder()
+#       .register_connector_type("mqtt", octo_connector_mqtt::factory())
+#       .from_config_file("octo.toml")?
+#
+# Kept crate-local (not under the repo's shared config/connectors/) so it isn't
+# picked up by the http connector's config-load tests.
+
+[connector]
+id = "factory"
+type = "mqtt"
+host = "localhost"
+port = 1883
+# client_id = "octo-factory"     # optional; defaults to "octo-<id>"
+# keep_alive_secs = 30           # optional
+# username = "octo"              # optional
+# password_env = "MQTT_PASS"     # optional; read from this env var
+
+# factory/temperature → mqtt.factory.temperature, payload as JSON so a reflex
+# router can read e.g. /celsius.
+[[connector.sub]]
+topic = "factory/#"
+qos = 0
+kind_prefix = "mqtt"
+payload = "json"

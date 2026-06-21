@@ -18,8 +18,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use octo_core::{
-    Blob, Cogitator, CogitatorContext, ConnectorId, Envelope, EventKind, Filter, OctoResult,
-    Subscription,
+    Blob, ChannelId, Cogitator, CogitatorContext, ConnectorId, Envelope, EventKind, Filter,
+    KindPattern, OctoResult, ReplyChannel, Subscription,
 };
 use octo_rig::OctoDispatchTool;
 
@@ -40,6 +40,11 @@ the user's request needs its data or action; otherwise just answer. Reply in the
 keep it short. If a connector returns an error, tell the user honestly that it failed — never \
 invent a result.";
 
+const PROACTIVE_PREAMBLE: &str = "You are Octo, an always-on agent. A runtime event just occurred \
+— this is NOT a user message; you are acting on your own initiative. Decide whether it warrants \
+action (call `dispatch_to_connector`) and/or a short message to the user. If nothing is warranted, \
+reply with exactly `NOOP` and nothing else. Do not invent results; be brief.";
+
 pub struct ReactCogitator {
     id: String,
     self_source: ConnectorId,
@@ -48,6 +53,13 @@ pub struct ReactCogitator {
     /// Recent bus events the agent perceived but didn't act on (ambient
     /// awareness). Bounded to `AMBIENT_MAX`; fed into the preamble on reply.
     ambient: Mutex<VecDeque<String>>,
+    /// Non-chat event kinds that trigger *proactive* cognition (from
+    /// `OCTO_ACTIONABLE`). Deliberately narrower than perception.
+    actionable: Vec<KindPattern>,
+    /// Where a proactive (self-initiated) message is delivered: (connector,
+    /// channel). `None` → the agent can deliberate but has nowhere to speak, so
+    /// proactive events are observed instead of acted on.
+    proactive: Option<(ConnectorId, ChannelId)>,
 }
 
 impl ReactCogitator {
@@ -57,12 +69,32 @@ impl ReactCogitator {
         history: Arc<dyn HistoryStore>,
     ) -> Arc<Self> {
         let id = id.into();
+        let actionable = settings
+            .actionable
+            .as_deref()
+            .unwrap_or("")
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(KindPattern::new)
+            .collect();
+        let proactive = match (
+            settings.proactive_target.as_deref(),
+            settings.proactive_channel.as_deref(),
+        ) {
+            (Some(t), Some(c)) if !t.is_empty() && !c.is_empty() => {
+                Some((ConnectorId::new(t), ChannelId::new(c)))
+            }
+            _ => None,
+        };
         Arc::new(Self {
             self_source: ConnectorId::new(format!("cogitator/{id}")),
             id,
             settings,
             history,
             ambient: Mutex::new(VecDeque::new()),
+            actionable,
+            proactive,
         })
     }
 }
@@ -74,7 +106,17 @@ impl Cogitator for ReactCogitator {
     }
 
     fn filter(&self) -> Filter {
-        perception_filter(self.settings.perception.as_deref())
+        let mut filter = perception_filter(self.settings.perception.as_deref());
+        // Make sure every actionable kind is within perceptual scope — otherwise
+        // configuring an actionable kind would silently never fire because the
+        // agent never sees it. A `kinds`-scoped filter ORs the extra patterns in;
+        // a wildcard (`all`) filter already sees everything.
+        if filter.kinds.is_some() {
+            for pattern in &self.actionable {
+                filter = filter.with_kind(pattern.clone());
+            }
+        }
+        filter
     }
 
     async fn run(
@@ -118,7 +160,102 @@ impl ReactCogitator {
                 return;
             }
         }
+        // Proactive trigger: a configured non-chat kind (e.g. a sensor anomaly or
+        // a timer fire). Acts on the agent's own initiative — never on chat (that
+        // would loop) nor on our own emissions (guarded above).
+        if self.is_actionable(&incoming) {
+            self.clone().react_proactive(incoming, ctx).await;
+            return;
+        }
         self.observe(&incoming);
+    }
+
+    /// Whether an in-scope envelope should escalate to *proactive* cognition.
+    /// Chat kinds are hard-excluded (chat is the reactive path; including it here
+    /// would let the agent's own `chat.reply` re-trigger cognition).
+    fn is_actionable(&self, env: &Envelope) -> bool {
+        let kind = env.kind.as_str();
+        if kind == "chat.message" || kind == "chat.reply" {
+            return false;
+        }
+        self.actionable.iter().any(|p| p.matches(&env.kind))
+    }
+
+    /// Proactive path — distinct from [`respond`](Self::respond): the event has
+    /// no user and no source channel to reply into, so the model deliberates and
+    /// either acts (tool dispatch), speaks to the configured proactive channel,
+    /// or returns `NOOP`.
+    async fn react_proactive(self: Arc<Self>, incoming: Arc<Envelope>, ctx: &CogitatorContext) {
+        let Some((target, channel)) = self.proactive.clone() else {
+            tracing::warn!(
+                kind = %incoming.kind,
+                "actionable event but OCTO_PROACTIVE_TARGET/CHANNEL unset; observing instead"
+            );
+            self.observe(&incoming);
+            return;
+        };
+        tracing::info!(kind = %incoming.kind, source = %incoming.source, "proactive: reacting");
+
+        // Per-kind history (not a user transcript): gives the agent memory of
+        // recent events of this kind so it can avoid repeating itself.
+        let history_key = format!("proactive:{}", incoming.kind.as_str());
+        let history = to_messages(&self.history.load(&history_key).await);
+        let tool = OctoDispatchTool::new(ctx.bus(), self.self_source.clone(), catalog(ctx));
+
+        let preamble = format!("{PROACTIVE_PREAMBLE}\n\n{}", proactive_context(&incoming));
+        let event = proactive_event_description(&incoming);
+
+        let answer = match llm::chat_with_tool(
+            &self.settings.api_key,
+            &self.settings.model,
+            &preamble,
+            &event,
+            None,
+            history,
+            tool,
+            MAX_TOOL_TURNS,
+        )
+        .await
+        {
+            Ok(a) => a.trim().to_string(),
+            Err(e) => {
+                tracing::warn!(error = %e, "proactive llm failed");
+                return;
+            }
+        };
+
+        // Record the deliberation (even a NOOP) so repeats are deduped.
+        self.record(&history_key, event, answer.clone()).await;
+
+        if answer.is_empty() || answer.eq_ignore_ascii_case("NOOP") {
+            tracing::info!("proactive: NOOP");
+            return;
+        }
+        self.emit_proactive(&target, &channel, answer, ctx).await;
+    }
+
+    /// Emit a self-initiated `chat.reply` to the configured proactive
+    /// destination. Unlike [`emit`](Self::emit), there's no incoming envelope to
+    /// reply to — the target/channel come from config.
+    async fn emit_proactive(
+        &self,
+        target: &ConnectorId,
+        channel: &ChannelId,
+        text: String,
+        ctx: &CogitatorContext,
+    ) {
+        let reply = Envelope::new(
+            self.self_source.clone(),
+            EventKind::from_static("chat.reply"),
+            text,
+        )
+        .with_target(target.clone())
+        .with_channel(channel.clone())
+        .with_reply_to(ReplyChannel::new(channel.clone()));
+        tracing::info!(target = %target, channel = %channel.as_str(), "proactive → message");
+        if let Err(e) = ctx.publish(reply).await {
+            tracing::warn!(error = %e, "failed to publish proactive chat.reply");
+        }
     }
 
     async fn respond(
@@ -305,6 +442,40 @@ fn incoming_context(env: &Envelope, channel: &str) -> String {
         }
     }
     s += " Reply through this same channel; take the source into account.";
+    s
+}
+
+/// Front-load a proactive event's provenance and the reflex/router trail that
+/// led to it — so the model can see e.g. *"reflex rule `sensor-high` rewrote this
+/// to sensor.anomaly"* before deciding what to do.
+fn proactive_context(env: &Envelope) -> String {
+    let mut s = String::from("Context — this is a runtime event, not a user message.");
+    if let Some(channel) = &env.channel {
+        s += &format!(" Origin channel: \"{}\".", channel);
+    }
+    if !env.trail.is_empty() {
+        let steps: Vec<String> = env.trail.iter().map(|e| format!("{e:?}")).collect();
+        s += &format!(" How it got here (trail): {}.", steps.join(" → "));
+    }
+    s += " Decide if it warrants action or a message; otherwise reply NOOP.";
+    s
+}
+
+/// Render the event itself into the synthetic "user" turn for the proactive
+/// prompt: its kind, payload, and any tags.
+fn proactive_event_description(env: &Envelope) -> String {
+    let payload = env
+        .payload_as::<serde_json::Value>()
+        .map(|v| v.to_string())
+        .or_else(|| env.payload_as::<String>().cloned())
+        .unwrap_or_else(|| "(no readable payload)".to_string());
+    let mut s = format!(
+        "Runtime event `{}` from connector `{}`. Payload: {payload}.",
+        env.kind, env.source
+    );
+    if !env.tags.is_empty() {
+        s += &format!(" Tags: {:?}.", env.tags);
+    }
     s
 }
 

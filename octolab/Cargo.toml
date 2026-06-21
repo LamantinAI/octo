@@ -8,6 +8,8 @@ description = "Playground for exercising the Octo runtime with a simple ReAct LL
 octo-core = { path = "../octo-core" }
 octo-connector-http = { path = "../connectors/http" }
 octo-connector-telegram = { path = "../connectors/telegram" }
+octo-connector-scheduler = { path = "../connectors/scheduler" }
+octo-connector-mqtt = { path = "../connectors/mqtt" }
 octo-history = { path = "../octo-history" }
 octo-rig = { path = "../octo-rig" }
 tokio = { version = "1.40", features = ["full"] }

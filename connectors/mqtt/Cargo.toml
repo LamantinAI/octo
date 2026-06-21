@@ -1,0 +1,23 @@
+[package]
+name = "octo-connector-mqtt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "MQTT subscriber connector for the Octo runtime — bridges broker topics into bus envelopes (e.g. factory/temperature → mqtt.factory.temperature). Input-only, TOML-configured, one instance per broker."
+
+[dependencies]
+octo-core = { path = "../../octo-core" }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+rumqttc = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

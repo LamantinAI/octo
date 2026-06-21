@@ -1,0 +1,29 @@
+# Example scheduler connector manifest (type = "scheduler").
+#
+# Register the factory in code, then point the builder at a manifest that
+# scans this file's directory:
+#
+#   Octo::builder()
+#       .register_connector_type("scheduler", octo_connector_scheduler::factory())
+#       .from_config_file("octo.toml")?
+#
+# Kept crate-local (not under the repo's shared config/connectors/) so it isn't
+# picked up by the http connector's config-load tests.
+
+[connector]
+id = "heartbeat"
+type = "scheduler"
+
+# A fast heartbeat — observe-only ambient awareness ("time is passing").
+[[timer]]
+name = "pulse"
+every_ms = 1000
+kind = "timer.tick"
+
+# A sparse wake — drives proactive cognition. Keep this rare; each fire can
+# cost an LLM call downstream.
+[[timer]]
+name = "wake"
+every_ms = 60000
+kind = "timer.fire"
+payload = { reason = "scheduled wake" }
