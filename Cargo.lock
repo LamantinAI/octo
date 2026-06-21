@@ -1344,6 +1344,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "octo-history"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "octo-rig"
 version = "0.0.1"
 dependencies = [
@@ -1365,6 +1376,7 @@ dependencies = [
  "octo-connector-http",
  "octo-connector-telegram",
  "octo-core",
+ "octo-history",
  "octo-rig",
  "reqwest 0.12.28",
  "rig-core",
