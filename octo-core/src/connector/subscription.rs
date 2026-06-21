@@ -26,7 +26,10 @@ pub struct SubscribeOptions {
 impl Default for SubscribeOptions {
     fn default() -> Self {
         Self {
-            backpressure: BackpressureStrategy::Block,
+            // The bus is a fan-out: a slow subscriber must not stall the others,
+            // so the sane default is lossy drop-oldest (the broadcast's native
+            // behavior — now with *visible* lag counts, not silent drops).
+            backpressure: BackpressureStrategy::DropOldest,
             buffer: 256,
             concurrency: 1,
             panic_policy: PanicPolicy::Restart,
@@ -35,6 +38,16 @@ impl Default for SubscribeOptions {
 }
 
 impl SubscribeOptions {
+    /// Whether these options require the per-subscriber shim (a forwarder task +
+    /// bounded queue), or can ride the raw broadcast receiver. The raw path is
+    /// the fan-out native: drop-oldest with the broadcast's own capacity. The
+    /// shim is needed for any non-drop-oldest strategy, or a per-subscriber
+    /// buffer deeper than the bus's broadcast ring.
+    pub fn needs_shim(&self, bus_capacity: usize) -> bool {
+        !matches!(self.backpressure, BackpressureStrategy::DropOldest)
+            || self.buffer > bus_capacity
+    }
+
     pub fn with_backpressure(mut self, b: BackpressureStrategy) -> Self {
         self.backpressure = b;
         self

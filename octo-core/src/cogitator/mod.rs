@@ -51,6 +51,14 @@ pub trait Cogitator: Send + Sync + 'static {
         Filter::all()
     }
 
+    /// Backpressure options for the cogitator's bus subscription. Default is the
+    /// fan-out default (drop-oldest with visible lag counts). A cogitator under
+    /// high-rate perception or one that wants steering (a follow-up superseding a
+    /// queued message) overrides this — e.g. a deep buffer + `Steer`.
+    fn subscribe_options(&self) -> SubscribeOptions {
+        SubscribeOptions::default()
+    }
+
     /// Run the cogitator's main loop. Receives:
     /// - `ctx` — shutdown signal + bus handle (publish + late subscribe).
     /// - `subscription` — pre-made subscription on the bus (per `filter()`),
