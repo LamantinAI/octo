@@ -20,5 +20,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dotenvy = "0.15"
 config = { version = "0.14", default-features = false }
 bytes = "1"
+base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 rig-core = "0.35"
