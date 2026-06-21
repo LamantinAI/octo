@@ -4,6 +4,8 @@
 //! - `OCTO_LLM_MODEL`     → `model`
 //! - `OCTO_LLM_BASE_URL`  → `base_url` (informational for the openrouter provider)
 //! - `OCTO_TELEGRAM_TOKEN`→ `telegram_token` (optional; absent → console connector)
+//! - `OCTO_HISTORY`       → `history` (`memory` default | `file:<dir>`)
+//! - `OCTO_PERCEPTION`    → `perception` (`addressed` default | `chat` | `all` | glob)
 
 use serde::Deserialize;
 
@@ -22,6 +24,11 @@ pub struct Settings {
     /// History backend: `memory` (default) or `file:<dir>`. (`OCTO_HISTORY`.)
     #[serde(rename = "history", default)]
     pub history: Option<String>,
+    /// Perception scope (`OCTO_PERCEPTION`): `addressed` (default) | `chat` |
+    /// `all` | a custom event-kind glob. Sets the cogitator's subscription —
+    /// how much of the bus it sees (action stays narrow regardless).
+    #[serde(rename = "perception", default)]
+    pub perception: Option<String>,
 }
 
 impl Settings {
