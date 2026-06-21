@@ -104,10 +104,17 @@ impl ReactCogitator {
         if incoming.source == self.self_source {
             return;
         }
-        // Action trigger: a user chat message. Anything else → observe only.
+        // Action trigger: a user chat message. Text or an image (a photo arrives
+        // as a `Blob` payload, caption on the `caption` tag). Anything else →
+        // observe only.
         if incoming.kind.as_str() == "chat.message" {
             if let Some(text) = incoming.payload_as::<String>().cloned() {
-                self.respond(incoming, text, ctx).await;
+                self.respond(incoming, text, None, ctx).await;
+                return;
+            }
+            if let Some(image) = incoming.payload_as::<Blob>().cloned() {
+                let caption = incoming.tags.get("caption").cloned().unwrap_or_default();
+                self.respond(incoming, caption, Some(image), ctx).await;
                 return;
             }
         }
@@ -118,6 +125,7 @@ impl ReactCogitator {
         self: Arc<Self>,
         incoming: Arc<Envelope>,
         text: String,
+        image: Option<Blob>,
         ctx: &CogitatorContext,
     ) {
         let channel_key = incoming
@@ -126,23 +134,27 @@ impl ReactCogitator {
             .map(|c| c.as_str().to_string())
             .unwrap_or_default();
 
-        // Reflex: /pic sends an image (media path), no LLM.
-        if text.trim() == "/pic" {
-            tracing::info!(source = %incoming.source, "reflex: /pic");
-            self.send_image(&incoming, ctx).await;
-            self.record(&channel_key, text, "(sent an image)".into()).await;
-            return;
-        }
-        // Reflex: known commands, no LLM.
-        if let Some(canned) = command_reply(&text) {
-            tracing::info!(source = %incoming.source, cmd = %text, "reflex (no LLM)");
-            self.emit_reply(&incoming, canned, ctx).await;
-            let marker = format!("(reflex reply to {})", text.trim());
-            self.record(&channel_key, text, marker).await;
-            return;
+        // Reflexes are for plain-text commands only; an image always goes to the
+        // model (which may also be a vision model).
+        if image.is_none() {
+            // Reflex: /pic sends an image (media path), no LLM.
+            if text.trim() == "/pic" {
+                tracing::info!(source = %incoming.source, "reflex: /pic");
+                self.send_image(&incoming, ctx).await;
+                self.record(&channel_key, text, "(sent an image)".into()).await;
+                return;
+            }
+            // Reflex: known commands, no LLM.
+            if let Some(canned) = command_reply(&text) {
+                tracing::info!(source = %incoming.source, cmd = %text, "reflex (no LLM)");
+                self.emit_reply(&incoming, canned, ctx).await;
+                let marker = format!("(reflex reply to {})", text.trim());
+                self.record(&channel_key, text, marker).await;
+                return;
+            }
         }
 
-        tracing::info!(source = %incoming.source, channel = %channel_key, "← {text}");
+        tracing::info!(source = %incoming.source, channel = %channel_key, has_image = image.is_some(), "← {text}");
 
         let history = to_messages(&self.history.load(&channel_key).await);
 
@@ -163,6 +175,7 @@ impl ReactCogitator {
             &self.settings.model,
             &preamble,
             &text,
+            image.as_ref(),
             history,
             tool,
             MAX_TOOL_TURNS,
@@ -178,7 +191,14 @@ impl ReactCogitator {
         tracing::info!("→ {answer}");
 
         self.emit_reply(&incoming, answer.clone(), ctx).await;
-        self.record(&channel_key, text, answer).await;
+        // Faithful transcript: note an image arrived (the model won't re-see the
+        // pixels next turn; the textual note keeps recall honest).
+        let user_turn = match (image.is_some(), text.is_empty()) {
+            (true, true) => "(sent an image)".to_string(),
+            (true, false) => format!("(sent an image) {text}"),
+            (false, _) => text,
+        };
+        self.record(&channel_key, user_turn, answer).await;
     }
 
     /// Persist one user→assistant exchange to channel history. Used by *every*

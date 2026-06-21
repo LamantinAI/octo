@@ -1370,6 +1370,7 @@ name = "octolab"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "bytes",
  "config",
  "dotenvy",

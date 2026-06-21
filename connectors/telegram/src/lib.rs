@@ -15,6 +15,7 @@ use octo_core::{
     Blob, ChannelId, Connector, ConnectorCapabilities, ConnectorContext, ConnectorId, Envelope,
     EventKind, Filter, OctoResult, ReplyChannel, SubscribeOptions,
 };
+use teloxide::net::Download;
 use teloxide::prelude::*;
 use teloxide::types::{ChatId, InputFile, UpdateKind};
 use teloxide::update_listeners::{polling_default, AsUpdateStream};
@@ -107,18 +108,37 @@ impl Connector for TelegramConnector {
                 update = stream.next() => match update {
                     Some(Ok(update)) => {
                         if let UpdateKind::Message(msg) = update.kind {
+                            let chat = msg.chat.id.0.to_string();
                             if let Some(text) = msg.text() {
-                                let chat = msg.chat.id.0.to_string();
                                 tracing::info!(%chat, "recv: {text}");
-                                let env = Envelope::new(
-                                    self.id.clone(),
-                                    EventKind::from_static("chat.message"),
+                                let env = chat_envelope(
+                                    &self.id,
+                                    &chat,
                                     text.to_string(),
-                                )
-                                .with_channel(ChannelId::new(chat.clone()))
-                                .with_reply_to(ReplyChannel::new(ChannelId::new(chat)));
+                                    msg.caption(),
+                                );
                                 if let Err(e) = ctx.publish(env).await {
                                     tracing::warn!(error = %e, "failed to publish chat.message");
+                                }
+                            } else if let Some(photo) = msg.photo().and_then(<[_]>::last) {
+                                // Largest size is last. Download bytes → Blob so a
+                                // (vision) cogitator can perceive the image.
+                                match download_bytes(&bot, &photo.file.id).await {
+                                    Ok(bytes) => {
+                                        tracing::info!(%chat, bytes = bytes.len(), "recv: photo");
+                                        let blob = Blob::new(bytes, "image/jpeg")
+                                            .with_filename("photo.jpg");
+                                        let env = chat_envelope(
+                                            &self.id,
+                                            &chat,
+                                            blob,
+                                            msg.caption(),
+                                        );
+                                        if let Err(e) = ctx.publish(env).await {
+                                            tracing::warn!(error = %e, "failed to publish photo chat.message");
+                                        }
+                                    }
+                                    Err(e) => tracing::warn!(error = %e, "telegram photo download failed"),
                                 }
                             }
                         }
@@ -130,4 +150,33 @@ impl Connector for TelegramConnector {
             }
         }
     }
+}
+
+/// Build an inbound `chat.message` envelope: the payload is the text (a `String`)
+/// or the image (a `Blob`); the `chat_id` rides on both the channel and the
+/// reply recommendation, and a non-empty caption is attached as a `caption` tag.
+fn chat_envelope<P: std::any::Any + Send + Sync>(
+    id: &ConnectorId,
+    chat: &str,
+    payload: P,
+    caption: Option<&str>,
+) -> Envelope {
+    let mut env = Envelope::new(id.clone(), EventKind::from_static("chat.message"), payload)
+        .with_channel(ChannelId::new(chat.to_string()))
+        .with_reply_to(ReplyChannel::new(ChannelId::new(chat.to_string())));
+    if let Some(cap) = caption.filter(|c| !c.is_empty()) {
+        env = env.with_tag("caption", cap);
+    }
+    env
+}
+
+/// Resolve a Telegram `file_id` and download its bytes.
+async fn download_bytes(
+    bot: &Bot,
+    file_id: &teloxide::types::FileId,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let file = bot.get_file(file_id.clone()).await?;
+    let mut bytes: Vec<u8> = Vec::new();
+    bot.download_file(&file.path, &mut bytes).await?;
+    Ok(bytes)
 }
