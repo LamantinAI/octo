@@ -45,8 +45,9 @@ dot-namespaced with glob matching (`vision.**`, `mqtt.factory.*`). An optional
   (reconnect, retry, restart, graceful shutdown) and runs on its own cadence, not
   a central request loop. Input-only, output-only, or bidirectional.
 - **In-process bus** with declarative `Filter`s (by kind glob, source, target,
-  channel, correlation) and a broker-style request/response
-  (`publish_and_await_response`).
+  channel, correlation), a broker-style request/response
+  (`publish_and_await_response`), and **per-subscriber backpressure**
+  (drop-oldest / drop-newest / block) with dropped-envelope counts — no silent loss.
 - **Typed payloads** — `PayloadRegistry` validates that a kind carries its
   expected type; mismatches are rejected before they reach subscribers.
 - **Pluggable cognition** — implement the `Cogitator` trait; the runtime
@@ -143,11 +144,9 @@ cargo run -p octolab       # the agent (needs OCTO_* env / repo-root .env)
 Working and covered by tests: the envelope/bus/filter core, typed payload
 registry, request/response, connector lifecycle FSM, rule-based reflex routing,
 supervision with restart policies, the control-plane self-restart signals,
-streaming frames, and the pluggable cogitator pipeline. Rough edges:
+streaming frames, per-subscriber bus backpressure, and the pluggable cogitator
+pipeline. Rough edges:
 
-- **Bus backpressure.** The in-process broadcast silently drops on lag — a slow
-  cognition layer under a burst can miss envelopes. Per-subscriber backpressure
-  isn't wired yet.
 - **Inbound media.** The outbound media path (`Blob` → connector) works; the
   inbound half (e.g. a photo *into* an envelope) is not built.
 - **Single-process bus.** `InProcessBus` only; the NATS/broker-backed distributed
