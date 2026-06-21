@@ -5,8 +5,16 @@
 //! hand-rolled JSON decide-loop. Keeps per-channel history (fed as context) and
 //! a reflex fast-path for commands. Replies honor the incoming envelope's reply
 //! recommendation (back to source, same channel).
+//!
+//! Perception is configurable (`OCTO_PERCEPTION`): the subscription filter sets
+//! how much of the bus the agent *sees*, while the action trigger stays narrow —
+//! it only calls the LLM on a `chat.message` addressed to it, never on its own
+//! emissions or other traffic. Anything seen but not acted on is *observed*
+//! (logged + kept as ambient context), so wide perception never means wide (or
+//! looping) cognition.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use octo_core::{
@@ -23,6 +31,9 @@ use crate::llm;
 /// Max tool-calling rounds rig may take per message.
 const MAX_TOOL_TURNS: usize = 5;
 
+/// How many recently-observed (ambient) bus events to keep for context.
+const AMBIENT_MAX: usize = 8;
+
 const BASE_PREAMBLE: &str = "You are Octo, a concise, helpful assistant living inside the Octo \
 event-driven runtime. Call the `dispatch_to_connector` tool to reach an available connector when \
 the user's request needs its data or action; otherwise just answer. Reply in the user's language, \
@@ -34,6 +45,9 @@ pub struct ReactCogitator {
     self_source: ConnectorId,
     settings: Settings,
     history: Arc<dyn HistoryStore>,
+    /// Recent bus events the agent perceived but didn't act on (ambient
+    /// awareness). Bounded to `AMBIENT_MAX`; fed into the preamble on reply.
+    ambient: Mutex<VecDeque<String>>,
 }
 
 impl ReactCogitator {
@@ -48,6 +62,7 @@ impl ReactCogitator {
             id,
             settings,
             history,
+            ambient: Mutex::new(VecDeque::new()),
         })
     }
 }
@@ -59,7 +74,7 @@ impl Cogitator for ReactCogitator {
     }
 
     fn filter(&self) -> Filter {
-        Filter::by_kind("chat.message")
+        perception_filter(self.settings.perception.as_deref())
     }
 
     async fn run(
@@ -80,10 +95,31 @@ impl Cogitator for ReactCogitator {
 }
 
 impl ReactCogitator {
+    /// Perception → action gate. Wide perception reaches here; only a
+    /// `chat.message` addressed to us (and never our own emission) triggers
+    /// cognition. Everything else in scope is observed, not acted on — so a wide
+    /// `OCTO_PERCEPTION` can't cause feedback loops or blast the LLM.
     async fn handle(self: Arc<Self>, incoming: Arc<Envelope>, ctx: &CogitatorContext) {
-        let Some(text) = incoming.payload_as::<String>().cloned() else {
+        // Never react to (nor observe) our own emissions — that's the loop.
+        if incoming.source == self.self_source {
             return;
-        };
+        }
+        // Action trigger: a user chat message. Anything else → observe only.
+        if incoming.kind.as_str() == "chat.message" {
+            if let Some(text) = incoming.payload_as::<String>().cloned() {
+                self.respond(incoming, text, ctx).await;
+                return;
+            }
+        }
+        self.observe(&incoming);
+    }
+
+    async fn respond(
+        self: Arc<Self>,
+        incoming: Arc<Envelope>,
+        text: String,
+        ctx: &CogitatorContext,
+    ) {
         let channel_key = incoming
             .channel
             .as_ref()
@@ -94,12 +130,15 @@ impl ReactCogitator {
         if text.trim() == "/pic" {
             tracing::info!(source = %incoming.source, "reflex: /pic");
             self.send_image(&incoming, ctx).await;
+            self.record(&channel_key, text, "(sent an image)".into()).await;
             return;
         }
         // Reflex: known commands, no LLM.
         if let Some(canned) = command_reply(&text) {
             tracing::info!(source = %incoming.source, cmd = %text, "reflex (no LLM)");
             self.emit_reply(&incoming, canned, ctx).await;
+            let marker = format!("(reflex reply to {})", text.trim());
+            self.record(&channel_key, text, marker).await;
             return;
         }
 
@@ -111,9 +150,13 @@ impl ReactCogitator {
         // (catalogue comes from the runtime's introspection).
         let tool = OctoDispatchTool::new(ctx.bus(), self.self_source.clone(), catalog(ctx));
 
-        // Front-load the *incoming* provenance so the agent knows where the
-        // message came from (symmetric to seeing the outgoing connector catalog).
-        let preamble = format!("{BASE_PREAMBLE}\n\n{}", incoming_context(&incoming, &channel_key));
+        // Front-load the *incoming* provenance and any ambient bus activity, so
+        // the agent knows where the message came from and what else it perceived.
+        let mut preamble =
+            format!("{BASE_PREAMBLE}\n\n{}", incoming_context(&incoming, &channel_key));
+        if let Some(ambient) = self.ambient_context() {
+            preamble += &format!("\n\n{ambient}");
+        }
 
         let answer = match llm::chat_with_tool(
             &self.settings.api_key,
@@ -135,13 +178,50 @@ impl ReactCogitator {
         tracing::info!("→ {answer}");
 
         self.emit_reply(&incoming, answer.clone(), ctx).await;
+        self.record(&channel_key, text, answer).await;
+    }
+
+    /// Persist one user→assistant exchange to channel history. Used by *every*
+    /// path — LLM and reflex alike — so the transcript faithfully reflects every
+    /// message that arrived (the "recall" level of perception). Reflexes store a
+    /// compact assistant marker instead of the full canned reply.
+    async fn record(&self, channel: &str, user: String, assistant: String) {
         if let Err(e) = self
             .history
-            .append(&channel_key, &[Turn::user(text), Turn::assistant(answer)])
+            .append(channel, &[Turn::user(user), Turn::assistant(assistant)])
             .await
         {
             tracing::warn!(error = %e, "failed to persist history");
         }
+    }
+
+    /// Observe an envelope that's in perceptual scope but not addressed to us:
+    /// log it and keep it as ambient context (bounded ring). No LLM, no reply.
+    fn observe(&self, env: &Envelope) {
+        let line = ambient_line(env);
+        tracing::info!(kind = %env.kind, source = %env.source, "ambient: {line}");
+        let mut buf = self.ambient.lock().unwrap();
+        buf.push_back(line);
+        while buf.len() > AMBIENT_MAX {
+            buf.pop_front();
+        }
+    }
+
+    /// Render the ambient ring into a preamble block, or `None` if empty.
+    fn ambient_context(&self) -> Option<String> {
+        let buf = self.ambient.lock().unwrap();
+        if buf.is_empty() {
+            return None;
+        }
+        let lines = buf
+            .iter()
+            .map(|l| format!("- {l}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some(format!(
+            "Ambient — recent bus activity you also perceived (not addressed to you):\n{lines}\n\
+             Mention it only if the user asks what's going on around you; otherwise ignore it."
+        ))
     }
 
     /// Emit a `chat.reply` of any payload type (text / media [`Blob`]) back to
@@ -206,6 +286,34 @@ fn incoming_context(env: &Envelope, channel: &str) -> String {
     }
     s += " Reply through this same channel; take the source into account.";
     s
+}
+
+/// Perception scope → subscription filter (`OCTO_PERCEPTION`). Controls how much
+/// of the bus the agent *sees*: `addressed` (only chat messages to us — the
+/// default, today's behavior), `chat` (all chat traffic, including passing-by),
+/// `all` (the whole bus), or a custom event-kind glob (e.g. `vision.**`).
+fn perception_filter(spec: Option<&str>) -> Filter {
+    match spec.unwrap_or("addressed").trim() {
+        "addressed" => Filter::by_kind("chat.message"),
+        "chat" => Filter::by_kind("chat.**"),
+        "all" => Filter::all(),
+        glob => Filter::by_kind(glob.to_string()),
+    }
+}
+
+/// Compact one-line description of an observed envelope for ambient context.
+fn ambient_line(env: &Envelope) -> String {
+    let channel = env.channel.as_ref().map(|c| c.as_str()).unwrap_or("-");
+    let preview = env
+        .payload_as::<String>()
+        .map(|s| {
+            let t = s.trim();
+            let short: String = t.chars().take(80).collect();
+            let ellipsis = if t.chars().count() > 80 { "…" } else { "" };
+            format!(": {short}{ellipsis}")
+        })
+        .unwrap_or_default();
+    format!("[{}] from {} (channel {}){}", env.kind, env.source, channel, preview)
 }
 
 /// Catalogue (connectors advertising a description) for the dispatch tool.

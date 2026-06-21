@@ -68,6 +68,10 @@ async fn main() -> Result<()> {
             Arc::new(history::InMemoryHistory::new(HISTORY_MAX))
         }
     };
+    eprintln!(
+        "[octolab] perception: {}",
+        settings.perception.as_deref().unwrap_or("addressed")
+    );
 
     let mut builder = Octo::builder()
         .payload_registry(Arc::new(registry))
