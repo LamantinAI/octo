@@ -6,6 +6,7 @@ members = [
     "connectors/petstore",
     "connectors/http",
     "connectors/telegram",
+    "connectors/scheduler",
     "octo-rig",
     "octolab",
 ]
@@ -16,6 +17,7 @@ default-members = [
     "octo-history",
     "connectors/petstore",
     "connectors/http",
+    "connectors/scheduler",
 ]
 
 [workspace.package]
