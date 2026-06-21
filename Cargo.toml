@@ -21,7 +21,7 @@ default-members = [
 [workspace.package]
 version = "0.0.1"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 authors = ["Octo contributors"]
 repository = "https://github.com/lamantinai/octo"
 rust-version = "1.85"
