@@ -59,6 +59,59 @@ pub struct RoutePredicate {
     pub tags_required: HashMap<String, String>,
     /// Match only envelopes whose target equals this connector.
     pub target: Option<ConnectorId>,
+    /// Match on a numeric field inside a JSON (`serde_json::Value`) payload —
+    /// e.g. "celsius > 80". Lets the reflex tier express thresholds declaratively
+    /// (routine reading vs anomaly) without a custom classifier. Only matches
+    /// when the envelope's payload is a `serde_json::Value` and the pointed-at
+    /// field is numeric.
+    pub payload: Option<PayloadPredicate>,
+}
+
+/// A numeric comparison against a field in a JSON payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PayloadPredicate {
+    /// JSON Pointer to the field (e.g. `/celsius`, `/reading/value`).
+    pub pointer: String,
+    /// Comparison operator.
+    pub op: NumOp,
+    /// Right-hand side of the comparison.
+    pub value: f64,
+}
+
+/// Numeric comparison operators for [`PayloadPredicate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NumOp {
+    /// `>`
+    Gt,
+    /// `>=`
+    Gte,
+    /// `<`
+    Lt,
+    /// `<=`
+    Lte,
+    /// `==`
+    Eq,
+}
+
+impl PayloadPredicate {
+    /// Evaluate against an envelope. `false` unless the payload is a
+    /// `serde_json::Value` whose pointed-at field is a number.
+    fn matches(&self, envelope: &crate::Envelope) -> bool {
+        let Some(value) = envelope.payload_as::<serde_json::Value>() else {
+            return false;
+        };
+        let Some(field) = value.pointer(&self.pointer).and_then(|v| v.as_f64()) else {
+            return false;
+        };
+        match self.op {
+            NumOp::Gt => field > self.value,
+            NumOp::Gte => field >= self.value,
+            NumOp::Lt => field < self.value,
+            NumOp::Lte => field <= self.value,
+            NumOp::Eq => field == self.value,
+        }
+    }
 }
 
 impl RoutePredicate {
@@ -89,6 +142,11 @@ impl RoutePredicate {
             match envelope.tags.get(key) {
                 Some(v) if v == value => {}
                 _ => return false,
+            }
+        }
+        if let Some(payload) = &self.payload {
+            if !payload.matches(envelope) {
+                return false;
             }
         }
         true
@@ -196,6 +254,40 @@ mod tests {
             .insert("severity".into(), "high".into());
         // missing "scope"
         assert!(!predicate.matches(&env_partial));
+    }
+
+    #[test]
+    fn payload_predicate_matches_numeric_threshold() {
+        let predicate = RoutePredicate {
+            kind: Some(KindPattern::new("sensor.reading")),
+            payload: Some(PayloadPredicate {
+                pointer: "/celsius".to_string(),
+                op: NumOp::Gt,
+                value: 80.0,
+            }),
+            ..Default::default()
+        };
+
+        let hot = Envelope::new(
+            ConnectorId::new("sensor"),
+            EventKind::from_static("sensor.reading"),
+            serde_json::json!({ "celsius": 95 }),
+        );
+        let cool = Envelope::new(
+            ConnectorId::new("sensor"),
+            EventKind::from_static("sensor.reading"),
+            serde_json::json!({ "celsius": 21 }),
+        );
+        // Wrong payload type → no match (not a JSON Value).
+        let typed = Envelope::new(
+            ConnectorId::new("sensor"),
+            EventKind::from_static("sensor.reading"),
+            95i32,
+        );
+
+        assert!(predicate.matches(&hot));
+        assert!(!predicate.matches(&cool));
+        assert!(!predicate.matches(&typed));
     }
 
     #[test]

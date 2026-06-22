@@ -42,8 +42,8 @@ pub use envelope::{
 pub use error::{OctoError, OctoResult};
 pub use ids::{ChannelId, ConnectorId, EventId, RuleId};
 pub use router::{
-    Route, RouteAction, RouteId, RoutePredicate, RouteStrategy, Router, RouterContext,
-    RuleBasedRouter,
+    NumOp, PayloadPredicate, Route, RouteAction, RouteId, RoutePredicate, RouteStrategy, Router,
+    RouterContext, RuleBasedRouter,
 };
 pub use runtime::{Octo, OctoBuilder};
 

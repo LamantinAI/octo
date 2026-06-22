@@ -19,7 +19,9 @@
 pub mod route;
 pub mod rule_based;
 
-pub use route::{Route, RouteAction, RouteId, RoutePredicate, RouteStrategy};
+pub use route::{
+    NumOp, PayloadPredicate, Route, RouteAction, RouteId, RoutePredicate, RouteStrategy,
+};
 pub use rule_based::{RouterState, RuleBasedRouter, RuleBasedRouterBuilder};
 
 use std::sync::Arc;
