@@ -84,9 +84,9 @@ impl Connector for ConsoleConnector {
                     Some(env) => {
                         if let Some(blob) = env.payload_as::<Blob>() {
                             // The console can't render images; show a placeholder.
-                            println!("🖼  [media: {}, {} bytes]", blob.content_type(), blob.len());
+                            println!("[media: {}, {} bytes]", blob.content_type(), blob.len());
                         } else if let Some(text) = env.payload_as::<String>() {
-                            println!("🤖 {text}");
+                            println!("bot> {text}");
                         }
                     }
                     None => return Ok(()),
