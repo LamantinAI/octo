@@ -17,12 +17,14 @@ use std::sync::Arc;
 
 use error::Result;
 use octo_connector_http::HttpConnector;
-use octo_connector_telegram::TelegramConnector;
 use octo_core::{Octo, PayloadRegistry};
 
 /// Absolute path to the dyn petstore manifest (cwd-independent).
 const PETSTORE_MANIFEST: &str =
     concat!(env!("CARGO_MANIFEST_DIR"), "/../config/connectors/petstore/petstore.toml");
+
+/// octolab runtime manifest — config-driven connectors (the Telegram channel).
+const OCTO_TOML: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/config/octo.toml");
 
 /// Repo-root `.env`, anchored on the manifest so cwd doesn't matter.
 const DOTENV_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../.env");
@@ -78,10 +80,16 @@ async fn main() -> Result<()> {
         .cogitator(cogitator::ReactCogitator::new("react", settings.clone(), history))
         .add_connector(petstore);
 
-    // ── User channel: official Telegram connector, or console fallback ───────
-    if let Some(token) = settings.telegram_token.clone() {
-        eprintln!("[octolab] channel: telegram");
-        builder = builder.add_connector(TelegramConnector::new("telegram", token));
+    // ── User channel: config-driven Telegram (with ACL), or console fallback ──
+    // With a token present, the Telegram connector is assembled from
+    // config/octo.toml via its factory: the token comes from the env, while
+    // authorization (the chat allow-list) lives in the connector's own
+    // telegram.toml + ACL file. Otherwise, console.
+    if settings.telegram_token.is_some() {
+        eprintln!("[octolab] channel: telegram (config-driven, ACL)");
+        builder = builder
+            .register_connector_type("telegram", octo_connector_telegram::factory())
+            .from_config_file(OCTO_TOML)?;
     } else {
         eprintln!("[octolab] channel: console (set OCTO_TELEGRAM_TOKEN for telegram)");
         builder = builder.add_connector(console::ConsoleConnector::new("console"));

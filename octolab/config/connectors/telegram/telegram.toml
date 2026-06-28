@@ -1,0 +1,14 @@
+[connector]
+id = "telegram"
+type = "telegram"
+
+# Bot token is a secret — kept in the env, named here (default OCTO_TELEGRAM_TOKEN).
+token_env = "OCTO_TELEGRAM_TOKEN"
+
+# Authorization: a chat not on the allow-list is dropped at the edge, before the
+# bus. The JSON file (resolved next to this manifest) is the mutable tier; a
+# missing file is fine — owner_chat below seeds the list so the bot answers you
+# on first run. **Set owner_chat to YOUR chat id** (ask @userinfobot), otherwise
+# the bot will silently ignore you.
+acl_path = "telegram_acl.json"
+owner_chat = 123456789

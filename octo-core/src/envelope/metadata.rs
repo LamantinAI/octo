@@ -48,6 +48,19 @@ pub enum TrustLevel {
     Untrusted,
 }
 
+impl TrustLevel {
+    /// Numeric rank — higher is more trusted. Used by [`Filter`](crate::Filter)
+    /// trust floors (the enum's declaration order doesn't encode this).
+    pub fn rank(self) -> u8 {
+        match self {
+            TrustLevel::High => 3,
+            TrustLevel::Medium => 2,
+            TrustLevel::Low => 1,
+            TrustLevel::Untrusted => 0,
+        }
+    }
+}
+
 /// Priority hint for dispatcher ordering and rate-limit class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

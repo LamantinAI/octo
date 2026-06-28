@@ -79,6 +79,10 @@ pub trait Connector: Send + Sync + 'static {
 /// they get it through the context, which the runtime constructs and passes
 /// in. This is the "шина сама появляется" property: a connector knows nothing
 /// about a specific bus instance until it's plugged into a runtime.
+///
+/// `Clone` is cheap (a token + an `Arc`) — a connector that spawns helper tasks
+/// can hand each a context to publish/subscribe from.
+#[derive(Clone)]
 pub struct ConnectorContext {
     pub shutdown: CancellationToken,
     bus: Arc<InProcessBus>,

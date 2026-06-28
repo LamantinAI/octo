@@ -1334,8 +1334,11 @@ dependencies = [
  "async-trait",
  "futures",
  "octo-core",
+ "serde",
+ "serde_json",
  "teloxide",
  "tokio",
+ "toml",
  "tracing",
 ]
 
