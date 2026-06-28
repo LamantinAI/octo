@@ -308,7 +308,7 @@ impl ReactCogitator {
         };
         if !is_owner(incoming) {
             tracing::warn!(source = %incoming.source, "acl command from non-owner — refused");
-            return Some("⛔ Управлять списком доступа может только владелец.".to_string());
+            return Some("Управлять списком доступа может только владелец.".to_string());
         }
         let payload = match cmd {
             "/allow" | "/deny" => match arg.parse::<i64>() {
@@ -434,7 +434,7 @@ fn format_acl_result(cmd: &str, payload: Option<&Value>) -> String {
         "/allow" => {
             let id = p.get("chat_id").and_then(Value::as_i64).unwrap_or_default();
             if p.get("added").and_then(Value::as_bool) == Some(true) {
-                format!("✅ Чат {id} добавлен (trusted).")
+                format!("Чат {id} добавлен (trusted).")
             } else {
                 format!("Чат {id} уже был в списке.")
             }
@@ -442,7 +442,7 @@ fn format_acl_result(cmd: &str, payload: Option<&Value>) -> String {
         "/deny" => {
             let id = p.get("chat_id").and_then(Value::as_i64).unwrap_or_default();
             if p.get("removed").and_then(Value::as_bool) == Some(true) {
-                format!("✅ Чат {id} удалён.")
+                format!("Чат {id} удалён.")
             } else {
                 format!("Чата {id} не было в списке.")
             }
@@ -468,7 +468,7 @@ fn format_acl_result(cmd: &str, payload: Option<&Value>) -> String {
 fn command_reply(text: &str) -> Option<String> {
     match text.trim() {
         "/start" => Some(
-            "👋 Привет! Я Octo — агент на event-driven рантайме. Напиши сообщение, и я отвечу \
+            "Привет! Я Octo — агент на event-driven рантайме. Напиши сообщение, и я отвечу \
              (с памятью в рамках чата). Доступные коннекторы (напр. petstore) дёргаю инструментом сам. \
              /help — что умею."
                 .to_string(),

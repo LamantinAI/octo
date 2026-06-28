@@ -188,7 +188,7 @@ impl Connector for ProgressiveSink {
                             }
                             (Some(_), None) => {
                                 eprintln!(
-                                    "[sink {}] ⚠ stream chunk without correlation_id; dropping",
+                                    "[sink {}] warning: stream chunk without correlation_id; dropping",
                                     self.id
                                 );
                             }
