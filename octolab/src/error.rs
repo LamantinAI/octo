@@ -11,6 +11,9 @@ pub enum Error {
     #[error("octo runtime: {0}")]
     Octo(#[from] octo_core::OctoError),
 
+    #[error("octo config: {0}")]
+    OctoConfig(#[from] octo_core::ConfigError),
+
     #[error("http connector spec: {0}")]
     HttpSpec(#[from] octo_connector_http::SpecError),
 

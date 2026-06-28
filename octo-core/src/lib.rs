@@ -108,6 +108,23 @@ mod tests {
         assert!(!Filter::by_target(ConnectorId::new("alerter")).matches(&env));
     }
 
+    #[test]
+    fn filter_min_trust_gates_channel_envelopes_only() {
+        let f = Filter::all().with_min_trust(TrustLevel::Medium);
+
+        let high = Envelope::new(ConnectorId::new("tg"), EventKind::from_static("chat.message"), ())
+            .with_channel_metadata(ChannelMetadata::new().with_trust(TrustLevel::High));
+        assert!(f.matches(&high), "trusted channel passes");
+
+        let low = Envelope::new(ConnectorId::new("tg"), EventKind::from_static("chat.message"), ())
+            .with_channel_metadata(ChannelMetadata::new().with_trust(TrustLevel::Low));
+        assert!(!f.matches(&low), "below-floor channel is dropped");
+
+        let internal =
+            Envelope::new(ConnectorId::new("petstore"), EventKind::from_static("pet.result"), ());
+        assert!(f.matches(&internal), "internal (no metadata) traffic passes");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn bus_publish_subscribe_roundtrip() {
         let bus = InProcessBus::new(16);

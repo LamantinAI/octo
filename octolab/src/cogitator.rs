@@ -15,6 +15,7 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use octo_core::{
@@ -22,6 +23,7 @@ use octo_core::{
     Subscription,
 };
 use octo_rig::OctoDispatchTool;
+use serde_json::{json, Value};
 
 use crate::config::Settings;
 use crate::error::Result;
@@ -152,6 +154,14 @@ impl ReactCogitator {
                 self.record(&channel_key, text, marker).await;
                 return;
             }
+            // Reflex: owner-only ACL admin (/allow /deny /allowed). A security
+            // action stays deterministic (no LLM that could be talked into it);
+            // authorization is checked against the *incoming* message's trust.
+            if let Some(reply) = self.acl_command(&text, &incoming, ctx).await {
+                self.emit_reply(&incoming, reply, ctx).await;
+                self.record(&channel_key, text, "(acl command)".into()).await;
+                return;
+            }
         }
 
         tracing::info!(source = %incoming.source, channel = %channel_key, has_image = image.is_some(), "← {text}");
@@ -274,6 +284,47 @@ impl ReactCogitator {
         self.emit(incoming, text, ctx).await;
     }
 
+    /// Owner-only ACL admin: `/allow <id>`, `/deny <id>`, `/allowed`. Returns the
+    /// reply text if `text` is such a command, else `None` (not handled here).
+    /// Dispatches an `octo.telegram.*` control command to the Telegram connector
+    /// — but only after checking the *incoming* message came from an owner-trust
+    /// channel, so a non-owner can't escalate.
+    async fn acl_command(
+        &self,
+        text: &str,
+        incoming: &Envelope,
+        ctx: &CogitatorContext,
+    ) -> Option<String> {
+        let trimmed = text.trim();
+        let (cmd, arg) = match trimmed.split_once(char::is_whitespace) {
+            Some((c, a)) => (c, a.trim()),
+            None => (trimmed, ""),
+        };
+        let kind = match cmd {
+            "/allow" => "octo.telegram.allow_chat",
+            "/deny" => "octo.telegram.remove_chat",
+            "/allowed" => "octo.telegram.list_chats",
+            _ => return None,
+        };
+        if !is_owner(incoming) {
+            tracing::warn!(source = %incoming.source, "acl command from non-owner — refused");
+            return Some("⛔ Управлять списком доступа может только владелец.".to_string());
+        }
+        let payload = match cmd {
+            "/allow" | "/deny" => match arg.parse::<i64>() {
+                Ok(id) => json!({ "chat_id": id, "role": "trusted" }),
+                Err(_) => return Some(format!("Использование: {cmd} <chat_id>")),
+            },
+            _ => json!({}),
+        };
+        let req = Envelope::new(self.self_source.clone(), EventKind::new(kind), payload)
+            .with_target(ConnectorId::new("telegram"));
+        match ctx.publish_and_await_response(req, Duration::from_secs(5)).await {
+            Ok(resp) => Some(format_acl_result(cmd, resp.payload_as::<Value>())),
+            Err(e) => Some(format!("Команда не выполнена: {e}")),
+        }
+    }
+
     async fn send_image(&self, incoming: &Envelope, ctx: &CogitatorContext) {
         match fetch_image("https://picsum.photos/400").await {
             Ok(blob) => {
@@ -360,6 +411,58 @@ async fn fetch_image(url: &str) -> Result<Blob> {
         .to_string();
     let bytes = resp.bytes().await?;
     Ok(Blob::new(bytes, content_type).with_filename("image.jpg"))
+}
+
+/// Whether an incoming message came from an owner-trust channel. The Telegram
+/// connector stamps `role = "owner"` on the owner's chat metadata.
+fn is_owner(env: &Envelope) -> bool {
+    env.channel_metadata
+        .as_ref()
+        .and_then(|m| m.tags.get("role"))
+        .map(|r| r.as_str() == "owner")
+        .unwrap_or(false)
+}
+
+/// Render an `octo.telegram.*.result` payload into a user-facing reply.
+fn format_acl_result(cmd: &str, payload: Option<&Value>) -> String {
+    let p = payload.cloned().unwrap_or(Value::Null);
+    if p.get("ok").and_then(Value::as_bool) != Some(true) {
+        let err = p.get("error").and_then(Value::as_str).unwrap_or("неизвестная ошибка");
+        return format!("Ошибка: {err}");
+    }
+    match cmd {
+        "/allow" => {
+            let id = p.get("chat_id").and_then(Value::as_i64).unwrap_or_default();
+            if p.get("added").and_then(Value::as_bool) == Some(true) {
+                format!("✅ Чат {id} добавлен (trusted).")
+            } else {
+                format!("Чат {id} уже был в списке.")
+            }
+        }
+        "/deny" => {
+            let id = p.get("chat_id").and_then(Value::as_i64).unwrap_or_default();
+            if p.get("removed").and_then(Value::as_bool) == Some(true) {
+                format!("✅ Чат {id} удалён.")
+            } else {
+                format!("Чата {id} не было в списке.")
+            }
+        }
+        _ => {
+            let chats = p.get("chats").and_then(Value::as_array).cloned().unwrap_or_default();
+            if chats.is_empty() {
+                return "Список доступа пуст.".to_string();
+            }
+            let lines: Vec<String> = chats
+                .iter()
+                .map(|c| {
+                    let id = c.get("chat_id").and_then(Value::as_i64).unwrap_or_default();
+                    let role = c.get("role").and_then(Value::as_str).unwrap_or("?");
+                    format!("• {id} — {role}")
+                })
+                .collect();
+            format!("Список доступа:\n{}", lines.join("\n"))
+        }
+    }
 }
 
 fn command_reply(text: &str) -> Option<String> {

@@ -15,7 +15,7 @@ use tokio::sync::{broadcast, Notify};
 
 use crate::{
     BackpressureStrategy, ChannelId, ConnectorId, Envelope, EventId, EventKind, OctoError,
-    OctoResult, PayloadRegistry, SubscribeOptions,
+    OctoResult, PayloadRegistry, SubscribeOptions, TrustLevel,
 };
 
 /// Abstraction over the in-process bus — the medium between connector actors
@@ -79,6 +79,11 @@ pub struct Filter {
     /// broker-style request/response pattern: subscriber filters by the id of
     /// the command it published, responder sets `correlation_id` on the reply.
     pub correlation_ids: Option<Vec<EventId>>,
+    /// Minimum channel trust. An envelope carrying `channel_metadata` **below**
+    /// this level is filtered out — the general, runtime-level trust gate a
+    /// subscriber (e.g. a cogitator) sets so untrusted input never reaches it.
+    /// Envelopes with **no** `channel_metadata` (internal/system traffic) pass.
+    pub min_trust: Option<TrustLevel>,
 }
 
 impl Filter {
@@ -143,6 +148,15 @@ impl Filter {
         self
     }
 
+    /// Require a minimum channel trust. Channel-tagged envelopes below `level`
+    /// are filtered out; envelopes with no `channel_metadata` (internal traffic)
+    /// still pass. A general trust gate, complementary to a connector dropping
+    /// untrusted at its own edge.
+    pub fn with_min_trust(mut self, level: TrustLevel) -> Self {
+        self.min_trust = Some(level);
+        self
+    }
+
     pub fn matches(&self, env: &Envelope) -> bool {
         if let Some(kinds) = &self.kinds {
             if !kinds.iter().any(|p| p.matches(&env.kind)) {
@@ -170,6 +184,15 @@ impl Filter {
             match &env.correlation_id {
                 Some(cid) if correlation_ids.contains(cid) => {}
                 _ => return false,
+            }
+        }
+        if let Some(min) = self.min_trust {
+            // Only channel-tagged envelopes are gated; internal/system traffic
+            // (no channel_metadata) passes through.
+            if let Some(meta) = &env.channel_metadata {
+                if meta.trust.rank() < min.rank() {
+                    return false;
+                }
             }
         }
         true

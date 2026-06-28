@@ -1,0 +1,30 @@
+# Example Telegram connector manifest (type = "telegram").
+#
+# Register the factory in code, then point the builder at an octo.toml whose
+# [connectors] dir contains this file:
+#
+#   Octo::builder()
+#       .register_connector_type("telegram", octo_connector_telegram::factory())
+#       .from_config_file("octo.toml")?
+#
+# Kept crate-local (not under the repo's shared config/connectors/) so it isn't
+# picked up by the http connector's config-load tests.
+
+[connector]
+id = "telegram"
+type = "telegram"
+
+# The bot token is a SECRET — it stays in the environment, named here (not the
+# value). Default is OCTO_TELEGRAM_TOKEN; override only if you run several bots.
+token_env = "OCTO_TELEGRAM_TOKEN"
+
+# Authorization: path (relative to this manifest) to the JSON allow-list. A chat
+# not on the list is dropped at the edge, before the bus — untrusted input never
+# reaches cognition. The file is the *mutable* tier (an owner extends it at
+# runtime in a later phase); this manifest is the static config.
+acl_path = "telegram_acl.json"
+
+# Seed owner chat id — added to the ACL at role "owner", so the bot is reachable
+# on first run even with an empty/absent ACL file. Replace with YOUR chat id
+# (e.g. ask @userinfobot). Omit acl_path AND owner_chat to disable auth entirely.
+owner_chat = 123456789
