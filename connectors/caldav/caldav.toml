@@ -1,0 +1,38 @@
+# Example CalDAV connector manifest (type = "caldav"). One manifest per calendar,
+# so ten calendars = ten of these files, zero new code. Register the factory once:
+#
+#   Octo::builder()
+#       .register_connector_type("caldav", octo_connector_caldav::factory())
+#       .from_config_file("octo.toml")?
+#
+# Kept crate-local (not under the repo's shared config/connectors/) so it isn't
+# picked up by other connectors' config-load tests.
+
+[connector]
+id = "calendar-work"
+type = "caldav"
+
+# The calendar collection can be given two ways:
+#
+# 1. Discovery (recommended): give only the server root as `base_url`. The
+#    connector resolves the collection URL on first use via PROPFIND
+#    (current-user-principal -> calendar-home-set -> pick a VEVENT calendar),
+#    the same way desktop clients do. Optionally narrow by display name with
+#    `calendar`; otherwise the first VEVENT calendar is chosen.
+base_url = "https://caldav.yandex.ru"
+# calendar = "My events"
+#
+# 2. Explicit: skip discovery and pin a full collection URL with `collection`.
+#    Collections are opaque, server-assigned URLs, so this is only handy when
+#    you already know it. Provider examples:
+#      Yandex:    https://caldav.yandex.ru/calendars/<user>/events-37856064/
+#      Fastmail:  https://caldav.fastmail.com/dav/calendars/user/<user>/<id>/
+#      Nextcloud: https://<host>/remote.php/dav/calendars/<user>/personal/
+# collection = "https://caldav.yandex.ru/calendars/user@yandex.ru/events-default/"
+
+# Auth (octo-http-auth). Yandex / Fastmail / iCloud / Nextcloud use basic auth with
+# an APP PASSWORD (never the account password!), read from the named env var.
+# Google is auth = "oauth2" (bearer + refresh) — planned, not yet wired.
+auth = "basic"
+login = "user@yandex.ru"
+password_env = "OCTO_YANDEX_APP_PASSWORD"
