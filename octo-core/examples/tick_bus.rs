@@ -1,4 +1,4 @@
-//! Minimal end-to-end check of the runtime ("бульон").
+//! Minimal end-to-end check of the runtime (the "broth").
 //!
 //! `TickConnector` knows nothing about a specific bus. It's plugged into an
 //! [`Octo`] runtime via the builder; the runtime constructs a

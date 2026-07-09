@@ -84,12 +84,16 @@ dot-namespaced with glob matching (`vision.**`, `mqtt.factory.*`). An optional
 ```
 octo/                       ← workspace root
 ├── octo-core/              ← the kernel: bus, envelope, connectors, lifecycle, router, runtime
-├── octo-history/           ← pluggable per-channel conversation history (in-memory / file)
+├── components/             ← pluggable, backend-swappable libraries (not the kernel, not connectors)
+│   ├── history/            ← per-channel conversation history (in-memory / file backends)
+│   └── http-auth/          ← reusable auth modes for connectors (basic / bearer / oauth2)
 ├── octo-rig/               ← a rig Tool bridging native LLM tool-calling → connector dispatch
 ├── connectors/
 │   ├── http/               ← dynamic, TOML-configured HTTP connector (one crate, many APIs)
 │   ├── petstore/           ← example HTTP connector instance
-│   └── telegram/           ← bidirectional Telegram connector (teloxide)
+│   ├── telegram/           ← bidirectional Telegram connector (teloxide)
+│   ├── scheduler/          ← manageable-actor scheduler (control commands mutate persisted state)
+│   └── caldav/             ← generic CalDAV calendar connector (one crate, many calendars)
 └── octolab/                ← playground: a real ReAct LLM agent over the runtime
 ```
 

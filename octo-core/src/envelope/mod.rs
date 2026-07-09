@@ -50,7 +50,7 @@ pub struct Envelope {
     /// `None` for input/observation envelopes.
     pub target: Option<ConnectorId>,
 
-    /// Channel within the source connector ("присоска"), if applicable.
+    /// Channel within the source connector (a sucker), if applicable.
     pub channel: Option<ChannelId>,
 
     /// Typed event identifier (`vision.incident.fight`, `telegram.command`, ...).

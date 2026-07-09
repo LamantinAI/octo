@@ -308,12 +308,12 @@ impl ReactCogitator {
         };
         if !is_owner(incoming) {
             tracing::warn!(source = %incoming.source, "acl command from non-owner — refused");
-            return Some("Управлять списком доступа может только владелец.".to_string());
+            return Some("Only the owner may manage the access list.".to_string());
         }
         let payload = match cmd {
             "/allow" | "/deny" => match arg.parse::<i64>() {
                 Ok(id) => json!({ "chat_id": id, "role": "trusted" }),
-                Err(_) => return Some(format!("Использование: {cmd} <chat_id>")),
+                Err(_) => return Some(format!("Usage: {cmd} <chat_id>")),
             },
             _ => json!({}),
         };
@@ -321,7 +321,7 @@ impl ReactCogitator {
             .with_target(ConnectorId::new("telegram"));
         match ctx.publish_and_await_response(req, Duration::from_secs(5)).await {
             Ok(resp) => Some(format_acl_result(cmd, resp.payload_as::<Value>())),
-            Err(e) => Some(format!("Команда не выполнена: {e}")),
+            Err(e) => Some(format!("Command failed: {e}")),
         }
     }
 
@@ -333,7 +333,7 @@ impl ReactCogitator {
             }
             Err(e) => {
                 tracing::warn!(error = %e, "image fetch failed");
-                self.emit(incoming, format!("Не удалось загрузить картинку: {e}"), ctx)
+                self.emit(incoming, format!("Failed to load the image: {e}"), ctx)
                     .await;
             }
         }
@@ -427,30 +427,30 @@ fn is_owner(env: &Envelope) -> bool {
 fn format_acl_result(cmd: &str, payload: Option<&Value>) -> String {
     let p = payload.cloned().unwrap_or(Value::Null);
     if p.get("ok").and_then(Value::as_bool) != Some(true) {
-        let err = p.get("error").and_then(Value::as_str).unwrap_or("неизвестная ошибка");
-        return format!("Ошибка: {err}");
+        let err = p.get("error").and_then(Value::as_str).unwrap_or("unknown error");
+        return format!("Error: {err}");
     }
     match cmd {
         "/allow" => {
             let id = p.get("chat_id").and_then(Value::as_i64).unwrap_or_default();
             if p.get("added").and_then(Value::as_bool) == Some(true) {
-                format!("Чат {id} добавлен (trusted).")
+                format!("Chat {id} added (trusted).")
             } else {
-                format!("Чат {id} уже был в списке.")
+                format!("Chat {id} was already on the list.")
             }
         }
         "/deny" => {
             let id = p.get("chat_id").and_then(Value::as_i64).unwrap_or_default();
             if p.get("removed").and_then(Value::as_bool) == Some(true) {
-                format!("Чат {id} удалён.")
+                format!("Chat {id} removed.")
             } else {
-                format!("Чата {id} не было в списке.")
+                format!("Chat {id} was not on the list.")
             }
         }
         _ => {
             let chats = p.get("chats").and_then(Value::as_array).cloned().unwrap_or_default();
             if chats.is_empty() {
-                return "Список доступа пуст.".to_string();
+                return "The access list is empty.".to_string();
             }
             let lines: Vec<String> = chats
                 .iter()
@@ -460,7 +460,7 @@ fn format_acl_result(cmd: &str, payload: Option<&Value>) -> String {
                     format!("• {id} — {role}")
                 })
                 .collect();
-            format!("Список доступа:\n{}", lines.join("\n"))
+            format!("Access list:\n{}", lines.join("\n"))
         }
     }
 }
@@ -468,16 +468,16 @@ fn format_acl_result(cmd: &str, payload: Option<&Value>) -> String {
 fn command_reply(text: &str) -> Option<String> {
     match text.trim() {
         "/start" => Some(
-            "Привет! Я Octo — агент на event-driven рантайме. Напиши сообщение, и я отвечу \
-             (с памятью в рамках чата). Доступные коннекторы (напр. petstore) дёргаю инструментом сам. \
-             /help — что умею."
+            "Hi! I'm Octo — an agent on an event-driven runtime. Send a message and I'll reply \
+             (with per-chat history). I reach available connectors (e.g. petstore) via a tool myself. \
+             /help for what I can do."
                 .to_string(),
         ),
         "/help" => Some(
-            "Я ReAct-агент поверх Octo-рантайма (rig native tool-calling).\n\
-             • любой текст → ответ; при нужде сам схожу в коннектор инструментом\n\
-             • /pic → картинка\n\
-             • /start, /help → мгновенно, без LLM"
+            "I'm a ReAct agent on the Octo runtime (rig native tool-calling).\n\
+             - any text -> a reply; I'll call a connector via a tool when needed\n\
+             - /pic -> an image\n\
+             - /start, /help -> instant, no LLM"
                 .to_string(),
         ),
         _ => None,

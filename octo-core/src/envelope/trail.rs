@@ -63,7 +63,7 @@ pub enum TrailAction {
     Emit { kind: EventKind },
     /// Added classification tags without acting.
     Tag { added: Vec<String> },
-    /// Issued an immediate acknowledgement (e.g. "обрабатываю..." in act+escalate mode).
+    /// Issued an immediate acknowledgement (e.g. "processing..." in act+escalate mode).
     Ack { ack_msg_id: Option<String> },
     /// Made a final decision.
     Decision { summary: String },
