@@ -1,0 +1,21 @@
+[package]
+name = "octo-http-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Reusable HTTP/network authentication modes for Octo connectors: Basic (app password) and Bearer now, OAuth2 (bearer + refresh) planned. Config-deserializable, secrets read from the environment. Shared by the CalDAV / SMTP / HTTP connectors so a new provider is a config preset, not new code."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+base64 = { workspace = true }
+reqwest = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+toml = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
