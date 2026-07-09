@@ -1,0 +1,27 @@
+[package]
+name = "octo-connector-caldav"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Generic CalDAV connector for the Octo runtime (RFC 4791). One crate, many calendars — Yandex, Fastmail, Nextcloud, iCloud, Google. Bidirectional organ: list/create/delete events via env-as-tools dispatch. Auth via octo-http-auth (basic app-password now, oauth2 planned)."
+
+[dependencies]
+octo-core = { path = "../../octo-core" }
+octo-http-auth = { path = "../../components/http-auth" }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+icalendar = "0.16"
+quick-xml = "0.36"
+toml = { workspace = true }
+
+[dev-dependencies]
+tokio-util = { workspace = true }
