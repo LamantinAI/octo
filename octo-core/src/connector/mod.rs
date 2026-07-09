@@ -3,7 +3,7 @@
 //! A **connector** is the protocol/transport layer — describes *what source*,
 //! its *direction*, and the *transport implementation* (Bot API long-polling,
 //! MQTT subscribe, RTSP handler). One connector instance per "way to reach
-//! into the world". Channels (присоски) live inside connectors.
+//! into the world". Channels (suckers) live inside connectors.
 //!
 //! This module groups everything that defines a connector and its companion
 //! abstractions:
@@ -77,7 +77,7 @@ pub trait Connector: Send + Sync + 'static {
 /// Carries the shutdown signal and a handle to the runtime's bus (publish +
 /// subscribe). Connectors should not hold references to a bus directly —
 /// they get it through the context, which the runtime constructs and passes
-/// in. This is the "шина сама появляется" property: a connector knows nothing
+/// in. This is the "the bus appears on its own" property: a connector knows nothing
 /// about a specific bus instance until it's plugged into a runtime.
 ///
 /// `Clone` is cheap (a token + an `Arc`) — a connector that spawns helper tasks

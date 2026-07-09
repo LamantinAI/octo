@@ -427,7 +427,7 @@ fn spawn_forwarder(
 
 /// In-process event bus — `tokio::sync::broadcast` based.
 ///
-/// The bus is the medium between actors inside the runtime ("бульон с веществами").
+/// The bus is the medium between actors inside the runtime (the "broth").
 /// Not a transport abstraction — distributed messaging is explicitly out of scope.
 ///
 /// Backpressure: the default subscription rides the broadcast directly

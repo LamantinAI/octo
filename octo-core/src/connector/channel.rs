@@ -1,4 +1,4 @@
-//! Channel — sub-actor inside a connector ("присоска" on a "щупальце").
+//! Channel — sub-actor inside a connector (a sucker on a tentacle).
 //!
 //! A channel is an instance representing one specific source (a chat_id, an MQTT
 //! topic, an RTSP stream). It owns the per-source mailbox, lifecycle FSM and

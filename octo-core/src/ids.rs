@@ -60,7 +60,7 @@ impl From<String> for ConnectorId {
 /// Channel identifier — string-based, scoped per connector.
 ///
 /// Convention: `<topic>` or `<chat_id>` or `<source_path>`. Channel is the
-/// "присоска" (sucker) on a connector ("щупальце") — see `connector_channel_split`
+/// A sucker on a connector (a tentacle) — see `connector_channel_split`
 /// vault draft.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ChannelId(String);

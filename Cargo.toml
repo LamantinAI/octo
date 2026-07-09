@@ -2,22 +2,27 @@
 resolver = "2"
 members = [
     "octo-core",
-    "octo-history",
+    "components/history",
+    "components/http-auth",
     "connectors/petstore",
     "connectors/http",
     "connectors/telegram",
     "connectors/scheduler",
+    "connectors/caldav",
     "octo-rig",
     "octolab",
 ]
 # Keep `cargo test` (no --workspace) light — octo-rig/telegram/octolab pull the
-# rig/LLM and teloxide trees. octo-history is light, so it stays in the default set.
+# rig/LLM and teloxide trees. The components/ libs are light, so they stay in the
+# default set.
 default-members = [
     "octo-core",
-    "octo-history",
+    "components/history",
+    "components/http-auth",
     "connectors/petstore",
     "connectors/http",
     "connectors/scheduler",
+    "connectors/caldav",
 ]
 
 [workspace.package]
@@ -44,3 +49,4 @@ futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 toml = "0.8"
 teloxide = "0.17"
+base64 = "0.22"
