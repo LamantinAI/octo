@@ -61,13 +61,22 @@ pub struct CaldavConnector {
     resolved: OnceCell<String>,
     auth: HttpAuth,
     client: reqwest::Client,
+    /// Timezone used to render event `start`/`end` for the agent (UTC by default;
+    /// set to the owner's zone so listed times read as local wall-clock).
+    display_tz: chrono_tz::Tz,
 }
 
 impl CaldavConnector {
     /// A calendar instance bound to a known CalDAV `collection` URL, authenticated
     /// via `auth`. Uses a default HTTP client.
     pub fn new(id: impl Into<String>, collection: impl Into<String>, auth: AuthConfig) -> Arc<Self> {
-        Self::from_source(id, CollectionSource::Explicit(collection.into()), auth, reqwest::Client::new())
+        Self::from_source(
+            id,
+            CollectionSource::Explicit(collection.into()),
+            auth,
+            reqwest::Client::new(),
+            chrono_tz::UTC,
+        )
     }
 
     /// A calendar instance that discovers its collection URL from a server root.
@@ -80,7 +89,7 @@ impl CaldavConnector {
         auth: AuthConfig,
     ) -> Arc<Self> {
         let source = CollectionSource::Discover { base_url: base_url.into(), calendar };
-        Self::from_source(id, source, auth, reqwest::Client::new())
+        Self::from_source(id, source, auth, reqwest::Client::new(), chrono_tz::UTC)
     }
 
     /// As [`new`](Self::new), sharing a caller-supplied HTTP client (pool reuse /
@@ -91,7 +100,13 @@ impl CaldavConnector {
         auth: AuthConfig,
         client: reqwest::Client,
     ) -> Arc<Self> {
-        Self::from_source(id, CollectionSource::Explicit(collection.into()), auth, client)
+        Self::from_source(
+            id,
+            CollectionSource::Explicit(collection.into()),
+            auth,
+            client,
+            chrono_tz::UTC,
+        )
     }
 
     /// The general constructor: a [`CollectionSource`] and a shared HTTP client.
@@ -100,6 +115,7 @@ impl CaldavConnector {
         source: CollectionSource,
         auth: AuthConfig,
         client: reqwest::Client,
+        display_tz: chrono_tz::Tz,
     ) -> Arc<Self> {
         let capabilities = ConnectorCapabilities::bidirectional()
             .with_accept_kinds([
@@ -121,6 +137,7 @@ impl CaldavConnector {
             // The OAuth2 refresh (when configured) shares this connector's client.
             auth: HttpAuth::with_client(auth, client.clone()),
             client,
+            display_tz,
         })
     }
 
@@ -187,7 +204,8 @@ impl CaldavConnector {
                 LIST => {
                     let from = params.get("from").and_then(Value::as_str).unwrap_or_default();
                     let to = params.get("to").and_then(Value::as_str).unwrap_or_default();
-                    dav::list_events(&self.client, collection, &self.auth, from, to).await
+                    dav::list_events(&self.client, collection, &self.auth, from, to, self.display_tz)
+                        .await
                 }
                 CREATE => {
                     let uid = EventId::new().to_string();
@@ -265,7 +283,15 @@ impl ConnectorFactory for CaldavConnectorFactory {
         // AuthConfig reads `auth`/`login`/`password_env` from the same table
         // (extra keys like id/type/collection/base_url are ignored).
         let auth: AuthConfig = table.clone().try_into()?;
-        Ok(CaldavConnector::from_source(id.as_str(), source, auth, self.client.clone()))
+        // Optional `timezone` (IANA name) renders listed event times as local
+        // wall-clock for the agent; defaults to UTC.
+        let display_tz = match table.get("timezone").and_then(|v| v.as_str()) {
+            Some(name) => name.parse::<chrono_tz::Tz>().map_err(|e| {
+                format!("caldav: invalid timezone `{name}`: {e}")
+            })?,
+            None => chrono_tz::UTC,
+        };
+        Ok(CaldavConnector::from_source(id.as_str(), source, auth, self.client.clone(), display_tz))
     }
 }
 
