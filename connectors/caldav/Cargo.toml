@@ -22,6 +22,8 @@ tracing = { workspace = true }
 icalendar = "0.16"
 quick-xml = "0.36"
 toml = { workspace = true }
+rrule = "0.14"
+chrono-tz = "0.10"
 
 [dev-dependencies]
 tokio-util = { workspace = true }
