@@ -41,6 +41,7 @@ pub async fn list_events(
     auth: &HttpAuth,
     from: &str,
     to: &str,
+    tz: chrono_tz::Tz,
 ) -> Result<Value, DavError> {
     let start = to_ical_utc(from)?;
     let end = to_ical_utc(to)?;
@@ -73,7 +74,7 @@ pub async fn list_events(
     let win_end = to_utc(to)?;
     let mut events = Vec::new();
     for ical in extract_calendar_data(&text)? {
-        expand_calendar(&ical, win_start, win_end, &mut events);
+        expand_calendar(&ical, win_start, win_end, tz, &mut events);
     }
     Ok(json!({ "events": events }))
 }
@@ -171,7 +172,13 @@ impl RawVevent {
 
 /// Parse one VCALENDAR blob, expanding recurrences into the window and pushing
 /// each resulting event as JSON onto `out`.
-fn expand_calendar(ical: &str, win_start: DateTime<Utc>, win_end: DateTime<Utc>, out: &mut Vec<Value>) {
+fn expand_calendar(
+    ical: &str,
+    win_start: DateTime<Utc>,
+    win_end: DateTime<Utc>,
+    tz: chrono_tz::Tz,
+    out: &mut Vec<Value>,
+) {
     let vevents = parse_vevents(ical);
     let (masters, overrides): (Vec<_>, Vec<_>) =
         vevents.iter().partition(|ve| ve.get("RECURRENCE-ID").is_none());
@@ -194,7 +201,7 @@ fn expand_calendar(ical: &str, win_start: DateTime<Utc>, win_end: DateTime<Utc>,
         }
         if let Some(start) = ov.datetime("DTSTART") {
             if start >= win_start && start <= win_end {
-                out.push(emit(ov, start, start + duration_of(ov, start)));
+                out.push(emit(ov, start, start + duration_of(ov, start), tz));
             }
         }
     }
@@ -205,7 +212,7 @@ fn expand_calendar(ical: &str, win_start: DateTime<Utc>, win_end: DateTime<Utc>,
         let recurring = m.all("RRULE").next().is_some() || m.all("RDATE").next().is_some();
         if !recurring {
             // Single event — the server already constrained it to the window.
-            out.push(emit(m, start, start + dur));
+            out.push(emit(m, start, start + dur, tz));
             continue;
         }
         match expand_master(m, win_start, win_end) {
@@ -215,14 +222,14 @@ fn expand_calendar(ical: &str, win_start: DateTime<Utc>, win_end: DateTime<Utc>,
                     if overridden.contains(&(uid.clone(), occ.timestamp())) {
                         continue; // replaced by a RECURRENCE-ID instance emitted above
                     }
-                    out.push(emit(m, occ, occ + dur));
+                    out.push(emit(m, occ, occ + dur, tz));
                 }
             }
             // Couldn't expand (unparseable rule/tz) — surface the master rather
             // than lose the event; its date will be the series origin.
             None => {
                 tracing::debug!(uid = m.value("UID").unwrap_or_default(), "caldav: RRULE expansion failed; emitting master as-is");
-                out.push(emit(m, start, start + dur));
+                out.push(emit(m, start, start + dur, tz));
             }
         }
     }
@@ -264,8 +271,10 @@ fn expand_master(
 }
 
 /// Build the JSON event Albert sees: `{ uid, title, start, end, location? }`,
-/// with `start`/`end` normalised to RFC3339 UTC.
-fn emit(ve: &RawVevent, start: DateTime<Utc>, end: DateTime<Utc>) -> Value {
+/// with `start`/`end` as RFC3339 in the configured display timezone `tz` (UTC
+/// renders with a `Z`, other zones with their offset, e.g. `+03:00`), so the
+/// agent reads local wall-clock times without doing any timezone arithmetic.
+fn emit(ve: &RawVevent, start: DateTime<Utc>, end: DateTime<Utc>, tz: chrono_tz::Tz) -> Value {
     let mut o = Map::new();
     if let Some(v) = ve.value("UID") {
         o.insert("uid".into(), json!(v));
@@ -273,8 +282,9 @@ fn emit(ve: &RawVevent, start: DateTime<Utc>, end: DateTime<Utc>) -> Value {
     if let Some(v) = ve.value("SUMMARY") {
         o.insert("title".into(), json!(unescape_text(v)));
     }
-    o.insert("start".into(), json!(start.to_rfc3339_opts(SecondsFormat::Secs, true)));
-    o.insert("end".into(), json!(end.to_rfc3339_opts(SecondsFormat::Secs, true)));
+    let render = |dt: DateTime<Utc>| dt.with_timezone(&tz).to_rfc3339_opts(SecondsFormat::Secs, true);
+    o.insert("start".into(), json!(render(start)));
+    o.insert("end".into(), json!(render(end)));
     if let Some(v) = ve.value("LOCATION") {
         o.insert("location".into(), json!(unescape_text(v)));
     }
@@ -817,7 +827,7 @@ END:VCALENDAR&#13;
                    END:VEVENT\r\nEND:VCALENDAR\r\n";
         let (s, e) = win("2026-01-01T00:00:00Z", "2026-02-01T00:00:00Z");
         let mut out = Vec::new();
-        expand_calendar(ics, s, e, &mut out);
+        expand_calendar(ics, s, e, chrono_tz::UTC, &mut out);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["uid"], "abc-123");
         assert_eq!(out[0]["title"], "Standup");
@@ -837,7 +847,7 @@ END:VCALENDAR&#13;
                    RRULE:FREQ=DAILY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
         let (s, e) = win("2026-07-10T00:00:00Z", "2026-07-11T00:00:00Z");
         let mut out = Vec::new();
-        expand_calendar(ics, s, e, &mut out);
+        expand_calendar(ics, s, e, chrono_tz::UTC, &mut out);
         assert_eq!(out.len(), 1, "exactly one occurrence in the one-day window");
         assert_eq!(out[0]["title"], "Standup");
         assert_eq!(out[0]["start"], "2026-07-10T07:15:00Z");
@@ -859,7 +869,7 @@ END:VCALENDAR&#13;
                    END:VCALENDAR\r\n";
         let (s, e) = win("2026-07-10T00:00:00Z", "2026-07-11T00:00:00Z");
         let mut out = Vec::new();
-        expand_calendar(ics, s, e, &mut out);
+        expand_calendar(ics, s, e, chrono_tz::UTC, &mut out);
         assert_eq!(out.len(), 1, "override replaces the instance, no duplicate");
         assert_eq!(out[0]["start"], "2026-07-10T11:00:00Z"); // 14:00 MSK, moved
     }
@@ -872,8 +882,21 @@ END:VCALENDAR&#13;
                    EXDATE;TZID=Europe/Moscow:20260710T101500\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
         let (s, e) = win("2026-07-10T00:00:00Z", "2026-07-11T00:00:00Z");
         let mut out = Vec::new();
-        expand_calendar(ics, s, e, &mut out);
+        expand_calendar(ics, s, e, chrono_tz::UTC, &mut out);
         assert!(out.is_empty(), "EXDATE-excluded day yields nothing");
+    }
+
+    #[test]
+    fn renders_start_end_in_display_timezone() {
+        // Same UTC instant, rendered for Europe/Moscow → local wall-clock + offset.
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:tz-1\r\nSUMMARY:Standup\r\n\
+                   DTSTART:20260710T071500Z\r\nDTEND:20260710T074500Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let (s, e) = win("2026-07-10T00:00:00Z", "2026-07-11T00:00:00Z");
+        let mut out = Vec::new();
+        expand_calendar(ics, s, e, chrono_tz::Europe::Moscow, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["start"], "2026-07-10T10:15:00+03:00");
+        assert_eq!(out[0]["end"], "2026-07-10T10:45:00+03:00");
     }
 
     /// Live check against a real CalDAV server. Ignored by default; run with:
@@ -898,8 +921,13 @@ END:VCALENDAR&#13;
             std::env::var("OCTO_TEST_CALDAV_FROM").unwrap_or_else(|_| "2026-01-01T00:00:00Z".into());
         let to =
             std::env::var("OCTO_TEST_CALDAV_TO").unwrap_or_else(|_| "2027-01-01T00:00:00Z".into());
-        let result = list_events(&client, &collection, &auth, &from, &to).await.expect("list_events");
-        println!("LIVE list_events [{from} .. {to}] -> {}", serde_json::to_string_pretty(&result).unwrap());
+        let tz: chrono_tz::Tz = std::env::var("OCTO_TEST_CALDAV_TZ")
+            .ok()
+            .and_then(|t| t.parse().ok())
+            .unwrap_or(chrono_tz::UTC);
+        let result =
+            list_events(&client, &collection, &auth, &from, &to, tz).await.expect("list_events");
+        println!("LIVE list_events [{from} .. {to}] ({tz}) -> {}", serde_json::to_string_pretty(&result).unwrap());
     }
 
     /// Live create -> list -> delete round-trip. Ignored; creates and then
@@ -934,6 +962,7 @@ END:VCALENDAR&#13;
             &auth,
             "2026-06-30T00:00:00Z",
             "2026-07-02T00:00:00Z",
+            chrono_tz::UTC,
         )
         .await
         .expect("list");
