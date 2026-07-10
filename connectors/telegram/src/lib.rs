@@ -16,6 +16,7 @@
 //! in the environment, the ACL in a JSON state file named by the manifest.
 
 mod acl;
+mod format;
 
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -31,7 +32,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use teloxide::net::Download;
 use teloxide::prelude::*;
-use teloxide::types::{ChatId, InputFile, UpdateKind};
+use teloxide::types::{ChatId, InputFile, ParseMode, UpdateKind};
 use teloxide::update_listeners::{polling_default, AsUpdateStream};
 
 pub use acl::{Acl, AclEntry, Role};
@@ -158,9 +159,26 @@ impl Connector for TelegramConnector {
                                     Err(e) => tracing::warn!(error = %e, "telegram media send failed"),
                                 }
                             } else if let Some(text) = env.payload_as::<String>() {
-                                match out_bot.send_message(chat_id, text.clone()).await {
-                                    Ok(_) => tracing::info!(chat, "sent reply"),
-                                    Err(e) => tracing::warn!(error = %e, "telegram send failed"),
+                                // Render the model's Markdown to Telegram HTML so it
+                                // shows formatted (not raw `**`/`#`/tables), split to
+                                // the message-length limit, and fall back to plain
+                                // text if the Bot API rejects a chunk's HTML.
+                                let html = format::to_telegram_html(text);
+                                for chunk in format::split_for_telegram(&html) {
+                                    let sent = out_bot
+                                        .send_message(chat_id, chunk.clone())
+                                        .parse_mode(ParseMode::Html)
+                                        .await;
+                                    match sent {
+                                        Ok(_) => tracing::info!(chat, "sent reply"),
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, "telegram HTML send failed; retrying as plain text");
+                                            let plain = format::strip_tags(&chunk);
+                                            if let Err(e2) = out_bot.send_message(chat_id, plain).await {
+                                                tracing::warn!(error = %e2, "telegram plain send failed");
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
