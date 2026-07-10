@@ -2,10 +2,18 @@
 //! over WebDAV verbs, with iCalendar bodies. Transport-agnostic of the Octo
 //! connector — pure request/response functions the connector calls.
 
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{
+    DateTime, Duration as ChronoDuration, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Utc,
+};
 use icalendar::{Calendar, CalendarDateTime, Component, Event, EventLike};
 use octo_http_auth::HttpAuth;
+use rrule::RRuleSet;
 use serde_json::{json, Map, Value};
+
+/// Cap on recurrence occurrences materialised per series in one `list_events`
+/// window — a safety bound against a pathological rule; a normal day/week query
+/// yields a handful. If a query ever hits it, we log and report truncation.
+const MAX_OCCURRENCES: u16 = 512;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DavError {
@@ -58,15 +66,14 @@ pub async fn list_events(
         return Err(DavError::Status { status: status.as_u16(), body: truncate(&text) });
     }
 
+    // The server filters by the same `[start, end]`, but for recurring series it
+    // returns the *master* (original DTSTART + RRULE) rather than the occurrence
+    // in-window, so we expand recurrences client-side against the window.
+    let win_start = to_utc(from)?;
+    let win_end = to_utc(to)?;
     let mut events = Vec::new();
     for ical in extract_calendar_data(&text)? {
-        if let Ok(cal) = ical.parse::<Calendar>() {
-            for comp in &cal.components {
-                if let Some(ev) = comp.as_event() {
-                    events.push(event_to_json(ev));
-                }
-            }
-        }
+        expand_calendar(&ical, win_start, win_end, &mut events);
     }
     Ok(json!({ "events": events }))
 }
@@ -131,24 +138,324 @@ pub async fn delete_event(
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-fn event_to_json(ev: &Event) -> Value {
+// ── recurrence-aware VEVENT expansion ───────────────────────────────────────
+//
+// A CalDAV `calendar-query` returns, per recurring series, the *master* VEVENT
+// (its original DTSTART + RRULE/EXDATE) plus any modified instances as separate
+// VEVENTs carrying a RECURRENCE-ID. To answer "what's on in [win_start, win_end]"
+// we materialise each master's occurrences in the window (via the `rrule` crate),
+// substitute RECURRENCE-ID overrides, and emit every hit at its *real* time. A
+// non-recurring event is emitted as-is. On any parse failure we fall back to the
+// master's own DTSTART so an event is surfaced rather than silently dropped.
+
+/// A parsed VEVENT: property lines as `(NAME, params, value)` where `params`
+/// keeps its leading `;` (e.g. `;TZID=Europe/Moscow`) or is empty.
+struct RawVevent {
+    props: Vec<(String, String, String)>,
+}
+
+impl RawVevent {
+    fn get(&self, name: &str) -> Option<&(String, String, String)> {
+        self.props.iter().find(|(n, _, _)| n == name)
+    }
+    fn value(&self, name: &str) -> Option<&str> {
+        self.get(name).map(|(_, _, v)| v.as_str())
+    }
+    fn all<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a (String, String, String)> {
+        self.props.iter().filter(move |(n, _, _)| n == name)
+    }
+    fn datetime(&self, name: &str) -> Option<DateTime<Utc>> {
+        self.get(name).and_then(|(_, p, v)| parse_ical_dt(p, v))
+    }
+}
+
+/// Parse one VCALENDAR blob, expanding recurrences into the window and pushing
+/// each resulting event as JSON onto `out`.
+fn expand_calendar(ical: &str, win_start: DateTime<Utc>, win_end: DateTime<Utc>, out: &mut Vec<Value>) {
+    let vevents = parse_vevents(ical);
+    let (masters, overrides): (Vec<_>, Vec<_>) =
+        vevents.iter().partition(|ve| ve.get("RECURRENCE-ID").is_none());
+
+    // Slots (uid + original-occurrence instant) that a modified instance replaces,
+    // so the master expansion skips them.
+    let mut overridden: std::collections::HashSet<(String, i64)> = std::collections::HashSet::new();
+    for ov in &overrides {
+        if let (Some(uid), Some((_, p, v))) = (ov.value("UID"), ov.get("RECURRENCE-ID")) {
+            if let Some(rid) = parse_ical_dt(p, v) {
+                overridden.insert((uid.to_string(), rid.timestamp()));
+            }
+        }
+    }
+
+    // Emit modified instances at their (possibly moved) real time, unless cancelled.
+    for ov in &overrides {
+        if ov.value("STATUS").is_some_and(|s| s.eq_ignore_ascii_case("CANCELLED")) {
+            continue;
+        }
+        if let Some(start) = ov.datetime("DTSTART") {
+            if start >= win_start && start <= win_end {
+                out.push(emit(ov, start, start + duration_of(ov, start)));
+            }
+        }
+    }
+
+    for m in &masters {
+        let Some(start) = m.datetime("DTSTART") else { continue };
+        let dur = duration_of(m, start);
+        let recurring = m.all("RRULE").next().is_some() || m.all("RDATE").next().is_some();
+        if !recurring {
+            // Single event — the server already constrained it to the window.
+            out.push(emit(m, start, start + dur));
+            continue;
+        }
+        match expand_master(m, win_start, win_end) {
+            Some(occurrences) => {
+                let uid = m.value("UID").unwrap_or_default().to_string();
+                for occ in occurrences {
+                    if overridden.contains(&(uid.clone(), occ.timestamp())) {
+                        continue; // replaced by a RECURRENCE-ID instance emitted above
+                    }
+                    out.push(emit(m, occ, occ + dur));
+                }
+            }
+            // Couldn't expand (unparseable rule/tz) — surface the master rather
+            // than lose the event; its date will be the series origin.
+            None => {
+                tracing::debug!(uid = m.value("UID").unwrap_or_default(), "caldav: RRULE expansion failed; emitting master as-is");
+                out.push(emit(m, start, start + dur));
+            }
+        }
+    }
+}
+
+/// Materialise a recurring master's occurrences within `[win_start, win_end]`
+/// (inclusive) as UTC instants. Feeds the `rrule` engine the DTSTART/RRULE/
+/// EXDATE/RDATE lines verbatim. Returns `None` if the rule can't be parsed.
+fn expand_master(
+    m: &RawVevent,
+    win_start: DateTime<Utc>,
+    win_end: DateTime<Utc>,
+) -> Option<Vec<DateTime<Utc>>> {
+    let (_, dsp, dsv) = m.get("DTSTART")?;
+    let (dsp, dsv) = normalize_dtstart(dsp, dsv);
+    let mut spec = format!("DTSTART{dsp}:{dsv}");
+    for (_, _, v) in m.all("RRULE") {
+        spec.push_str(&format!("\nRRULE:{v}"));
+    }
+    for (_, p, v) in m.all("RDATE") {
+        spec.push_str(&format!("\nRDATE{p}:{v}"));
+    }
+    for (_, p, v) in m.all("EXDATE") {
+        spec.push_str(&format!("\nEXDATE{p}:{v}"));
+    }
+
+    let set: RRuleSet = spec.parse().ok()?;
+    let after = win_start.with_timezone(&rrule::Tz::UTC);
+    let before = win_end.with_timezone(&rrule::Tz::UTC);
+    let result = set.after(after).before(before).all(MAX_OCCURRENCES);
+    if result.limited {
+        tracing::warn!(
+            uid = m.value("UID").unwrap_or_default(),
+            cap = MAX_OCCURRENCES,
+            "caldav: recurrence hit the occurrence cap; window may be under-reported"
+        );
+    }
+    Some(result.dates.into_iter().map(|d| d.with_timezone(&Utc)).collect())
+}
+
+/// Build the JSON event Albert sees: `{ uid, title, start, end, location? }`,
+/// with `start`/`end` normalised to RFC3339 UTC.
+fn emit(ve: &RawVevent, start: DateTime<Utc>, end: DateTime<Utc>) -> Value {
     let mut o = Map::new();
-    if let Some(v) = ev.property_value("UID") {
+    if let Some(v) = ve.value("UID") {
         o.insert("uid".into(), json!(v));
     }
-    if let Some(v) = ev.property_value("SUMMARY") {
-        o.insert("title".into(), json!(v));
+    if let Some(v) = ve.value("SUMMARY") {
+        o.insert("title".into(), json!(unescape_text(v)));
     }
-    if let Some(v) = ev.property_value("DTSTART") {
-        o.insert("start".into(), json!(ical_to_rfc3339(v)));
-    }
-    if let Some(v) = ev.property_value("DTEND") {
-        o.insert("end".into(), json!(ical_to_rfc3339(v)));
-    }
-    if let Some(v) = ev.property_value("LOCATION") {
-        o.insert("location".into(), json!(v));
+    o.insert("start".into(), json!(start.to_rfc3339_opts(SecondsFormat::Secs, true)));
+    o.insert("end".into(), json!(end.to_rfc3339_opts(SecondsFormat::Secs, true)));
+    if let Some(v) = ve.value("LOCATION") {
+        o.insert("location".into(), json!(unescape_text(v)));
     }
     Value::Object(o)
+}
+
+/// Event duration from DTEND (preferred) or DURATION; zero if neither is usable.
+fn duration_of(ve: &RawVevent, start: DateTime<Utc>) -> ChronoDuration {
+    if let Some(end) = ve.datetime("DTEND") {
+        let d = end - start;
+        if d >= ChronoDuration::zero() {
+            return d;
+        }
+    }
+    ve.value("DURATION")
+        .and_then(parse_ical_duration)
+        .unwrap_or_else(ChronoDuration::zero)
+}
+
+/// Unfold RFC5545 continuation lines and split a VCALENDAR body into its VEVENTs.
+fn parse_vevents(ical: &str) -> Vec<RawVevent> {
+    // Unfold: a line beginning with a space or tab continues the previous one.
+    let mut logical: Vec<String> = Vec::new();
+    for raw in ical.split('\n') {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        if (line.starts_with(' ') || line.starts_with('\t')) && !logical.is_empty() {
+            logical.last_mut().unwrap().push_str(&line[1..]);
+        } else {
+            logical.push(line.to_string());
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut cur: Option<Vec<(String, String, String)>> = None;
+    for line in &logical {
+        let trimmed = line.trim();
+        if trimmed.eq_ignore_ascii_case("BEGIN:VEVENT") {
+            cur = Some(Vec::new());
+        } else if trimmed.eq_ignore_ascii_case("END:VEVENT") {
+            if let Some(props) = cur.take() {
+                out.push(RawVevent { props });
+            }
+        } else if let Some(props) = cur.as_mut() {
+            if let Some(p) = parse_property_line(line) {
+                props.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// Split a content line into `(NAME, params, value)`; `params` retains its
+/// leading `;`. The name/value boundary is the first colon not inside quotes.
+fn parse_property_line(line: &str) -> Option<(String, String, String)> {
+    let mut in_quote = false;
+    let mut colon = None;
+    for (i, c) in line.char_indices() {
+        match c {
+            '"' => in_quote = !in_quote,
+            ':' if !in_quote => {
+                colon = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let colon = colon?;
+    let (name_params, value) = (&line[..colon], &line[colon + 1..]);
+    let (name, params) = match name_params.find(';') {
+        Some(s) => (&name_params[..s], &name_params[s..]),
+        None => (name_params, ""),
+    };
+    Some((name.to_ascii_uppercase(), params.to_string(), value.to_string()))
+}
+
+/// Value of an iCal parameter (e.g. `TZID`) from a `;K=V;K=V` params string.
+fn param_value(params: &str, key: &str) -> Option<String> {
+    for part in params.trim_start_matches(';').split(';') {
+        let mut kv = part.splitn(2, '=');
+        if kv.next().is_some_and(|k| k.eq_ignore_ascii_case(key)) {
+            return kv.next().map(|v| v.trim_matches('"').to_string());
+        }
+    }
+    None
+}
+
+/// Parse an iCal DATE-TIME (or DATE) value to a UTC instant, honouring a `Z`
+/// suffix, a `TZID` parameter, or `VALUE=DATE`; floating times are read as UTC.
+fn parse_ical_dt(params: &str, value: &str) -> Option<DateTime<Utc>> {
+    if param_value(params, "VALUE").is_some_and(|v| v.eq_ignore_ascii_case("DATE")) || !value.contains('T') {
+        let date = NaiveDate::parse_from_str(value, "%Y%m%d").ok()?;
+        return Some(Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0)?));
+    }
+    if let Some(z) = value.strip_suffix('Z') {
+        let naive = NaiveDateTime::parse_from_str(z, "%Y%m%dT%H%M%S").ok()?;
+        return Some(Utc.from_utc_datetime(&naive));
+    }
+    let naive = NaiveDateTime::parse_from_str(value, "%Y%m%dT%H%M%S").ok()?;
+    if let Some(tz) = param_value(params, "TZID").and_then(|t| t.parse::<chrono_tz::Tz>().ok()) {
+        return tz
+            .from_local_datetime(&naive)
+            .single()
+            .or_else(|| tz.from_local_datetime(&naive).earliest())
+            .map(|dt| dt.with_timezone(&Utc))
+            .or_else(|| Some(Utc.from_utc_datetime(&naive)));
+    }
+    Some(Utc.from_utc_datetime(&naive)) // floating — best-effort UTC
+}
+
+/// Prepare a master's DTSTART for the `rrule` parser: an all-day (`VALUE=DATE`)
+/// origin becomes a concrete UTC midnight so occurrences carry a time; other
+/// forms (TZID / `Z` / floating) pass through unchanged.
+fn normalize_dtstart(params: &str, value: &str) -> (String, String) {
+    let is_date =
+        param_value(params, "VALUE").is_some_and(|v| v.eq_ignore_ascii_case("DATE")) || !value.contains('T');
+    if is_date {
+        if let Ok(date) = NaiveDate::parse_from_str(value, "%Y%m%d") {
+            return (String::new(), format!("{}T000000Z", date.format("%Y%m%d")));
+        }
+    }
+    (params.to_string(), value.to_string())
+}
+
+/// Parse an RFC5545 DURATION (e.g. `PT30M`, `P1DT2H`, `P1W`); `None` if malformed.
+fn parse_ical_duration(s: &str) -> Option<ChronoDuration> {
+    let neg = s.starts_with('-');
+    let body = s.trim_start_matches(['+', '-']).strip_prefix('P')?;
+    let (date_part, time_part) = match body.split_once('T') {
+        Some((d, t)) => (d, Some(t)),
+        None => (body, None),
+    };
+    let mut secs: i64 = 0;
+    let mut acc = String::new();
+    for c in date_part.chars() {
+        if c.is_ascii_digit() {
+            acc.push(c);
+        } else {
+            let n: i64 = acc.parse().ok()?;
+            acc.clear();
+            secs += match c {
+                'W' => n * 7 * 86_400,
+                'D' => n * 86_400,
+                _ => return None,
+            };
+        }
+    }
+    if let Some(t) = time_part {
+        for c in t.chars() {
+            if c.is_ascii_digit() {
+                acc.push(c);
+            } else {
+                let n: i64 = acc.parse().ok()?;
+                acc.clear();
+                secs += match c {
+                    'H' => n * 3_600,
+                    'M' => n * 60,
+                    'S' => n,
+                    _ => return None,
+                };
+            }
+        }
+    }
+    Some(ChronoDuration::seconds(if neg { -secs } else { secs }))
+}
+
+/// Unescape an iCal TEXT value (`\,` `\;` `\n` `\\`).
+fn unescape_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') | Some('N') => out.push('\n'),
+                Some(other) => out.push(other),
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Pull the text inside every `<calendar-data>` element of a `multistatus`.
@@ -207,15 +514,6 @@ fn to_utc(rfc3339: &str) -> Result<DateTime<Utc>, DavError> {
 /// RFC3339 → iCalendar UTC (`YYYYMMDDTHHMMSSZ`) for a `time-range`.
 fn to_ical_utc(rfc3339: &str) -> Result<String, DavError> {
     Ok(to_utc(rfc3339)?.format("%Y%m%dT%H%M%SZ").to_string())
-}
-
-/// Best-effort iCalendar UTC (`...Z`) → RFC3339; other forms pass through raw.
-fn ical_to_rfc3339(ical: &str) -> String {
-    match chrono::NaiveDateTime::parse_from_str(ical, "%Y%m%dT%H%M%SZ") {
-        Ok(naive) => DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc)
-            .to_rfc3339_opts(SecondsFormat::Secs, true),
-        Err(_) => ical.to_string(),
-    }
 }
 
 fn truncate(s: &str) -> String {
@@ -486,25 +784,22 @@ fn resolve_url(origin: &str, href: &str) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn ical_utc_round_trips() {
-        assert_eq!(to_ical_utc("2026-01-15T12:30:00Z").unwrap(), "20260115T123000Z");
-        assert_eq!(ical_to_rfc3339("20260115T123000Z"), "2026-01-15T12:30:00Z");
-        // Non-UTC forms pass through untouched.
-        assert_eq!(ical_to_rfc3339("20260115"), "20260115");
+    fn win(from: &str, to: &str) -> (DateTime<Utc>, DateTime<Utc>) {
+        (to_utc(from).unwrap(), to_utc(to).unwrap())
     }
 
     #[test]
-    fn extracts_calendar_data_and_parses_event() {
+    fn ical_utc_round_trips() {
+        assert_eq!(to_ical_utc("2026-01-15T12:30:00Z").unwrap(), "20260115T123000Z");
+    }
+
+    #[test]
+    fn extracts_calendar_data_blob() {
         let xml = r#"<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
   <D:response><D:propstat><D:prop>
     <C:calendar-data>BEGIN:VCALENDAR&#13;
 BEGIN:VEVENT&#13;
 UID:abc-123&#13;
-SUMMARY:Standup&#13;
-DTSTART:20260115T090000Z&#13;
-DTEND:20260115T091500Z&#13;
-LOCATION:Room 1&#13;
 END:VEVENT&#13;
 END:VCALENDAR&#13;
 </C:calendar-data>
@@ -512,13 +807,73 @@ END:VCALENDAR&#13;
 </D:multistatus>"#;
         let blobs = extract_calendar_data(xml).unwrap();
         assert_eq!(blobs.len(), 1);
-        let cal: Calendar = blobs[0].parse().unwrap();
-        let ev = cal.components.iter().find_map(|c| c.as_event()).unwrap();
-        let json = event_to_json(ev);
-        assert_eq!(json["uid"], "abc-123");
-        assert_eq!(json["title"], "Standup");
-        assert_eq!(json["start"], "2026-01-15T09:00:00Z");
-        assert_eq!(json["location"], "Room 1");
+        assert!(blobs[0].contains("BEGIN:VEVENT"));
+    }
+
+    #[test]
+    fn single_event_emitted_as_is() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:abc-123\r\nSUMMARY:Standup\r\n\
+                   DTSTART:20260115T090000Z\r\nDTEND:20260115T091500Z\r\nLOCATION:Room 1\r\n\
+                   END:VEVENT\r\nEND:VCALENDAR\r\n";
+        let (s, e) = win("2026-01-01T00:00:00Z", "2026-02-01T00:00:00Z");
+        let mut out = Vec::new();
+        expand_calendar(ics, s, e, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["uid"], "abc-123");
+        assert_eq!(out[0]["title"], "Standup");
+        assert_eq!(out[0]["start"], "2026-01-15T09:00:00Z");
+        assert_eq!(out[0]["end"], "2026-01-15T09:15:00Z");
+        assert_eq!(out[0]["location"], "Room 1");
+    }
+
+    #[test]
+    fn expands_recurring_master_into_window() {
+        // A daily standup whose series began in April, queried for one day in July:
+        // the server returns the master (April DTSTART + RRULE); we must surface the
+        // *July* occurrence at its real Moscow time (10:15 MSK = 07:15Z).
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:daily-1\r\nSUMMARY:Standup\r\n\
+                   DTSTART;TZID=Europe/Moscow:20260430T101500\r\n\
+                   DTEND;TZID=Europe/Moscow:20260430T103000\r\n\
+                   RRULE:FREQ=DAILY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let (s, e) = win("2026-07-10T00:00:00Z", "2026-07-11T00:00:00Z");
+        let mut out = Vec::new();
+        expand_calendar(ics, s, e, &mut out);
+        assert_eq!(out.len(), 1, "exactly one occurrence in the one-day window");
+        assert_eq!(out[0]["title"], "Standup");
+        assert_eq!(out[0]["start"], "2026-07-10T07:15:00Z");
+        assert_eq!(out[0]["end"], "2026-07-10T07:30:00Z");
+    }
+
+    #[test]
+    fn recurrence_id_override_replaces_instance() {
+        // Master daily at 10:15 MSK; one instance (2026-07-10) moved to 14:00 MSK.
+        // The window must show the moved time once — not the original, not both.
+        let ics = "BEGIN:VCALENDAR\r\n\
+                   BEGIN:VEVENT\r\nUID:daily-2\r\nSUMMARY:Standup\r\n\
+                   DTSTART;TZID=Europe/Moscow:20260701T101500\r\n\
+                   DTEND;TZID=Europe/Moscow:20260701T103000\r\nRRULE:FREQ=DAILY\r\nEND:VEVENT\r\n\
+                   BEGIN:VEVENT\r\nUID:daily-2\r\nSUMMARY:Standup\r\n\
+                   RECURRENCE-ID;TZID=Europe/Moscow:20260710T101500\r\n\
+                   DTSTART;TZID=Europe/Moscow:20260710T140000\r\n\
+                   DTEND;TZID=Europe/Moscow:20260710T143000\r\nEND:VEVENT\r\n\
+                   END:VCALENDAR\r\n";
+        let (s, e) = win("2026-07-10T00:00:00Z", "2026-07-11T00:00:00Z");
+        let mut out = Vec::new();
+        expand_calendar(ics, s, e, &mut out);
+        assert_eq!(out.len(), 1, "override replaces the instance, no duplicate");
+        assert_eq!(out[0]["start"], "2026-07-10T11:00:00Z"); // 14:00 MSK, moved
+    }
+
+    #[test]
+    fn exdate_excludes_occurrence() {
+        // Daily series with 2026-07-10 excluded → the window is empty.
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:daily-3\r\nSUMMARY:Standup\r\n\
+                   DTSTART;TZID=Europe/Moscow:20260701T101500\r\nRRULE:FREQ=DAILY\r\n\
+                   EXDATE;TZID=Europe/Moscow:20260710T101500\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let (s, e) = win("2026-07-10T00:00:00Z", "2026-07-11T00:00:00Z");
+        let mut out = Vec::new();
+        expand_calendar(ics, s, e, &mut out);
+        assert!(out.is_empty(), "EXDATE-excluded day yields nothing");
     }
 
     /// Live check against a real CalDAV server. Ignored by default; run with:
@@ -537,16 +892,14 @@ END:VCALENDAR&#13;
             password_env: "OCTO_YANDEX_APP_PASSWORD".into(),
         });
         let client = reqwest::Client::new();
-        let result = list_events(
-            &client,
-            &collection,
-            &auth,
-            "2026-01-01T00:00:00Z",
-            "2027-01-01T00:00:00Z",
-        )
-        .await
-        .expect("list_events");
-        println!("LIVE list_events -> {}", serde_json::to_string_pretty(&result).unwrap());
+        // Window overridable via env (defaults to the calendar year) so the same
+        // test can probe a specific day when checking recurrence expansion.
+        let from =
+            std::env::var("OCTO_TEST_CALDAV_FROM").unwrap_or_else(|_| "2026-01-01T00:00:00Z".into());
+        let to =
+            std::env::var("OCTO_TEST_CALDAV_TO").unwrap_or_else(|_| "2027-01-01T00:00:00Z".into());
+        let result = list_events(&client, &collection, &auth, &from, &to).await.expect("list_events");
+        println!("LIVE list_events [{from} .. {to}] -> {}", serde_json::to_string_pretty(&result).unwrap());
     }
 
     /// Live create -> list -> delete round-trip. Ignored; creates and then
