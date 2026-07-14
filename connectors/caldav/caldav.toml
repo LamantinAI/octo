@@ -30,9 +30,28 @@ base_url = "https://caldav.yandex.ru"
 #      Nextcloud: https://<host>/remote.php/dav/calendars/<user>/personal/
 # collection = "https://caldav.yandex.ru/calendars/user@yandex.ru/events-default/"
 
+# Optional. `timezone` (IANA name) renders listed event times as local wall-clock
+# for the agent (defaults to UTC). `reminder_minutes` is the default popup lead
+# time for events this connector creates when the create command omits its own
+# `reminder_minutes`; omit it for no default reminder, or pass -1 on a command to
+# opt a single event out.
+# timezone = "Europe/Moscow"
+# reminder_minutes = 10
+
 # Auth (octo-http-auth). Yandex / Fastmail / iCloud / Nextcloud use basic auth with
 # an APP PASSWORD (never the account password!), read from the named env var.
-# Google is auth = "oauth2" (bearer + refresh) — planned, not yet wired.
 auth = "basic"
 login = "user@yandex.ru"
 password_env = "OCTO_YANDEX_APP_PASSWORD"
+
+# Google uses OAuth2 (bearer + refresh): the connector exchanges a long-lived
+# refresh token for short-lived access tokens and caches them. Grant the FULL
+# calendar scope (https://www.googleapis.com/auth/calendar) — Google's CalDAV
+# endpoint rejects the narrower calendar.events scope — and point base_url at
+# Google's CalDAV root for discovery:
+#   base_url = "https://apidata.googleusercontent.com/caldav/v2"
+#   auth = "oauth2"
+#   token_url = "https://oauth2.googleapis.com/token"
+#   client_id = "<oauth-client-id>"
+#   client_secret_env = "GOOGLE_CLIENT_SECRET"
+#   refresh_token_env = "GOOGLE_REFRESH_TOKEN"

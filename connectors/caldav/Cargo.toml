@@ -6,7 +6,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Generic CalDAV connector for the Octo runtime (RFC 4791). One crate, many calendars — Yandex, Fastmail, Nextcloud, iCloud, Google. Bidirectional organ: list/create/delete events via env-as-tools dispatch. Auth via octo-http-auth (basic app-password now, oauth2 planned)."
+description = "Generic CalDAV connector for the Octo runtime (RFC 4791). One crate, many calendars — Yandex, Fastmail, Nextcloud, iCloud, Google. Bidirectional organ: list/create/delete events (with popup VALARM reminders) via env-as-tools dispatch. Auth via octo-http-auth (basic app-password or oauth2 refresh)."
 
 [dependencies]
 octo-core = { path = "../../octo-core" }
