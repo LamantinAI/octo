@@ -193,7 +193,8 @@ impl StorageConnector {
         let workspace_path = str_field(params, "workspace_path")?;
         let key = str_field(params, "key")?;
         let root = self.workspace_root()?;
-        let src = backend::resolve_within(&root, workspace_path).map_err(|e| e.to_string())?;
+        let src = octo_workspace::resolve_file_in_root(&root, workspace_path)
+            .map_err(|e| e.to_string())?;
         let bytes = match std::fs::read(&src) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -211,8 +212,9 @@ impl StorageConnector {
         let workspace_path = str_field(params, "workspace_path")?;
         let bytes = self.backend.get(key).await.map_err(|e| e.to_string())?;
         let root = self.workspace_root()?;
-        let dest = backend::resolve_within(&root, workspace_path).map_err(|e| e.to_string())?;
-        backend::write_atomic(&dest, &bytes).map_err(|e| e.to_string())?;
+        let dest = octo_workspace::resolve_file_in_root(&root, workspace_path)
+            .map_err(|e| e.to_string())?;
+        octo_workspace::write_atomic(&dest, &bytes).map_err(|e| e.to_string())?;
         Ok(json!({ "workspace_path": workspace_path, "key": key, "bytes": bytes.len() }))
     }
 

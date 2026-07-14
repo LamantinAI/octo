@@ -1338,7 +1338,7 @@ name = "octo-code"
 version = "0.0.1"
 dependencies = [
  "glob",
- "libc",
+ "octo-workspace",
  "regex",
  "rig-core",
  "serde",
@@ -1422,6 +1422,7 @@ dependencies = [
  "async-trait",
  "base64",
  "octo-core",
+ "octo-workspace",
  "serde",
  "serde_json",
  "tempfile",
@@ -1439,6 +1440,7 @@ dependencies = [
  "async-trait",
  "futures",
  "octo-core",
+ "octo-workspace",
  "pulldown-cmark",
  "serde",
  "serde_json",
@@ -1503,6 +1505,15 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+]
+
+[[package]]
+name = "octo-workspace"
+version = "0.0.1"
+dependencies = [
+ "libc",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

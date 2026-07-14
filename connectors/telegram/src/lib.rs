@@ -357,7 +357,11 @@ impl Connector for TelegramConnector {
 impl TelegramConnector {
     /// Save an incoming file into the shared workspace's inbox, returning its
     /// workspace-relative path.
-    fn save_incoming(&self, filename: &str, bytes: &[u8]) -> std::io::Result<String> {
+    fn save_incoming(
+        &self,
+        filename: &str,
+        bytes: &[u8],
+    ) -> Result<String, octo_workspace::WorkspaceError> {
         let root = fs::workspace_root(&self.workspace)?;
         fs::save_incoming(&root, filename, bytes)
     }
