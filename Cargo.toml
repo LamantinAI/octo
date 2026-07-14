@@ -9,6 +9,7 @@ members = [
     "connectors/telegram",
     "connectors/scheduler",
     "connectors/caldav",
+    "connectors/storage",
     "octo-rig",
     "octo-code",
     "octolab",
@@ -24,6 +25,7 @@ default-members = [
     "connectors/http",
     "connectors/scheduler",
     "connectors/caldav",
+    "connectors/storage",
     "octo-code",
 ]
 
