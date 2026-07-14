@@ -10,6 +10,7 @@ members = [
     "connectors/scheduler",
     "connectors/caldav",
     "octo-rig",
+    "octo-code",
     "octolab",
 ]
 # Keep `cargo test` (no --workspace) light — octo-rig/telegram/octolab pull the
@@ -23,6 +24,7 @@ default-members = [
     "connectors/http",
     "connectors/scheduler",
     "connectors/caldav",
+    "octo-code",
 ]
 
 [workspace.package]
