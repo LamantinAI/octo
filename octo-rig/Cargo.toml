@@ -10,7 +10,13 @@ description = "A rig Tool bridging rig's native tool-calling to the Octo connect
 
 [dependencies]
 octo-core = { path = "../octo-core" }
+octo-code = { path = "../octo-code", optional = true }
 rig-core = "0.35"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+
+[features]
+# Opt in the octo-code file tools (read/write/edit/list), re-exported here so a
+# rig agent gets them alongside the connector-dispatch bridge.
+code = ["dep:octo-code"]

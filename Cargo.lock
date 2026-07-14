@@ -1334,6 +1334,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "octo-code"
+version = "0.0.1"
+dependencies = [
+ "glob",
+ "libc",
+ "regex",
+ "rig-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "octo-connector-caldav"
 version = "0.0.1"
 dependencies = [
@@ -1463,6 +1479,7 @@ dependencies = [
 name = "octo-rig"
 version = "0.0.1"
 dependencies = [
+ "octo-code",
  "octo-core",
  "rig-core",
  "serde",

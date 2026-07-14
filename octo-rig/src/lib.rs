@@ -22,6 +22,13 @@ use rig::tool::Tool;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+/// The octo-code file tools (`read`/`write`/`edit`/`list`/`glob`/`grep`),
+/// available behind the `code` feature. Add them to a rig agent alongside
+/// [`OctoDispatchTool`]: `agent.tool(ReadTool).tool(WriteTool)...`. Jailed to
+/// `$OCTO_CODE_WORKSPACE`.
+#[cfg(feature = "code")]
+pub use octo_code::{EditTool, GlobTool, GrepTool, ListTool, ReadTool, WriteTool};
+
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// A rig tool that dispatches a command to an Octo connector and returns its
