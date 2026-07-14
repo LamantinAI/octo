@@ -36,8 +36,9 @@ pub use connector::{
     SubscribeOptions,
 };
 pub use envelope::{
-    Blob, ChannelMetadata, Envelope, EventKind, Payload, PayloadRegistry, Priority, RegistryEntry,
-    RegistryError, ReplyChannel, StreamFrame, TrailAction, TrailActor, TrailEntry, TrustLevel,
+    Blob, ChannelMetadata, Envelope, EventKind, InboundMessage, Payload, PayloadRegistry, Priority,
+    RegistryEntry, RegistryError, ReplyChannel, StreamFrame, TrailAction, TrailActor, TrailEntry,
+    TrustLevel,
 };
 pub use error::{OctoError, OctoResult};
 pub use ids::{ChannelId, ConnectorId, EventId, RuleId};

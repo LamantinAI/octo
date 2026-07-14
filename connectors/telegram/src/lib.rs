@@ -16,10 +16,12 @@
 //! in the environment, the ACL in a JSON state file named by the manifest.
 
 mod acl;
+mod batch;
 mod format;
 
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -35,7 +37,19 @@ use teloxide::prelude::*;
 use teloxide::types::{ChatId, InputFile, ParseMode, UpdateKind};
 use teloxide::update_listeners::{polling_default, AsUpdateStream};
 
+use crate::batch::{Batcher, Emit, Flush};
+
 pub use acl::{Acl, AclEntry, Role};
+
+/// Default quiet window before a coalescing burst (album / forward) is flushed.
+/// Short, because these bursts arrive machine-fast; single typed messages are
+/// never buffered, so this adds no latency to normal chat.
+const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(500);
+/// Default cap on how long a buffer may stay open (so a steady stream still
+/// flushes) — see [`batch::Batcher`].
+const DEFAULT_MAX_WAIT: Duration = Duration::from_secs(3);
+/// How often the run loop checks for buffers due to flush.
+const FLUSH_TICK: Duration = Duration::from_millis(100);
 
 /// Control commands that mutate the ACL at runtime (an owner-instructed
 /// cogitator dispatches these — the connector is a manageable actor, like the
@@ -60,13 +74,19 @@ pub struct TelegramConnector {
     /// chats are dropped at the edge, listed chats get `trust`/`role` stamped,
     /// and `octo.telegram.*` control commands mutate it at runtime.
     acl: Option<Arc<AclState>>,
+    /// Coalescing window: a chat's rapid burst of messages is buffered and
+    /// flushed as one input after `debounce` of quiet (capped at `max_wait`), so
+    /// forwarding several messages yields one turn, not one per message. A zero
+    /// `debounce` disables coalescing (publish each message immediately).
+    debounce: Duration,
+    max_wait: Duration,
 }
 
 impl TelegramConnector {
     /// Open with no access control — every chat is allowed. Fine for a local
     /// playground; a real deployment uses [`with_acl`](Self::with_acl).
     pub fn new(id: impl Into<String>, token: impl Into<String>) -> Arc<Self> {
-        Self::build(id, token, None)
+        Self::build(id, token, None, DEFAULT_DEBOUNCE, DEFAULT_MAX_WAIT)
     }
 
     /// Open gated by an access-control list: a message from a chat not on the
@@ -80,13 +100,15 @@ impl TelegramConnector {
         acl_path: Option<PathBuf>,
     ) -> Arc<Self> {
         let state = Arc::new(AclState { acl: RwLock::new(acl), path: acl_path });
-        Self::build(id, token, Some(state))
+        Self::build(id, token, Some(state), DEFAULT_DEBOUNCE, DEFAULT_MAX_WAIT)
     }
 
     fn build(
         id: impl Into<String>,
         token: impl Into<String>,
         acl: Option<Arc<AclState>>,
+        debounce: Duration,
+        max_wait: Duration,
     ) -> Arc<Self> {
         let capabilities = ConnectorCapabilities::bidirectional()
             .with_emit_kinds([EventKind::from_static("chat.message")])
@@ -101,6 +123,8 @@ impl TelegramConnector {
             capabilities,
             token: token.into(),
             acl,
+            debounce,
+            max_wait,
         })
     }
 }
@@ -190,6 +214,11 @@ impl Connector for TelegramConnector {
         });
 
         // ── Inbound: long-poll updates → chat.message ────────────────────────
+        // A per-chat Batcher coalesces rapid/forwarded bursts into one input; a
+        // periodic tick flushes buffers whose quiet window has elapsed.
+        let mut batcher = Batcher::new(self.debounce, self.max_wait);
+        let mut flush_tick = tokio::time::interval(FLUSH_TICK);
+        flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut listener = polling_default(bot.clone()).await;
         let stream = listener.as_stream();
         // PollingStream is !Unpin; pin it on the stack to poll in select!.
@@ -197,6 +226,11 @@ impl Connector for TelegramConnector {
         tracing::info!(connector = %self.id, "telegram polling started");
         loop {
             tokio::select! {
+                _ = flush_tick.tick() => {
+                    for flush in batcher.drain_due(Instant::now()) {
+                        publish_flush(&self.id, &ctx, flush).await;
+                    }
+                }
                 update = stream.next() => match update {
                     Some(Ok(update)) => {
                         if let UpdateKind::Message(msg) = update.kind {
@@ -215,17 +249,25 @@ impl Connector for TelegramConnector {
                                 },
                                 None => None,
                             };
+                            let now = Instant::now();
+                            // Coalesce only what Telegram groups: an album shares a
+                            // media_group_id; a forward burst carries forward_origin
+                            // (no batch id, so group per chat). Everything else is
+                            // emitted immediately — zero latency for normal chat.
+                            let coalesce_key = coalesce_key(&msg, &chat);
+                            let buffer = batcher.enabled() && coalesce_key.is_some();
                             if let Some(text) = msg.text() {
                                 tracing::info!(%chat, "recv: {text}");
-                                let env = chat_envelope(
-                                    &self.id,
-                                    &chat,
-                                    text.to_string(),
-                                    msg.caption(),
-                                    trust,
-                                );
-                                if let Err(e) = ctx.publish(env).await {
-                                    tracing::warn!(error = %e, "failed to publish chat.message");
+                                if buffer {
+                                    batcher.push_text(
+                                        coalesce_key.unwrap(), &chat, text.to_string(), trust, now,
+                                    );
+                                } else {
+                                    publish_flush(&self.id, &ctx, Flush {
+                                        chat: chat.clone(),
+                                        trust,
+                                        emit: Emit::Text { text: text.to_string(), caption: None },
+                                    }).await;
                                 }
                             } else if let Some(photo) = msg.photo().and_then(<[_]>::last) {
                                 // Largest size is last. Download bytes → Blob so a
@@ -235,15 +277,17 @@ impl Connector for TelegramConnector {
                                         tracing::info!(%chat, bytes = bytes.len(), "recv: photo");
                                         let blob = Blob::new(bytes, "image/jpeg")
                                             .with_filename("photo.jpg");
-                                        let env = chat_envelope(
-                                            &self.id,
-                                            &chat,
-                                            blob,
-                                            msg.caption(),
-                                            trust,
-                                        );
-                                        if let Err(e) = ctx.publish(env).await {
-                                            tracing::warn!(error = %e, "failed to publish photo chat.message");
+                                        let caption = msg.caption().map(str::to_string);
+                                        if buffer {
+                                            batcher.push_image(
+                                                coalesce_key.unwrap(), &chat, blob, caption, trust, now,
+                                            );
+                                        } else {
+                                            publish_flush(&self.id, &ctx, Flush {
+                                                chat: chat.clone(),
+                                                trust,
+                                                emit: Emit::Image { blob, caption },
+                                            }).await;
                                         }
                                     }
                                     Err(e) => tracing::warn!(error = %e, "telegram photo download failed"),
@@ -252,11 +296,53 @@ impl Connector for TelegramConnector {
                         }
                     }
                     Some(Err(e)) => tracing::warn!(error = %e, "telegram update error"),
-                    None => return Ok(()),
+                    None => {
+                        for flush in batcher.drain_all() {
+                            publish_flush(&self.id, &ctx, flush).await;
+                        }
+                        return Ok(());
+                    }
                 },
-                _ = ctx.shutdown.cancelled() => return Ok(()),
+                _ = ctx.shutdown.cancelled() => {
+                    for flush in batcher.drain_all() {
+                        publish_flush(&self.id, &ctx, flush).await;
+                    }
+                    return Ok(());
+                }
             }
         }
+    }
+}
+
+/// The coalescing key for a message, or `None` to emit it immediately.
+///
+/// Telegram groups an album under one `media_group_id`; a forwarded burst has no
+/// batch id, so forwarded messages are grouped per chat. A plain typed message
+/// (the common case) returns `None` and is published with zero added latency.
+fn coalesce_key(msg: &teloxide::types::Message, chat: &str) -> Option<String> {
+    if let Some(group) = msg.media_group_id() {
+        Some(format!("mg:{}", group.0))
+    } else if msg.forward_origin().is_some() {
+        Some(format!("fwd:{chat}"))
+    } else {
+        None
+    }
+}
+
+/// Publish a flushed batch as one `chat.message` envelope.
+async fn publish_flush(id: &ConnectorId, ctx: &ConnectorContext, flush: Flush) {
+    let Flush { chat, trust, emit } = flush;
+    let env = match emit {
+        Emit::Text { text, caption } => {
+            chat_envelope(id, &chat, text, caption.as_deref(), trust)
+        }
+        Emit::Image { blob, caption } => {
+            chat_envelope(id, &chat, blob, caption.as_deref(), trust)
+        }
+        Emit::Multipart(msg) => chat_envelope(id, &chat, msg, None, trust),
+    };
+    if let Err(e) = ctx.publish(env).await {
+        tracing::warn!(error = %e, "failed to publish chat.message");
     }
 }
 
@@ -392,6 +478,10 @@ struct TelegramConfig {
     /// Seed owner chat id — inserted into the ACL at `owner`, so the bot is
     /// reachable on first run even with an empty/absent ACL file.
     owner_chat: Option<i64>,
+    /// Coalescing quiet window in ms (default 1200; `0` disables coalescing).
+    batch_debounce_ms: Option<u64>,
+    /// Cap in ms on how long a chat's buffer stays open (default 8000).
+    batch_max_wait_ms: Option<u64>,
 }
 
 fn default_token_env() -> String {
@@ -419,22 +509,27 @@ impl ConnectorFactory for TelegramConnectorFactory {
         let token = std::env::var(&cfg.token_env)
             .map_err(|_| format!("telegram: env var {} is not set", cfg.token_env))?;
 
+        let debounce = cfg.batch_debounce_ms.map(Duration::from_millis).unwrap_or(DEFAULT_DEBOUNCE);
+        let max_wait = cfg.batch_max_wait_ms.map(Duration::from_millis).unwrap_or(DEFAULT_MAX_WAIT);
+
         // No ACL configured → allow-all connector (the playground shape).
-        if cfg.acl_path.is_none() && cfg.owner_chat.is_none() {
-            return Ok(TelegramConnector::new(id.as_str(), token));
-        }
-        // Resolve the ACL path (relative to the manifest) once — used to load it
-        // now and to persist runtime mutations later.
-        let acl_path: Option<PathBuf> = cfg.acl_path.as_ref().map(|p| ctx.base_dir.join(p));
-        let mut acl = match &acl_path {
-            Some(p) => Acl::load(p)?,
-            None => Acl::new(),
+        let acl_state = if cfg.acl_path.is_none() && cfg.owner_chat.is_none() {
+            None
+        } else {
+            // Resolve the ACL path (relative to the manifest) once — used to load
+            // it now and to persist runtime mutations later.
+            let acl_path: Option<PathBuf> = cfg.acl_path.as_ref().map(|p| ctx.base_dir.join(p));
+            let mut acl = match &acl_path {
+                Some(p) => Acl::load(p)?,
+                None => Acl::new(),
+            };
+            if let Some(owner) = cfg.owner_chat {
+                acl.ensure(owner, Role::Owner);
+            }
+            tracing::info!(connector = %id, allowed = acl.len(), "telegram: access-control list loaded");
+            Some(Arc::new(AclState { acl: RwLock::new(acl), path: acl_path }))
         };
-        if let Some(owner) = cfg.owner_chat {
-            acl.ensure(owner, Role::Owner);
-        }
-        tracing::info!(connector = %id, allowed = acl.len(), "telegram: access-control list loaded");
-        Ok(TelegramConnector::with_acl(id.as_str(), token, acl, acl_path))
+        Ok(TelegramConnector::build(id.as_str(), token, acl_state, debounce, max_wait))
     }
 }
 

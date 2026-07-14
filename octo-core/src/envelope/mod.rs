@@ -14,6 +14,7 @@
 
 pub mod blob;
 pub mod kind;
+pub mod message;
 pub mod metadata;
 pub mod payload;
 pub mod registry;
@@ -22,6 +23,7 @@ pub mod trail;
 
 pub use blob::Blob;
 pub use kind::EventKind;
+pub use message::InboundMessage;
 pub use metadata::{ChannelMetadata, Priority, ReplyChannel, TrustLevel};
 pub use payload::Payload;
 pub use registry::{PayloadRegistry, RegistryEntry, RegistryError};
