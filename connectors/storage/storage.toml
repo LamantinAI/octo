@@ -1,0 +1,34 @@
+# Example storage connector manifest (type = "storage"). Register the factory once:
+#
+#   Octo::builder()
+#       .register_connector_type("storage", octo_connector_storage::factory())
+#       .from_config_file("octo.toml")?
+#
+# Durable artifacts live here (as opposed to the ephemeral octo-code workspace):
+# the cogitator promotes a finished result by dispatching storage.put to this id.
+
+[connector]
+id   = "storage"
+type = "storage"
+
+# Backend is swappable. `local` (a directory) ships now; an S3-compatible backend
+# is planned and slots in behind the same command surface.
+backend = "local"
+
+# For the local backend: the store root. A relative path resolves against this
+# manifest's directory. Point it at a durable location (backed up), NOT /tmp.
+root = "artifacts"
+
+# Optional: the code workspace root, for storage.promote / storage.checkout
+# (bridging the ephemeral octo-code workspace and durable storage). Must be the
+# SAME directory octo-code uses. If omitted, the connector falls back to
+# $OCTO_CODE_WORKSPACE, then to the octo-code default <tmp>/octo-code.
+# workspace = "/tmp/octo-code/albert"
+
+# Planned S3 shape (not yet wired):
+# backend      = "s3"
+# bucket       = "albert-artifacts"
+# endpoint     = "https://s3.example.com"   # for S3-compatible providers
+# region       = "eu-central-1"
+# access_key_env = "OCTO_S3_ACCESS_KEY"
+# secret_key_env = "OCTO_S3_SECRET_KEY"
