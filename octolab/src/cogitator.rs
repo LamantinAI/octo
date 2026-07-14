@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use octo_core::{
-    Blob, Cogitator, CogitatorContext, ConnectorId, Envelope, EventKind, Filter, OctoResult,
-    Subscription,
+    Blob, Cogitator, CogitatorContext, ConnectorId, Envelope, EventKind, Filter, InboundMessage,
+    OctoResult, Subscription,
 };
 use octo_rig::OctoDispatchTool;
 use serde_json::{json, Value};
@@ -117,6 +117,14 @@ impl ReactCogitator {
             if let Some(image) = incoming.payload_as::<Blob>().cloned() {
                 let caption = incoming.tags.get("caption").cloned().unwrap_or_default();
                 self.respond(incoming, caption, Some(image), ctx).await;
+                return;
+            }
+            // A coalesced burst (text + photos). octolab's respond takes a single
+            // image, so take the first; a vision cogitator would handle all.
+            if let Some(msg) = incoming.payload_as::<InboundMessage>().cloned() {
+                let text = msg.text.unwrap_or_default();
+                let image = msg.images.into_iter().next();
+                self.respond(incoming, text, image, ctx).await;
                 return;
             }
         }
