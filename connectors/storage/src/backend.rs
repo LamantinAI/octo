@@ -3,10 +3,10 @@
 //! S3-compatible backend slots in later without touching the connector or its
 //! command surface.
 
-use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
+use octo_workspace::{write_atomic, WorkspaceError, TMP_PREFIX};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -17,6 +17,17 @@ pub enum StorageError {
     NotFound(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl From<WorkspaceError> for StorageError {
+    fn from(e: WorkspaceError) -> Self {
+        match e {
+            WorkspaceError::Absolute(p) | WorkspaceError::Escape(p) => StorageError::BadKey(p),
+            WorkspaceError::Empty => StorageError::BadKey(String::new()),
+            WorkspaceError::NotFound(p) => StorageError::NotFound(p),
+            WorkspaceError::Io(io) => StorageError::Io(io),
+        }
+    }
 }
 
 /// A durable object store addressed by string keys (`reports/2026/summary.md`).
@@ -54,7 +65,7 @@ impl LocalStorage {
 
     /// Resolve `key` to a path within the root, rejecting escapes. Purely lexical.
     fn resolve(&self, key: &str) -> Result<PathBuf, StorageError> {
-        resolve_within(&self.root, key)
+        Ok(octo_workspace::resolve_file_in_root(&self.root, key)?)
     }
 
     /// Recursively collect keys (root-relative paths) under `dir`.
@@ -82,58 +93,11 @@ impl LocalStorage {
     }
 }
 
-const TMP_PREFIX: &str = ".octo-storage.";
-
-fn unique_tmp(parent: &Path) -> PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    parent.join(format!("{}{}.{}.tmp", TMP_PREFIX, std::process::id(), n))
-}
-
-/// Resolve `rel` to a path within `root`, rejecting absolute paths, `..` escapes
-/// and the empty key. Purely lexical; shared by the local backend (storage keys)
-/// and the connector's workspace access (promote/checkout).
-pub(crate) fn resolve_within(root: &Path, rel: &str) -> Result<PathBuf, StorageError> {
-    let mut out = PathBuf::new();
-    for comp in Path::new(rel).components() {
-        match comp {
-            Component::Normal(c) => out.push(c),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !out.pop() {
-                    return Err(StorageError::BadKey(rel.to_string()));
-                }
-            }
-            Component::RootDir | Component::Prefix(_) => {
-                return Err(StorageError::BadKey(rel.to_string()));
-            }
-        }
-    }
-    if out.as_os_str().is_empty() {
-        return Err(StorageError::BadKey(rel.to_string()));
-    }
-    Ok(root.join(out))
-}
-
-/// Atomically write `bytes` to `dest` (temp sibling + rename), creating parents.
-pub(crate) fn write_atomic(dest: &Path, bytes: &[u8]) -> Result<(), StorageError> {
-    let parent = dest.parent().map(Path::to_path_buf).unwrap_or_default();
-    std::fs::create_dir_all(&parent)?;
-    let tmp = unique_tmp(&parent);
-    match std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, dest)) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e.into())
-        }
-    }
-}
-
 #[async_trait]
 impl StorageBackend for LocalStorage {
     async fn put(&self, key: &str, bytes: &[u8]) -> Result<(), StorageError> {
         let dest = self.resolve(key)?;
-        write_atomic(&dest, bytes)
+        Ok(write_atomic(&dest, bytes)?)
     }
 
     async fn get(&self, key: &str) -> Result<Vec<u8>, StorageError> {

@@ -10,6 +10,7 @@ description = "Durable object-store connector for the Octo runtime: put/get/list
 
 [dependencies]
 octo-core = { path = "../../octo-core" }
+octo-workspace = { path = "../../components/workspace" }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }

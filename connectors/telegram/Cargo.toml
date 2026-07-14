@@ -10,6 +10,7 @@ description = "Bidirectional Telegram Bot API connector for the Octo runtime (te
 
 [dependencies]
 octo-core = { path = "../../octo-core" }
+octo-workspace = { path = "../../components/workspace" }
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 async-trait = { workspace = true }
 futures = { workspace = true }

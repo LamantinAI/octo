@@ -1,0 +1,16 @@
+[package]
+name = "octo-workspace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Shared workspace path-jail and atomic writes for Octo's file faculties (octo-code, storage, telegram). A security primitive: one implementation, one place to audit."
+
+[dependencies]
+thiserror = { workspace = true }
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
