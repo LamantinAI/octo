@@ -18,6 +18,7 @@
 mod acl;
 mod batch;
 mod format;
+mod fs;
 
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -58,6 +59,10 @@ const ALLOW_CHAT: &str = "octo.telegram.allow_chat";
 const REMOVE_CHAT: &str = "octo.telegram.remove_chat";
 const LIST_CHATS: &str = "octo.telegram.list_chats";
 
+/// Outbound command: send a file from the shared workspace as a document.
+/// Payload `{ path, chat?, filename? }` — chat falls back to the envelope channel.
+const SEND_FILE: &str = "chat.send_file";
+
 /// Shared, mutable ACL state: the list behind a lock + where it persists.
 struct AclState {
     acl: RwLock<Acl>,
@@ -80,13 +85,17 @@ pub struct TelegramConnector {
     /// `debounce` disables coalescing (publish each message immediately).
     debounce: Duration,
     max_wait: Duration,
+    /// Shared workspace root for file transfer (inbound documents saved here,
+    /// `chat.send_file` reads from here). `None` → resolved from the environment
+    /// at use, matching octo-code. See [`fs`].
+    workspace: Option<PathBuf>,
 }
 
 impl TelegramConnector {
     /// Open with no access control — every chat is allowed. Fine for a local
     /// playground; a real deployment uses [`with_acl`](Self::with_acl).
     pub fn new(id: impl Into<String>, token: impl Into<String>) -> Arc<Self> {
-        Self::build(id, token, None, DEFAULT_DEBOUNCE, DEFAULT_MAX_WAIT)
+        Self::build(id, token, None, DEFAULT_DEBOUNCE, DEFAULT_MAX_WAIT, None)
     }
 
     /// Open gated by an access-control list: a message from a chat not on the
@@ -100,7 +109,7 @@ impl TelegramConnector {
         acl_path: Option<PathBuf>,
     ) -> Arc<Self> {
         let state = Arc::new(AclState { acl: RwLock::new(acl), path: acl_path });
-        Self::build(id, token, Some(state), DEFAULT_DEBOUNCE, DEFAULT_MAX_WAIT)
+        Self::build(id, token, Some(state), DEFAULT_DEBOUNCE, DEFAULT_MAX_WAIT, None)
     }
 
     fn build(
@@ -109,11 +118,13 @@ impl TelegramConnector {
         acl: Option<Arc<AclState>>,
         debounce: Duration,
         max_wait: Duration,
+        workspace: Option<PathBuf>,
     ) -> Arc<Self> {
         let capabilities = ConnectorCapabilities::bidirectional()
             .with_emit_kinds([EventKind::from_static("chat.message")])
             .with_accept_kinds([
                 EventKind::from_static("chat.reply"),
+                EventKind::from_static(SEND_FILE),
                 EventKind::from_static(ALLOW_CHAT),
                 EventKind::from_static(REMOVE_CHAT),
                 EventKind::from_static(LIST_CHATS),
@@ -125,6 +136,7 @@ impl TelegramConnector {
             acl,
             debounce,
             max_wait,
+            workspace,
         })
     }
 }
@@ -151,6 +163,7 @@ impl Connector for TelegramConnector {
         let out_ctx = ctx.clone();
         let out_acl = self.acl.clone();
         let out_id = self.id.clone();
+        let out_workspace = self.workspace.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -160,6 +173,11 @@ impl Connector for TelegramConnector {
                             // an outbound message to send.
                             if matches!(env.kind.as_str(), ALLOW_CHAT | REMOVE_CHAT | LIST_CHATS) {
                                 handle_control(&out_acl, &out_id, &env, &out_ctx).await;
+                                continue;
+                            }
+                            // Send a file from the shared workspace (by reference).
+                            if env.kind.as_str() == SEND_FILE {
+                                send_workspace_file(&out_bot, &out_workspace, &env).await;
                                 continue;
                             }
                             // The chat id rides on the envelope's channel.
@@ -292,6 +310,28 @@ impl Connector for TelegramConnector {
                                     }
                                     Err(e) => tracing::warn!(error = %e, "telegram photo download failed"),
                                 }
+                            } else if let Some(doc) = msg.document() {
+                                // A file → saved into the shared workspace; the
+                                // cogitator is handed its path (bytes by reference,
+                                // never through the model). Emitted immediately.
+                                let name = doc.file_name.clone().unwrap_or_else(|| "file".into());
+                                match download_bytes(&bot, &doc.file.id).await {
+                                    Ok(bytes) => match self.save_incoming(&name, &bytes) {
+                                        Ok(rel) => {
+                                            tracing::info!(%chat, %rel, bytes = bytes.len(), "recv: file");
+                                            let text = format!(
+                                                "[received file `{name}` — saved to workspace path `{rel}`]"
+                                            );
+                                            publish_flush(&self.id, &ctx, Flush {
+                                                chat: chat.clone(),
+                                                trust,
+                                                emit: Emit::Text { text, caption: None },
+                                            }).await;
+                                        }
+                                        Err(e) => tracing::warn!(error = %e, "failed to save incoming file"),
+                                    },
+                                    Err(e) => tracing::warn!(error = %e, "telegram file download failed"),
+                                }
                             }
                         }
                     }
@@ -311,6 +351,55 @@ impl Connector for TelegramConnector {
                 }
             }
         }
+    }
+}
+
+impl TelegramConnector {
+    /// Save an incoming file into the shared workspace's inbox, returning its
+    /// workspace-relative path.
+    fn save_incoming(&self, filename: &str, bytes: &[u8]) -> std::io::Result<String> {
+        let root = fs::workspace_root(&self.workspace)?;
+        fs::save_incoming(&root, filename, bytes)
+    }
+}
+
+/// Handle `chat.send_file`: load a file from the shared workspace by its path and
+/// send it as a Telegram document. Chat id comes from the payload `chat`, else
+/// the envelope's channel. Bytes never pass through the model — the payload only
+/// names a path.
+async fn send_workspace_file(bot: &Bot, workspace: &Option<PathBuf>, env: &Envelope) {
+    let params = env.payload_as::<Value>().cloned().unwrap_or(Value::Null);
+    let Some(path) = params.get("path").and_then(Value::as_str) else {
+        tracing::warn!("chat.send_file without a `path`; dropped");
+        return;
+    };
+    let chat = params
+        .get("chat")
+        .and_then(Value::as_i64)
+        .or_else(|| env.channel.as_ref().and_then(|c| c.as_str().parse::<i64>().ok()));
+    let Some(chat) = chat else {
+        tracing::warn!("chat.send_file without a chat id; dropped");
+        return;
+    };
+    let root = match fs::workspace_root(workspace) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "chat.send_file: workspace unavailable");
+            return;
+        }
+    };
+    let (bytes, name) = match fs::load_outgoing(&root, path) {
+        Ok(x) => x,
+        Err(e) => {
+            tracing::warn!(error = %e, %path, "chat.send_file: cannot read workspace file");
+            return;
+        }
+    };
+    let filename = params.get("filename").and_then(Value::as_str).map(str::to_string).unwrap_or(name);
+    let file = InputFile::memory(bytes).file_name(filename);
+    match bot.send_document(ChatId(chat), file).await {
+        Ok(_) => tracing::info!(chat, %path, "sent file"),
+        Err(e) => tracing::warn!(error = %e, "telegram send_document failed"),
     }
 }
 
@@ -478,10 +567,13 @@ struct TelegramConfig {
     /// Seed owner chat id — inserted into the ACL at `owner`, so the bot is
     /// reachable on first run even with an empty/absent ACL file.
     owner_chat: Option<i64>,
-    /// Coalescing quiet window in ms (default 1200; `0` disables coalescing).
+    /// Coalescing quiet window in ms (default 500; `0` disables coalescing).
     batch_debounce_ms: Option<u64>,
-    /// Cap in ms on how long a chat's buffer stays open (default 8000).
+    /// Cap in ms on how long a chat's buffer stays open (default 3000).
     batch_max_wait_ms: Option<u64>,
+    /// Shared workspace root (relative to the manifest) for file transfer. Must
+    /// match octo-code's. Absent → `$OCTO_CODE_WORKSPACE`, then the default.
+    workspace: Option<String>,
 }
 
 fn default_token_env() -> String {
@@ -511,6 +603,7 @@ impl ConnectorFactory for TelegramConnectorFactory {
 
         let debounce = cfg.batch_debounce_ms.map(Duration::from_millis).unwrap_or(DEFAULT_DEBOUNCE);
         let max_wait = cfg.batch_max_wait_ms.map(Duration::from_millis).unwrap_or(DEFAULT_MAX_WAIT);
+        let workspace: Option<PathBuf> = cfg.workspace.as_ref().map(|w| ctx.base_dir.join(w));
 
         // No ACL configured → allow-all connector (the playground shape).
         let acl_state = if cfg.acl_path.is_none() && cfg.owner_chat.is_none() {
@@ -529,7 +622,7 @@ impl ConnectorFactory for TelegramConnectorFactory {
             tracing::info!(connector = %id, allowed = acl.len(), "telegram: access-control list loaded");
             Some(Arc::new(AclState { acl: RwLock::new(acl), path: acl_path }))
         };
-        Ok(TelegramConnector::build(id.as_str(), token, acl_state, debounce, max_wait))
+        Ok(TelegramConnector::build(id.as_str(), token, acl_state, debounce, max_wait, workspace))
     }
 }
 
