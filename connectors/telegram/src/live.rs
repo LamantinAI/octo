@@ -12,7 +12,7 @@
 //!   openclaw-style live trace of tool use, without flooding the chat.
 //!
 //! A `chat.reply` ends the turn: the typing loop stops and the status message
-//! (if any) is left as-is but detached, so the next turn starts a fresh one.
+//! (if any) is deleted — the trace is transient scaffolding, not conversation.
 
 use std::{
     collections::HashMap,
@@ -111,13 +111,20 @@ impl Live {
         }
     }
 
-    /// The turn's reply is out: stop typing and detach the status message (it
-    /// stays in the chat as the turn's trace; the next turn starts a new one).
-    pub(crate) fn end_turn(&self, chat: i64) {
-        if let Some(h) = self.typing.lock().unwrap().remove(&chat) {
+    /// The turn's reply is out: stop typing and delete the status message — the
+    /// trace is scaffolding for the wait, not part of the conversation.
+    pub(crate) fn end_turn(&self, bot: &Bot, chat: ChatId) {
+        if let Some(h) = self.typing.lock().unwrap().remove(&chat.0) {
             h.abort();
         }
-        self.status.lock().unwrap().remove(&chat);
+        if let Some(status) = self.status.lock().unwrap().remove(&chat.0) {
+            let bot = bot.clone();
+            tokio::spawn(async move {
+                if let Err(e) = bot.delete_message(chat, status.id).await {
+                    tracing::warn!(chat = chat.0, error = %e, "telegram status delete failed");
+                }
+            });
+        }
     }
 }
 
