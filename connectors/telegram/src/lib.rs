@@ -215,9 +215,9 @@ impl Connector for TelegramConnector {
                                 _ => {}
                             }
 
-                            // The turn's reply is going out — stop typing, detach
+                            // The turn's reply is going out — stop typing, delete
                             // the status trace.
-                            live.end_turn(chat);
+                            live.end_turn(&out_bot, chat_id);
 
                             // A media payload → photo/document; a String → text.
                             if let Some(blob) = env.payload_as::<Blob>() {
