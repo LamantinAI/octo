@@ -311,7 +311,7 @@ fn render_table(t: &Table) -> String {
 }
 
 /// Escape text for an HTML body.
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
