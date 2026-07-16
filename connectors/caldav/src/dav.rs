@@ -297,7 +297,7 @@ fn expand_master(
     Some(result.dates.into_iter().map(|d| d.with_timezone(&Utc)).collect())
 }
 
-/// Build the JSON event Albert sees: `{ uid, title, start, end, location? }`,
+/// Build the JSON event the agent sees: `{ uid, title, start, end, location? }`,
 /// with `start`/`end` as RFC3339 in the configured display timezone `tz` (UTC
 /// renders with a `Z`, other zones with their offset, e.g. `+03:00`), so the
 /// agent reads local wall-clock times without doing any timezone arithmetic.
