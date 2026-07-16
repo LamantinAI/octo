@@ -1,7 +1,7 @@
 //! `octo-connector-caldav` — a generic CalDAV connector (RFC 4791).
 //!
 //! One crate, many calendars: a configured instance per account (Yandex,
-//! Fastmail, Nextcloud, iCloud, Google), each an env-as-tools organ Albert
+//! Fastmail, Nextcloud, iCloud, Google), each an env-as-tools organ the agent
 //! reaches by dispatching a command to the instance's `id`. Auth via
 //! [`octo_http_auth`] — HTTP Basic (an app password) or OAuth2 refresh (Google
 //! et al.), the secret always from a named env var.
