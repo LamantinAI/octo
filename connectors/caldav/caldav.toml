@@ -45,13 +45,25 @@ login = "user@yandex.ru"
 password_env = "OCTO_YANDEX_APP_PASSWORD"
 
 # Google uses OAuth2 (bearer + refresh): the connector exchanges a long-lived
-# refresh token for short-lived access tokens and caches them. Grant the FULL
-# calendar scope (https://www.googleapis.com/auth/calendar) — Google's CalDAV
-# endpoint rejects the narrower calendar.events scope — and point base_url at
-# Google's CalDAV root for discovery:
-#   base_url = "https://apidata.googleusercontent.com/caldav/v2"
+# refresh token for short-lived access tokens and caches them. Three prerequisites,
+# each of which fails in its own way (all verified against a live account):
+#
+#   1. Grant the FULL calendar scope, https://www.googleapis.com/auth/calendar.
+#      The narrower calendar.events (enough for Google's REST API) makes every
+#      CalDAV request fail: 403 insufficientPermissions.
+#   2. Enable the CalDAV API in the Cloud project, otherwise: 403
+#      accessNotConfigured. Enable at
+#      console.developers.google.com/apis/api/caldav.googleapis.com/overview
+#      and allow a few minutes to propagate.
+#   3. Use an EXPLICIT `collection` — Google canNOT be discovered from a
+#      `base_url`. It answers 404 Not Found for the `current-user-principal`
+#      property (even though the resource reports <D:principal/>), so the
+#      PROPFIND discovery chain has nothing to follow. The collection is
+#      `<account address>/events`.
+#
+#   collection = "https://apidata.googleusercontent.com/caldav/v2/you@gmail.com/events"
 #   auth = "oauth2"
 #   token_url = "https://oauth2.googleapis.com/token"
-#   client_id = "<oauth-client-id>"
+#   client_id = "<oauth-client-id>.apps.googleusercontent.com"
 #   client_secret_env = "GOOGLE_CLIENT_SECRET"
 #   refresh_token_env = "GOOGLE_REFRESH_TOKEN"

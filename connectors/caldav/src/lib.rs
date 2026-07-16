@@ -8,7 +8,9 @@
 //!
 //! The collection URL is either given explicitly or discovered from a server
 //! root ([`CollectionSource`]), so a manifest can be just `base_url` + login +
-//! password.
+//! password. Google is the exception: it answers 404 for `current-user-principal`,
+//! so discovery cannot resolve it and its `collection` must be given explicitly
+//! (see `caldav.toml` for the full Google recipe).
 //!
 //! Commands (each replies with a correlated `<kind>.result`):
 //! - `calendar.list_events { from, to }` → `{ events: [...] }`
