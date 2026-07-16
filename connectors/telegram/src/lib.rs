@@ -5,7 +5,10 @@
 //! only the `channel` carries transport detail: here it's the `chat_id`. Inbound
 //! text messages become `chat.message` (with `reply_to = chat_id`); `chat.reply`
 //! envelopes targeted at us are sent back to their `channel`'s chat (a `Blob`
-//! payload → photo/document, a `String` → text).
+//! payload → photo/document, a `String` → text). Inbound photos and image
+//! documents are downloaded into `Blob` payloads for a vision cogitator. While
+//! a turn is running, `chat.typing` keeps the "typing…" indicator alive and
+//! `chat.status` streams a live tool-use trace (see [`live`]).
 //!
 //! **Authorization** is an optional per-chat allow-list ([`Acl`]): a message from
 //! a chat not on the list is dropped at the edge — before the bus — so untrusted
@@ -19,6 +22,7 @@ mod acl;
 mod batch;
 mod format;
 mod fs;
+mod live;
 
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -62,6 +66,12 @@ const LIST_CHATS: &str = "octo.telegram.list_chats";
 /// Outbound command: send a file from the shared workspace as a document.
 /// Payload `{ path, chat?, filename? }` — chat falls back to the envelope channel.
 const SEND_FILE: &str = "chat.send_file";
+
+/// Live-turn feedback kinds (see [`live`]): keep the "typing…" indicator alive
+/// while the cogitator thinks, and stream its tool-use trace into an in-place
+/// edited status message.
+const TYPING: &str = "chat.typing";
+const STATUS: &str = "chat.status";
 
 /// Shared, mutable ACL state: the list behind a lock + where it persists.
 struct AclState {
@@ -125,6 +135,8 @@ impl TelegramConnector {
             .with_accept_kinds([
                 EventKind::from_static("chat.reply"),
                 EventKind::from_static(SEND_FILE),
+                EventKind::from_static(TYPING),
+                EventKind::from_static(STATUS),
                 EventKind::from_static(ALLOW_CHAT),
                 EventKind::from_static(REMOVE_CHAT),
                 EventKind::from_static(LIST_CHATS),
@@ -164,6 +176,7 @@ impl Connector for TelegramConnector {
         let out_acl = self.acl.clone();
         let out_id = self.id.clone();
         let out_workspace = self.workspace.clone();
+        let live = live::Live::new();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -182,10 +195,29 @@ impl Connector for TelegramConnector {
                             }
                             // The chat id rides on the envelope's channel.
                             let Some(chat) = env.channel.as_ref().and_then(|c| c.as_str().parse::<i64>().ok()) else {
-                                tracing::warn!("chat.reply without a numeric channel; dropped");
+                                tracing::warn!(kind = %env.kind, "outbound without a numeric channel; dropped");
                                 continue;
                             };
                             let chat_id = ChatId(chat);
+
+                            // Live-turn feedback: typing indicator / status trace.
+                            match env.kind.as_str() {
+                                TYPING => {
+                                    live.start_typing(out_bot.clone(), chat_id);
+                                    continue;
+                                }
+                                STATUS => {
+                                    if let Some(line) = env.payload_as::<String>() {
+                                        live.status(&out_bot, chat_id, line).await;
+                                    }
+                                    continue;
+                                }
+                                _ => {}
+                            }
+
+                            // The turn's reply is going out — stop typing, detach
+                            // the status trace.
+                            live.end_turn(chat);
 
                             // A media payload → photo/document; a String → text.
                             if let Some(blob) = env.payload_as::<Blob>() {
@@ -310,10 +342,34 @@ impl Connector for TelegramConnector {
                                     }
                                     Err(e) => tracing::warn!(error = %e, "telegram photo download failed"),
                                 }
+                            } else if let Some((doc, mime)) = image_document(&msg) {
+                                // An image sent "as a file" (uncompressed) — the
+                                // same Blob path as a photo (a vision cogitator
+                                // should SEE it, not get a workspace path),
+                                // keeping its real MIME type. Emitted immediately.
+                                match download_bytes(&bot, &doc.file.id).await {
+                                    Ok(bytes) => {
+                                        tracing::info!(%chat, bytes = bytes.len(), %mime, "recv: image document");
+                                        let mut blob = Blob::new(bytes, mime);
+                                        if let Some(name) = &doc.file_name {
+                                            blob = blob.with_filename(name.clone());
+                                        }
+                                        publish_flush(&self.id, &ctx, Flush {
+                                            chat: chat.clone(),
+                                            trust,
+                                            emit: Emit::Image {
+                                                blob,
+                                                caption: msg.caption().map(str::to_string),
+                                            },
+                                        }).await;
+                                    }
+                                    Err(e) => tracing::warn!(error = %e, "telegram document download failed"),
+                                }
                             } else if let Some(doc) = msg.document() {
-                                // A file → saved into the shared workspace; the
-                                // cogitator is handed its path (bytes by reference,
-                                // never through the model). Emitted immediately.
+                                // Any other file → saved into the shared workspace;
+                                // the cogitator is handed its path (bytes by
+                                // reference, never through the model). Emitted
+                                // immediately.
                                 let name = doc.file_name.clone().unwrap_or_else(|| "file".into());
                                 match download_bytes(&bot, &doc.file.id).await {
                                     Ok(bytes) => match self.save_incoming(&name, &bytes) {
@@ -463,6 +519,14 @@ fn chat_envelope<P: std::any::Any + Send + Sync>(
         );
     }
     env
+}
+
+/// A document attachment that is actually an image (`image/*` MIME), with its
+/// MIME type rendered to a string — the "send as file" (uncompressed) path.
+fn image_document(msg: &teloxide::types::Message) -> Option<(&teloxide::types::Document, String)> {
+    let doc = msg.document()?;
+    let mime = doc.mime_type.as_ref()?;
+    (mime.type_() == "image").then(|| (doc, mime.essence_str().to_string()))
 }
 
 /// Resolve a Telegram `file_id` and download its bytes.
