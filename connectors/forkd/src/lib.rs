@@ -368,11 +368,22 @@ impl ConnectorFactory for ForkdConnectorFactory {
         // actually setuid — as root, or as a non-root service granted CAP_SETUID/
         // CAP_SETGID (e.g. systemd AmbientCapabilities under a hardened unit).
         let can_drop = can_drop_uid();
+        let run_group = table.get("run_group").and_then(|v| v.as_str());
         let drop_to = match table.get("run_as").and_then(|v| v.as_str()) {
             Some(user) => match resolve_user(user) {
-                Some(ids) if can_drop => {
-                    info!(user, uid = ids.0, "forkd: scripts run with dropped privileges");
-                    Some(ids)
+                Some((uid, pw_gid)) if can_drop => {
+                    // The child's PRIMARY gid must be the workspace-sharing group:
+                    // setuid drops supplementary groups, so mere membership will not
+                    // open a setgid 2770 workspace — chdir would fail EACCES.
+                    let gid = match run_group {
+                        Some(g) => resolve_group(g).unwrap_or_else(|| {
+                            warn!(group = g, "forkd: run_group not found; using the run_as user's own group");
+                            pw_gid
+                        }),
+                        None => pw_gid,
+                    };
+                    info!(user, uid, gid, "forkd: scripts run with dropped privileges");
+                    Some((uid, gid))
                 }
                 Some(_) => {
                     warn!(user, "forkd: no setuid capability, cannot drop to run_as; scripts run as the current user");
@@ -432,6 +443,20 @@ fn can_drop_uid() -> bool {
         .find_map(|l| l.strip_prefix("CapEff:"))
         .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
         .is_some_and(|caps| caps & NEEDED == NEEDED)
+}
+
+/// Resolve a group name to its gid via `getgrnam` (called once, at config time).
+fn resolve_group(name: &str) -> Option<u32> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    // SAFETY: as with getpwnam — read the static buffer immediately, copy out.
+    unsafe {
+        let gr = libc::getgrnam(cname.as_ptr());
+        if gr.is_null() {
+            None
+        } else {
+            Some((*gr).gr_gid)
+        }
+    }
 }
 
 /// Resolve a username to `(uid, gid)` via `getpwnam` (called once, at config time).
