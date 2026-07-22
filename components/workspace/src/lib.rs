@@ -11,7 +11,8 @@
 //!   empty path. Lexical (no filesystem access) so it is valid for a path about
 //!   to be created.
 //! - **Atomic, anti-symlink writes** ([`write_atomic`]): write to a unique temp
-//!   sibling with `O_EXCL` + `O_NOFOLLOW` at `0o600`, then `rename` over the
+//!   sibling with `O_EXCL` + `O_NOFOLLOW` at `0o660` (group-shared: the workspace is
+//!   the agent ⇄ script handoff surface), then `rename` over the
 //!   destination — replacing a symlink at the target rather than following it.
 //!
 //! Known limitation: [`resolve_in_root`] is lexical, so a *symlink component
@@ -126,7 +127,8 @@ pub fn write_in_root(root: &Path, rel: &str, bytes: &[u8]) -> Result<PathBuf, Wo
 /// Atomically create-or-replace the file at `dest`.
 ///
 /// Writes to a unique temp sibling opened with `O_EXCL` (anti-race) +
-/// `O_NOFOLLOW` (anti-symlink) at mode `0o600`, fsyncs, then `rename`s over the
+/// `O_NOFOLLOW` (anti-symlink) at mode `0o660` (group-shared handoff; the process
+/// umask may narrow it), fsyncs, then `rename`s over the
 /// destination — replacing a pre-existing symlink at the target instead of
 /// following it. Creates parent directories as needed.
 pub fn write_atomic(dest: &Path, bytes: &[u8]) -> Result<(), WorkspaceError> {
@@ -145,7 +147,10 @@ fn write_and_rename(tmp: &Path, dest: &Path, bytes: &[u8]) -> Result<(), Workspa
         .write(true)
         .create_new(true) // O_CREAT | O_EXCL
         .custom_flags(libc::O_NOFOLLOW)
-        .mode(0o600)
+        // 0o660, not 0o600: the workspace is a *shared* handoff surface — the agent
+        // process and the (dropped-privilege) script user exchange files through a
+        // common group. Others still get nothing; the process umask may narrow it.
+        .mode(0o660)
         .open(tmp)?;
     file.write_all(bytes)?;
     file.sync_all()?;
@@ -204,13 +209,15 @@ mod tests {
     }
 
     #[test]
-    fn write_replaces_and_is_mode_600() {
+    fn write_replaces_and_keeps_others_out() {
         let (_g, root) = root();
         write_in_root(&root, "f.txt", b"one").unwrap();
         let dest = write_in_root(&root, "f.txt", b"two").unwrap();
         assert_eq!(read_in_root(&root, "f.txt").unwrap(), b"two");
+        // Owner rw, others nothing; the group bits depend on the process umask
+        // (0o660 requested — full group sharing needs umask 0007, e.g. systemd UMask).
         let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(mode & 0o707, 0o600);
     }
 
     #[test]

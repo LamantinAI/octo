@@ -333,17 +333,18 @@ impl ConnectorFactory for ForkdConnectorFactory {
             mem_bytes: u64_or("mem_mb", 0) * 1024 * 1024,
         };
 
-        // Privilege drop: resolve `run_as` to (uid, gid); only apply it when forkd
-        // itself is root (a non-root parent can't setuid — exec would fail).
-        let am_root = unsafe { libc::geteuid() } == 0;
+        // Privilege drop: resolve `run_as` to (uid, gid); apply it when forkd can
+        // actually setuid — as root, or as a non-root service granted CAP_SETUID/
+        // CAP_SETGID (e.g. systemd AmbientCapabilities under a hardened unit).
+        let can_drop = can_drop_uid();
         let drop_to = match table.get("run_as").and_then(|v| v.as_str()) {
             Some(user) => match resolve_user(user) {
-                Some(ids) if am_root => {
+                Some(ids) if can_drop => {
                     info!(user, uid = ids.0, "forkd: scripts run with dropped privileges");
                     Some(ids)
                 }
                 Some(_) => {
-                    warn!(user, "forkd: not root, cannot drop to run_as; scripts run as the current user");
+                    warn!(user, "forkd: no setuid capability, cannot drop to run_as; scripts run as the current user");
                     None
                 }
                 None => {
@@ -352,7 +353,7 @@ impl ConnectorFactory for ForkdConnectorFactory {
                 }
             },
             None => {
-                if am_root {
+                if unsafe { libc::geteuid() } == 0 {
                     warn!("forkd: no run_as configured and running as ROOT — scripts run AS ROOT; set run_as to a dedicated unprivileged user");
                 }
                 None
@@ -374,6 +375,25 @@ impl ConnectorFactory for ForkdConnectorFactory {
 /// Convenience factory handle for registration.
 pub fn factory() -> Arc<dyn ConnectorFactory> {
     Arc::new(ForkdConnectorFactory::new())
+}
+
+/// Whether this process can setuid/setgid children: root, or a non-root service
+/// holding CAP_SETUID + CAP_SETGID in its effective set (systemd
+/// `AmbientCapabilities=CAP_SETUID CAP_SETGID` under a hardened `User=` unit).
+fn can_drop_uid() -> bool {
+    if unsafe { libc::geteuid() } == 0 {
+        return true;
+    }
+    // CapEff is a hex bitmask in /proc/self/status; CAP_SETGID = bit 6, CAP_SETUID = bit 7.
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return false;
+    };
+    const NEEDED: u64 = (1 << 6) | (1 << 7);
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("CapEff:"))
+        .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+        .is_some_and(|caps| caps & NEEDED == NEEDED)
 }
 
 /// Resolve a username to `(uid, gid)` via `getpwnam` (called once, at config time).
