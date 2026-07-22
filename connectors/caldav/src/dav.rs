@@ -5,7 +5,7 @@
 use chrono::{
     DateTime, Duration as ChronoDuration, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Utc,
 };
-use icalendar::{Calendar, CalendarDateTime, Component, Event, EventLike};
+use icalendar::{Alarm, Calendar, CalendarDateTime, Component, Event, EventLike, Trigger};
 use octo_http_auth::HttpAuth;
 use rrule::RRuleSet;
 use serde_json::{json, Map, Value};
@@ -80,13 +80,47 @@ pub async fn list_events(
 }
 
 /// `PUT` a new VEVENT to `<collection>/<uid>.ics`. Returns `{ uid }`.
+///
+/// `default_reminder` is the connector's fallback popup lead time (minutes); a
+/// per-event `reminder_minutes` in `params` overrides it. See [`build_event_ics`].
 pub async fn create_event(
     client: &reqwest::Client,
     collection: &str,
     auth: &HttpAuth,
     params: &Value,
     uid: &str,
+    default_reminder: Option<i64>,
 ) -> Result<Value, DavError> {
+    let ics = build_event_ics(params, uid, default_reminder)?;
+
+    let url = event_url(collection, uid);
+    let req = client
+        .put(&url)
+        .header(reqwest::header::CONTENT_TYPE, "text/calendar; charset=utf-8")
+        .body(ics);
+    let resp = auth.apply(req).await?.send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(DavError::Status {
+            status: status.as_u16(),
+            body: truncate(&resp.text().await.unwrap_or_default()),
+        });
+    }
+    Ok(json!({ "uid": uid }))
+}
+
+/// Build the iCalendar body for a new VEVENT. Split out from the HTTP `PUT` so the
+/// event shape — in particular the reminder VALARM — is unit-testable without a
+/// server.
+///
+/// A popup reminder is attached when a lead time resolves: the per-event
+/// `reminder_minutes` field if present, else the connector's `default_reminder`.
+/// A non-negative value adds a `VALARM;ACTION=DISPLAY` whose `TRIGGER` is that many
+/// minutes before the start, relative to `DTSTART` (a negative RFC 5545 duration) —
+/// the standard way every CalDAV server (Google, Yandex, Fastmail, Nextcloud,
+/// iCloud) raises a notification. A negative value (or no lead time at all) creates
+/// a plain event with no alarm.
+fn build_event_ics(params: &Value, uid: &str, default_reminder: Option<i64>) -> Result<String, DavError> {
     let title = str_field(params, "title")?;
     let start = to_utc(str_field(params, "start")?)?;
     let end = to_utc(str_field(params, "end")?)?;
@@ -103,22 +137,15 @@ pub async fn create_event(
     if let Some(l) = params.get("location").and_then(Value::as_str) {
         event.location(l);
     }
-    let ics = Calendar::new().push(event.done()).done().to_string();
-
-    let url = event_url(collection, uid);
-    let req = client
-        .put(&url)
-        .header(reqwest::header::CONTENT_TYPE, "text/calendar; charset=utf-8")
-        .body(ics);
-    let resp = auth.apply(req).await?.send().await?;
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(DavError::Status {
-            status: status.as_u16(),
-            body: truncate(&resp.text().await.unwrap_or_default()),
-        });
+    // A per-event `reminder_minutes` overrides the connector default; a non-negative
+    // result becomes a display alarm `n` minutes before the start.
+    let reminder = params.get("reminder_minutes").and_then(Value::as_i64).or(default_reminder);
+    if let Some(minutes) = reminder.filter(|m| *m >= 0) {
+        let trigger = Trigger::before_start(ChronoDuration::minutes(minutes));
+        event.alarm(Alarm::display(title, trigger));
     }
-    Ok(json!({ "uid": uid }))
+
+    Ok(Calendar::new().push(event.done()).done().to_string())
 }
 
 /// `DELETE <collection>/<uid>.ics`. Returns `{ deleted: bool }`.
@@ -270,7 +297,7 @@ fn expand_master(
     Some(result.dates.into_iter().map(|d| d.with_timezone(&Utc)).collect())
 }
 
-/// Build the JSON event Albert sees: `{ uid, title, start, end, location? }`,
+/// Build the JSON event the agent sees: `{ uid, title, start, end, location? }`,
 /// with `start`/`end` as RFC3339 in the configured display timezone `tz` (UTC
 /// renders with a `Z`, other zones with their offset, e.g. `+03:00`), so the
 /// agent reads local wall-clock times without doing any timezone arithmetic.
@@ -803,6 +830,63 @@ mod tests {
         assert_eq!(to_ical_utc("2026-01-15T12:30:00Z").unwrap(), "20260115T123000Z");
     }
 
+    /// The serialized value of a "before start" TRIGGER for `minutes`, computed via
+    /// the same icalendar path `build_event_ics` uses — so the reminder tests assert
+    /// the alarm's lead time without hard-coding chrono's ISO-8601 duration spelling.
+    fn trigger_value(minutes: i64) -> String {
+        let prop: icalendar::Property =
+            Trigger::before_start(ChronoDuration::minutes(minutes)).into();
+        prop.value().to_string()
+    }
+
+    fn event(reminder: Option<i64>) -> Value {
+        let mut e = json!({
+            "title": "Drink water",
+            "start": "2026-07-15T14:00:00Z",
+            "end": "2026-07-15T14:30:00Z",
+        });
+        if let Some(m) = reminder {
+            e["reminder_minutes"] = json!(m);
+        }
+        e
+    }
+
+    #[test]
+    fn reminder_attaches_a_display_valarm_before_start() {
+        let ics = build_event_ics(&event(Some(10)), "uid-1", None).unwrap();
+        assert!(ics.contains("BEGIN:VALARM"), "a reminder should add a VALARM:\n{ics}");
+        assert!(ics.contains("ACTION:DISPLAY"), "the alarm should be a display popup:\n{ics}");
+        assert!(ics.contains(&trigger_value(10)), "trigger should fire 10 min before:\n{ics}");
+    }
+
+    #[test]
+    fn per_event_reminder_overrides_the_connector_default() {
+        // Per-event 5 min must win over the connector's 30 min default.
+        let ics = build_event_ics(&event(Some(5)), "uid-2", Some(30)).unwrap();
+        assert!(ics.contains(&trigger_value(5)), "per-event 5 min should win:\n{ics}");
+        assert!(!ics.contains(&trigger_value(30)), "the 30 min default must not leak in:\n{ics}");
+    }
+
+    #[test]
+    fn connector_default_reminder_applies_when_event_omits_it() {
+        let ics = build_event_ics(&event(None), "uid-3", Some(10)).unwrap();
+        assert!(ics.contains("BEGIN:VALARM"), "the connector default should add an alarm:\n{ics}");
+        assert!(ics.contains(&trigger_value(10)), "default 10 min lead time:\n{ics}");
+    }
+
+    #[test]
+    fn no_reminder_yields_a_plain_event() {
+        let ics = build_event_ics(&event(None), "uid-4", None).unwrap();
+        assert!(!ics.contains("VALARM"), "no lead time -> no alarm:\n{ics}");
+    }
+
+    #[test]
+    fn negative_reminder_suppresses_the_default() {
+        // An explicit -1 opts out even though the connector has a default.
+        let ics = build_event_ics(&event(Some(-1)), "uid-5", Some(10)).unwrap();
+        assert!(!ics.contains("VALARM"), "-1 opts out of the default:\n{ics}");
+    }
+
     #[test]
     fn extracts_calendar_data_blob() {
         let xml = r#"<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
@@ -950,10 +1034,11 @@ END:VCALENDAR&#13;
             "start": "2026-07-01T10:00:00Z",
             "end": "2026-07-01T11:00:00Z",
             "location": "nowhere",
-            "description": "created by octo-connector-caldav live test; safe to delete"
+            "description": "created by octo-connector-caldav live test; safe to delete",
+            "reminder_minutes": 15
         });
 
-        let created = create_event(&client, &collection, &auth, &params, uid).await.expect("create");
+        let created = create_event(&client, &collection, &auth, &params, uid, Some(10)).await.expect("create");
         println!("created -> {created}");
 
         let listed = list_events(

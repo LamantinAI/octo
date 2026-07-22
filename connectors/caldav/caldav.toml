@@ -30,9 +30,40 @@ base_url = "https://caldav.yandex.ru"
 #      Nextcloud: https://<host>/remote.php/dav/calendars/<user>/personal/
 # collection = "https://caldav.yandex.ru/calendars/user@yandex.ru/events-default/"
 
+# Optional. `timezone` (IANA name) renders listed event times as local wall-clock
+# for the agent (defaults to UTC). `reminder_minutes` is the default popup lead
+# time for events this connector creates when the create command omits its own
+# `reminder_minutes`; omit it for no default reminder, or pass -1 on a command to
+# opt a single event out.
+# timezone = "Europe/Moscow"
+# reminder_minutes = 10
+
 # Auth (octo-http-auth). Yandex / Fastmail / iCloud / Nextcloud use basic auth with
 # an APP PASSWORD (never the account password!), read from the named env var.
-# Google is auth = "oauth2" (bearer + refresh) — planned, not yet wired.
 auth = "basic"
 login = "user@yandex.ru"
 password_env = "OCTO_YANDEX_APP_PASSWORD"
+
+# Google uses OAuth2 (bearer + refresh): the connector exchanges a long-lived
+# refresh token for short-lived access tokens and caches them. Three prerequisites,
+# each of which fails in its own way (all verified against a live account):
+#
+#   1. Grant the FULL calendar scope, https://www.googleapis.com/auth/calendar.
+#      The narrower calendar.events (enough for Google's REST API) makes every
+#      CalDAV request fail: 403 insufficientPermissions.
+#   2. Enable the CalDAV API in the Cloud project, otherwise: 403
+#      accessNotConfigured. Enable at
+#      console.developers.google.com/apis/api/caldav.googleapis.com/overview
+#      and allow a few minutes to propagate.
+#   3. Use an EXPLICIT `collection` — Google canNOT be discovered from a
+#      `base_url`. It answers 404 Not Found for the `current-user-principal`
+#      property (even though the resource reports <D:principal/>), so the
+#      PROPFIND discovery chain has nothing to follow. The collection is
+#      `<account address>/events`.
+#
+#   collection = "https://apidata.googleusercontent.com/caldav/v2/you@gmail.com/events"
+#   auth = "oauth2"
+#   token_url = "https://oauth2.googleapis.com/token"
+#   client_id = "<oauth-client-id>.apps.googleusercontent.com"
+#   client_secret_env = "GOOGLE_CLIENT_SECRET"
+#   refresh_token_env = "GOOGLE_REFRESH_TOKEN"
