@@ -346,7 +346,10 @@ impl ConnectorFactory for ForkdConnectorFactory {
                     warn!(user, "forkd: not root, cannot drop to run_as; scripts run as the current user");
                     None
                 }
-                None => return Err(format!("forkd: run_as user '{user}' not found").into()),
+                None => {
+                    warn!(user, "forkd: run_as user not found; scripts run as the current user");
+                    None
+                }
             },
             None => {
                 if am_root {
