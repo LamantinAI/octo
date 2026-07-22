@@ -1,18 +1,25 @@
 //! `octo-connector-caldav` — a generic CalDAV connector (RFC 4791).
 //!
 //! One crate, many calendars: a configured instance per account (Yandex,
-//! Fastmail, Nextcloud, iCloud, Google), each an env-as-tools organ Albert
+//! Fastmail, Nextcloud, iCloud, Google), each an env-as-tools organ the agent
 //! reaches by dispatching a command to the instance's `id`. Auth via
-//! [`octo_http_auth`] (basic app-password now; oauth2 for Google planned).
+//! [`octo_http_auth`] — HTTP Basic (an app password) or OAuth2 refresh (Google
+//! et al.), the secret always from a named env var.
 //!
 //! The collection URL is either given explicitly or discovered from a server
 //! root ([`CollectionSource`]), so a manifest can be just `base_url` + login +
-//! password.
+//! password. Google is the exception: it answers 404 for `current-user-principal`,
+//! so discovery cannot resolve it and its `collection` must be given explicitly
+//! (see `caldav.toml` for the full Google recipe).
 //!
 //! Commands (each replies with a correlated `<kind>.result`):
 //! - `calendar.list_events { from, to }` → `{ events: [...] }`
-//! - `calendar.create_event { title, start, end, description?, location? }` → `{ uid }`
+//! - `calendar.create_event { title, start, end, description?, location?, reminder_minutes? }` → `{ uid }`
 //! - `calendar.delete_event { uid }` → `{ deleted }`
+//!
+//! A created event carries a popup reminder (VALARM) when a lead time resolves:
+//! the per-command `reminder_minutes`, else the instance's `reminder_minutes`
+//! manifest default. This is what turns "remind me at 14:00" into a notification.
 
 mod dav;
 
@@ -35,8 +42,9 @@ const DELETE: &str = "calendar.delete_event";
 
 const CATALOG: &str = "A calendar (CalDAV). Dispatch a command envelope to this connector's id:
 - calendar.list_events { from: <RFC3339>, to: <RFC3339> } -> { events: [{ uid, title, start, end, location? }] }
-- calendar.create_event { title, start: <RFC3339>, end: <RFC3339>, description?, location? } -> { uid }
-- calendar.delete_event { uid } -> { deleted: bool }";
+- calendar.create_event { title, start: <RFC3339>, end: <RFC3339>, description?, location?, reminder_minutes? } -> { uid }
+- calendar.delete_event { uid } -> { deleted: bool }
+reminder_minutes on create_event sets a popup this many minutes before the start (a VALARM); omit it to use the calendar's configured default, or pass -1 for no reminder.";
 
 /// Where the calendar collection URL comes from.
 ///
@@ -64,6 +72,9 @@ pub struct CaldavConnector {
     /// Timezone used to render event `start`/`end` for the agent (UTC by default;
     /// set to the owner's zone so listed times read as local wall-clock).
     display_tz: chrono_tz::Tz,
+    /// Default popup lead time (minutes) for a created event when the command omits
+    /// `reminder_minutes`. `None` (or a negative override) means no reminder.
+    default_reminder: Option<i64>,
 }
 
 impl CaldavConnector {
@@ -76,6 +87,7 @@ impl CaldavConnector {
             auth,
             reqwest::Client::new(),
             chrono_tz::UTC,
+            None,
         )
     }
 
@@ -89,7 +101,7 @@ impl CaldavConnector {
         auth: AuthConfig,
     ) -> Arc<Self> {
         let source = CollectionSource::Discover { base_url: base_url.into(), calendar };
-        Self::from_source(id, source, auth, reqwest::Client::new(), chrono_tz::UTC)
+        Self::from_source(id, source, auth, reqwest::Client::new(), chrono_tz::UTC, None)
     }
 
     /// As [`new`](Self::new), sharing a caller-supplied HTTP client (pool reuse /
@@ -106,6 +118,7 @@ impl CaldavConnector {
             auth,
             client,
             chrono_tz::UTC,
+            None,
         )
     }
 
@@ -116,6 +129,7 @@ impl CaldavConnector {
         auth: AuthConfig,
         client: reqwest::Client,
         display_tz: chrono_tz::Tz,
+        default_reminder: Option<i64>,
     ) -> Arc<Self> {
         let capabilities = ConnectorCapabilities::bidirectional()
             .with_accept_kinds([
@@ -138,6 +152,7 @@ impl CaldavConnector {
             auth: HttpAuth::with_client(auth, client.clone()),
             client,
             display_tz,
+            default_reminder,
         })
     }
 
@@ -209,7 +224,15 @@ impl CaldavConnector {
                 }
                 CREATE => {
                     let uid = EventId::new().to_string();
-                    dav::create_event(&self.client, collection, &self.auth, &params, &uid).await
+                    dav::create_event(
+                        &self.client,
+                        collection,
+                        &self.auth,
+                        &params,
+                        &uid,
+                        self.default_reminder,
+                    )
+                    .await
                 }
                 DELETE => dav::delete_event(&self.client, collection, &self.auth, &params).await,
                 _ => unreachable!(),
@@ -291,7 +314,17 @@ impl ConnectorFactory for CaldavConnectorFactory {
             })?,
             None => chrono_tz::UTC,
         };
-        Ok(CaldavConnector::from_source(id.as_str(), source, auth, self.client.clone(), display_tz))
+        // Optional `reminder_minutes` — the default popup lead time for created
+        // events when a command omits its own; absent means no reminder by default.
+        let default_reminder = table.get("reminder_minutes").and_then(|v| v.as_integer());
+        Ok(CaldavConnector::from_source(
+            id.as_str(),
+            source,
+            auth,
+            self.client.clone(),
+            display_tz,
+            default_reminder,
+        ))
     }
 }
 
