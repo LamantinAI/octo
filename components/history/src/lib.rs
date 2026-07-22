@@ -17,6 +17,11 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+#[cfg(feature = "sqlite")]
+mod sqlite;
+#[cfg(feature = "sqlite")]
+pub use sqlite::SqliteHistory;
+
 /// Errors a history backend can raise (mirrors the `octo_core` style: explicit
 /// variants with `#[from]`, no `anyhow`).
 #[derive(Debug, Error)]
@@ -26,6 +31,9 @@ pub enum HistoryError {
 
     #[error("history json: {0}")]
     Json(#[from] serde_json::Error),
+
+    #[error("history db: {0}")]
+    Db(String),
 }
 
 pub type Result<T> = std::result::Result<T, HistoryError>;
