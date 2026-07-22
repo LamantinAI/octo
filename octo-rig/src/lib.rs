@@ -13,7 +13,7 @@
 //! let answer = agent.prompt(user).multi_turn(5).send().await?;
 //! ```
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use octo_core::{
@@ -199,22 +199,30 @@ impl Tool for SendFileTool {
     }
 }
 
-/// A rig tool that restarts part of the runtime through the control plane: a single
+/// A rig tool that lets an agent request a restart of part of the runtime — a single
 /// connector (to reload its manifest) or the whole process (a graceful shutdown; a
-/// supervisor such as systemd `Restart=always` revives it with fresh config). Emits
-/// an `octo.control.*` envelope — the runtime's control listener carries it out.
-/// Fire-and-forget, like [`SendFileTool`]; **whether to expose it, and to whom, is
-/// the host's call** — the tool itself performs whatever it is asked. This is what
-/// lets an agent apply its own config changes (the gap OpenClaw has).
+/// supervisor such as systemd `Restart=always` revives it with fresh config).
+///
+/// It **records the request rather than acting on it.** `call` stores the target in a
+/// shared slot and returns; the host drains that slot **after the turn's reply has
+/// been delivered** and calls [`carry_out_restart`] to perform it. Doing it any other
+/// way loses the reply: the runtime begins winding connectors down the instant the
+/// `octo.control.*` signal lands, so a `chat.reply` emitted moments later (the model
+/// speaks *then* calls the tool) races the teardown and never goes out. Deferring to
+/// post-reply removes the race regardless of how long the rest of the turn takes.
+/// **Whether to expose the tool, and to whom, is the host's call.** This is what lets
+/// an agent apply its own config changes (the gap OpenClaw has).
 #[derive(Clone)]
 pub struct RestartTool {
-    bus: Arc<InProcessBus>,
-    source: ConnectorId,
+    /// Filled with the requested target by [`Tool::call`]; drained by the host once
+    /// the reply is sent. `Some("process")` or `Some("<connector id>")`.
+    pending: Arc<Mutex<Option<String>>>,
 }
 
 impl RestartTool {
-    pub fn new(bus: Arc<InProcessBus>, source: ConnectorId) -> Self {
-        Self { bus, source }
+    /// Hold the tool with the slot the host reads after the reply is delivered.
+    pub fn new(pending: Arc<Mutex<Option<String>>>) -> Self {
+        Self { pending }
     }
 }
 
@@ -238,8 +246,9 @@ impl Tool for RestartTool {
                           target=\"process\" restarts the whole assistant — a graceful shutdown; a \
                           supervisor brings it straight back with fresh config (use after editing \
                           albert.toml, or when the owner asks you to reboot). target=\"<connector \
-                          id>\" restarts just that connector to reload its manifest. Tell the user \
-                          first — the restart happens right after your reply lands."
+                          id>\" restarts just that connector to reload its manifest. The restart is \
+                          carried out right AFTER this reply is delivered, so first tell the user \
+                          what you are doing in your reply, then call this once."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -252,19 +261,37 @@ impl Tool for RestartTool {
     }
 
     async fn call(&self, args: RestartArgs) -> Result<Value, Self::Error> {
-        let env = if args.target == "process" {
-            Envelope::new(self.source.clone(), EventKind::from_static(RESTART_PROCESS), ())
-        } else {
-            Envelope::new(
-                self.source.clone(),
-                EventKind::from_static(RESTART_CONNECTOR),
-                args.target.clone(),
-            )
-        };
-        tracing::info!(target = %args.target, "rig tool → restart");
-        match self.bus.publish(env).await {
-            Ok(()) => Ok(json!({ "ok": true, "restarting": args.target })),
-            Err(e) => Ok(json!({ "ok": false, "error": e.to_string() })),
+        tracing::info!(target = %args.target, "rig tool → restart (recorded; fires after the reply)");
+        if let Ok(mut slot) = self.pending.lock() {
+            *slot = Some(args.target.clone());
         }
+        Ok(json!({
+            "ok": true,
+            "restarting": args.target,
+            "when": "right after this reply is delivered"
+        }))
     }
+}
+
+/// Carry out a restart previously recorded by [`RestartTool::call`]. The host calls
+/// this **after** the turn's reply has been emitted (ideally with a short grace so the
+/// reply flushes). `target == "process"` restarts the whole runtime (`RESTART_PROCESS`);
+/// any other value names a connector to reload (`RESTART_CONNECTOR`). The runtime's
+/// control listener does the actual work.
+pub async fn carry_out_restart(
+    bus: &Arc<InProcessBus>,
+    source: &ConnectorId,
+    target: &str,
+) -> Result<(), String> {
+    let env = if target == "process" {
+        Envelope::new(source.clone(), EventKind::from_static(RESTART_PROCESS), ())
+    } else {
+        Envelope::new(
+            source.clone(),
+            EventKind::from_static(RESTART_CONNECTOR),
+            target.to_string(),
+        )
+    };
+    tracing::info!(target = %target, "carrying out restart");
+    bus.publish(env).await.map_err(|e| e.to_string())
 }
