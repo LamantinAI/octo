@@ -43,11 +43,19 @@ use tracing::{info, warn};
 
 const RUN: &str = "forkd.run";
 
-const CATALOG: &str = "A sandboxed runner for a skill's scripts. Dispatch to this connector's id:
-- forkd.run { path?, script?, interpreter?, args?, stdin?, timeout_secs? } -> { exit_code, stdout, stderr, timed_out }
-  Give `path` (a script in your workspace) OR inline `script`. `interpreter` (python3 / bash / sh;
-  default bash for inline) runs it; `args` are passed after the script. Runs jailed to your workspace
-  with a clean environment and a timeout. Network works (curl / wget / pip).";
+/// Env var naming the skills root — set by the host app so a skill's bundled
+/// scripts run **in place** (never copied through the model). The bwrap stage
+/// later ro-binds this same root into the sandbox.
+pub const SKILLS_ENV: &str = "OCTO_SKILLS_DIR";
+
+const CATALOG: &str = "A sandboxed runner for scripts. Dispatch to this connector's id:
+- forkd.run { skill_path? | path? | script?, interpreter?, args?, stdin?, timeout_secs? } -> { exit_code, stdout, stderr, timed_out }
+  `skill_path` runs a skill's bundled script IN PLACE (relative to the skills root, e.g.
+  \"fetch-url/scripts/fetch.sh\") — never copy a skill's script into the workspace or the chat.
+  `path` runs a script from your workspace; `script` is an inline body. `interpreter`
+  (python3 / bash / sh; default bash for inline) runs it; `args` follow the script. cwd is
+  your workspace (outputs land there), clean environment, hard timeout. Network works
+  (curl / wget / pip).";
 
 /// rlimits applied to the child before exec (0 = leave unlimited).
 #[derive(Clone, Copy)]
@@ -62,6 +70,8 @@ pub struct ForkdConnector {
     capabilities: ConnectorCapabilities,
     /// Explicit workspace root; `None` -> `$OCTO_CODE_WORKSPACE`.
     workspace: Option<PathBuf>,
+    /// Explicit skills root (bundled scripts run in place); `None` -> `$OCTO_SKILLS_DIR`.
+    skills: Option<PathBuf>,
     /// `(uid, gid)` to drop to; `None` -> run as the current user.
     drop_to: Option<(u32, u32)>,
     default_timeout: Duration,
@@ -75,6 +85,7 @@ impl ForkdConnector {
     fn build(
         id: impl Into<String>,
         workspace: Option<PathBuf>,
+        skills: Option<PathBuf>,
         drop_to: Option<(u32, u32)>,
         default_timeout: Duration,
         max_timeout: Duration,
@@ -88,12 +99,24 @@ impl ForkdConnector {
             id: ConnectorId::new(id),
             capabilities,
             workspace,
+            skills,
             drop_to,
             default_timeout,
             max_timeout,
             max_output,
             limits,
             seq: AtomicU64::new(0),
+        })
+    }
+
+    /// The skills root a `skill_path` resolves against: the manifest pin, else
+    /// `$OCTO_SKILLS_DIR` (exported by the host app — one source of truth by name).
+    fn skills_root(&self) -> Result<PathBuf, String> {
+        if let Some(p) = &self.skills {
+            return Ok(p.clone());
+        }
+        std::env::var_os(SKILLS_ENV).map(PathBuf::from).ok_or_else(|| {
+            format!("skill_path given but no skills root configured (set {SKILLS_ENV} or the manifest `skills`)")
         })
     }
 }
@@ -156,9 +179,14 @@ impl ForkdConnector {
             .unwrap_or(self.default_timeout)
             .min(self.max_timeout);
 
-        // Resolve the file to run: an inline script (written into the workspace) or a
-        // workspace-relative path (jailed against `..`/absolute escapes).
-        let target = if let Some(body) = inline {
+        // Resolve the file to run: a skill's bundled script (run IN PLACE from the
+        // skills root — never copied), an inline script (written into the workspace),
+        // or a workspace-relative path. All jailed against `..`/absolute escapes;
+        // cwd stays the workspace either way, so outputs land there.
+        let target = if let Some(rel) = params.get("skill_path").and_then(Value::as_str) {
+            let root = self.skills_root()?;
+            jailed(&root, rel)?
+        } else if let Some(body) = inline {
             let n = self.seq.fetch_add(1, Ordering::Relaxed);
             let file = workspace.join(format!(".forkd/run-{n}.{}", ext_of(interpreter)));
             if let Some(parent) = file.parent() {
@@ -169,7 +197,10 @@ impl ForkdConnector {
         } else if let Some(rel) = params.get("path").and_then(Value::as_str) {
             jailed(&workspace, rel)?
         } else {
-            return Err("provide `path` (a workspace script) or `script` (inline body)".into());
+            return Err(
+                "provide `skill_path` (a skill's bundled script), `path` (a workspace script) or `script` (inline body)"
+                    .into(),
+            );
         };
         let target = target.to_string_lossy().into_owned();
 
@@ -360,9 +391,16 @@ impl ConnectorFactory for ForkdConnectorFactory {
             }
         };
 
+        // Optional skills root pin; when absent, $OCTO_SKILLS_DIR is read at runtime.
+        let skills = table
+            .get("skills")
+            .and_then(|v| v.as_str())
+            .map(|s| ctx.base_dir.join(s));
+
         Ok(ForkdConnector::build(
             id.as_str(),
             workspace,
+            skills,
             drop_to,
             default_timeout,
             max_timeout,
@@ -416,15 +454,52 @@ mod tests {
     use super::*;
 
     fn forkd(ws: &Path) -> Arc<ForkdConnector> {
+        forkd_with_skills(ws, None)
+    }
+
+    fn forkd_with_skills(ws: &Path, skills: Option<&Path>) -> Arc<ForkdConnector> {
         ForkdConnector::build(
             "forkd",
             Some(ws.to_path_buf()),
+            skills.map(Path::to_path_buf),
             None,
             Duration::from_secs(5),
             Duration::from_secs(10),
             8192,
             Limits { cpu_secs: 5, fsize_bytes: 0, mem_bytes: 0 },
         )
+    }
+
+    #[tokio::test]
+    async fn a_skill_script_runs_in_place_with_workspace_cwd() {
+        let ws = std::env::temp_dir().join("forkd-test-skill-ws");
+        let skills = std::env::temp_dir().join("forkd-test-skills/demo/scripts");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&skills).unwrap();
+        // The script proves in-place exec (its own path) and workspace cwd (pwd).
+        std::fs::write(skills.join("hello.sh"), "echo \"skill says $1 from $(pwd)\"\n").unwrap();
+        let out = forkd_with_skills(&ws, Some(skills.parent().unwrap().parent().unwrap()))
+            .run_script(&json!({
+                "skill_path": "demo/scripts/hello.sh",
+                "interpreter": "bash",
+                "args": ["hi"]
+            }))
+            .await
+            .unwrap();
+        assert_eq!(out["exit_code"], 0);
+        let stdout = out["stdout"].as_str().unwrap();
+        assert!(stdout.contains("skill says hi"));
+        assert!(stdout.contains(ws.file_name().unwrap().to_str().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn a_skill_path_escape_is_rejected() {
+        let ws = std::env::temp_dir().join("forkd-test-skill-jail");
+        std::fs::create_dir_all(&ws).unwrap();
+        let out = forkd_with_skills(&ws, Some(&ws))
+            .run_script(&json!({ "skill_path": "../../etc/passwd" }))
+            .await;
+        assert!(out.is_err());
     }
 
     #[tokio::test]
