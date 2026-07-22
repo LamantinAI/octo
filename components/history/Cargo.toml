@@ -6,7 +6,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Pluggable per-channel conversation history for Octo agents — a backend-neutral trait (the way teloxide's Storage is pluggable) with in-memory and file backends. LLM-agnostic: stores neutral turns, no binding to any model library."
+description = "Pluggable per-channel conversation history for Octo agents — a backend-neutral trait (the way teloxide's Storage is pluggable) with in-memory, file, and (feature `sqlite`) a migrated SQLite backend. LLM-agnostic: stores neutral turns, no binding to any model library."
 
 [dependencies]
 async-trait = { workspace = true }
@@ -14,3 +14,12 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["fs"] }
 thiserror = { workspace = true }
+# Optional durable backend: SQLite via sqlx (async, bundled libsqlite3 — no system
+# dep; runtime queries — no DATABASE_URL at build; embedded migrations run at open).
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"], optional = true }
+
+[features]
+sqlite = ["dep:sqlx"]
+
+[dev-dependencies]
+tempfile = "3"
