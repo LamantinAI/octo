@@ -1372,6 +1372,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "octo-connector-forkd"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "libc",
+ "octo-core",
+ "octo-workspace",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "octo-connector-http"
 version = "0.0.1"
 dependencies = [
