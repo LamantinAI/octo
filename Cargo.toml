@@ -11,6 +11,7 @@ members = [
     "connectors/scheduler",
     "connectors/caldav",
     "connectors/storage",
+    "connectors/forkd",
     "octo-rig",
     "octo-code",
     "octolab",
