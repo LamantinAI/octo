@@ -38,10 +38,13 @@ const STATUS_MAX_LEN: usize = 3500;
 /// One status line is clipped to this many chars — it's a progress trace, not a log.
 const STATUS_LINE_MAX: usize = 300;
 
-/// The turn's status message so far: its Telegram id + accumulated (escaped) lines.
+/// The turn's status trace: every Telegram message it has occupied — rollover past
+/// the size cap starts a new one but the earlier ids are kept so the end of the
+/// turn can delete the WHOLE trace — plus the accumulated (escaped) lines of the
+/// tail message (the one still being edited in place).
 #[derive(Clone)]
 struct StatusMsg {
-    id: MessageId,
+    ids: Vec<MessageId>,
     lines: String,
 }
 
@@ -80,24 +83,29 @@ impl Live {
         let line = format::esc(&clip(line, STATUS_LINE_MAX));
         let existing = self.status.lock().unwrap().get(&chat.0).cloned();
 
-        // Try to grow the existing message in place.
+        // Try to grow the tail message in place.
         if let Some(cur) = existing {
-            if cur.lines.len() + line.len() < STATUS_MAX_LEN {
-                let lines = format!("{}\n{line}", cur.lines);
-                let edited = bot
-                    .edit_message_text(chat, cur.id, format!("<i>{lines}</i>"))
-                    .parse_mode(ParseMode::Html)
-                    .await;
-                if edited.is_ok() {
-                    let mut map = self.status.lock().unwrap();
-                    map.insert(chat.0, StatusMsg { id: cur.id, lines });
-                    return;
+            if let Some(&tail) = cur.ids.last() {
+                if cur.lines.len() + line.len() < STATUS_MAX_LEN {
+                    let lines = format!("{}\n{line}", cur.lines);
+                    let edited = bot
+                        .edit_message_text(chat, tail, format!("<i>{lines}</i>"))
+                        .parse_mode(ParseMode::Html)
+                        .await;
+                    if edited.is_ok() {
+                        let mut map = self.status.lock().unwrap();
+                        if let Some(entry) = map.get_mut(&chat.0) {
+                            entry.lines = lines;
+                        }
+                        return;
+                    }
+                    // Edit failed (message deleted / too old) → fall through to a new one.
                 }
-                // Edit failed (message deleted / too old) → fall through to a new one.
             }
         }
 
-        // Fresh status message for this turn (or a rollover past the size cap).
+        // Fresh status message (first of the turn, or a rollover past the size cap).
+        // Earlier ids are KEPT so end_turn deletes the whole trace, not just the tail.
         match bot
             .send_message(chat, format!("<i>{line}</i>"))
             .parse_mode(ParseMode::Html)
@@ -105,7 +113,11 @@ impl Live {
         {
             Ok(sent) => {
                 let mut map = self.status.lock().unwrap();
-                map.insert(chat.0, StatusMsg { id: sent.id, lines: line });
+                let entry = map
+                    .entry(chat.0)
+                    .or_insert_with(|| StatusMsg { ids: Vec::new(), lines: String::new() });
+                entry.ids.push(sent.id);
+                entry.lines = line;
             }
             Err(e) => tracing::warn!(chat = chat.0, error = %e, "telegram status send failed"),
         }
@@ -120,8 +132,12 @@ impl Live {
         if let Some(status) = self.status.lock().unwrap().remove(&chat.0) {
             let bot = bot.clone();
             tokio::spawn(async move {
-                if let Err(e) = bot.delete_message(chat, status.id).await {
-                    tracing::warn!(chat = chat.0, error = %e, "telegram status delete failed");
+                // Delete every message the trace occupied — rollover may have split it
+                // across several; the behaviour must be uniform for short and long turns.
+                for id in status.ids {
+                    if let Err(e) = bot.delete_message(chat, id).await {
+                        tracing::warn!(chat = chat.0, error = %e, "telegram status delete failed");
+                    }
                 }
             });
         }
