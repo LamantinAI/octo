@@ -1,0 +1,27 @@
+[package]
+name = "octo-connector-search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Web-search connector for the Octo runtime: an env-as-tools `search.web` organ over a swappable backend (DuckDuckGo now, Yandex later). Returns clean {title, url, snippet} hits."
+
+[dependencies]
+octo-core = { path = "../../octo-core" }
+# `process` for the DDG backend: it fetches via the system `curl` (see ddg.rs — DDG's
+# anti-bot serves reqwest/rustls a 202 challenge, but lets curl's TLS fingerprint through).
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "process"] }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+toml = { workspace = true }
+# HTML parsing for the DDG backend (html5ever CSS selectors). Kept to this crate —
+# only the search organ needs it.
+scraper = "0.20"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
