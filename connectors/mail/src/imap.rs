@@ -6,7 +6,7 @@
 //! `tokio_util::compat`. We keep the concrete stream type behind a small alias so
 //! the session signatures stay readable.
 
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use async_imap::Session;
 use futures::TryStreamExt;
@@ -44,8 +44,22 @@ pub(crate) async fn open(cfg: &MailConfig) -> Result<MailSession> {
     Ok(session)
 }
 
+/// Pin the process-level rustls CryptoProvider to ring, once. The dependency
+/// tree carries BOTH providers (aws-lc-rs via tokio-rustls' defaults, ring via
+/// lettre), and with two enabled `ClientConfig::builder()` PANICS at runtime
+/// ("could not automatically determine the process-level CryptoProvider").
+/// Install ring explicitly before any rustls config is built — this also covers
+/// lettre's SMTP TLS, which builds its config after this point.
+pub(crate) fn ensure_crypto_provider() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 /// A rustls client config trusting the Mozilla webpki root set.
 fn tls_connector() -> Result<TlsConnector> {
+    ensure_crypto_provider();
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let config = rustls::ClientConfig::builder()

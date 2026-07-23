@@ -23,7 +23,10 @@ chrono = { workspace = true }
 # IMAP over implicit TLS (rustls, to match the rest of octo). async-imap speaks
 # futures-io, so tokio streams are bridged with tokio-util's compat shim.
 async-imap = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
-tokio-rustls = "0.26"
+# ring, not the default aws-lc-rs: lettre already pulls ring, and two enabled
+# providers make rustls' lazy default PANIC at runtime. One provider, no ambiguity
+# (imap::ensure_crypto_provider still pins it explicitly, belt and braces).
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 webpki-roots = "0.26"
 # MIME + charset (cp1251, RFC 2047 encoded-words, HTML→text) — the hard part.
 mail-parser = "0.11"

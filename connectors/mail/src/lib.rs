@@ -85,6 +85,9 @@ impl Connector for MailConnector {
     }
 
     async fn run(self: Arc<Self>, ctx: ConnectorContext) -> OctoResult<()> {
+        // Pin the rustls CryptoProvider before ANY TLS config is built (IMAP or
+        // SMTP) — with two providers in the tree the lazy default panics.
+        imap::ensure_crypto_provider();
         let mut cmds = ctx
             .subscribe(Filter::by_target(self.id.clone()), SubscribeOptions::default())
             .await?;
