@@ -12,33 +12,35 @@
 //! It returns a clean hit list — never raw HTML — so the model spends context on
 //! results, not markup. Fetching a page's content is a separate organ.
 //!
-//! # Runtime requirement: the `curl` binary (DuckDuckGo backend only)
+//! # Dependency: the system libcurl (DuckDuckGo backend only)
 //!
-//! **The `ddg` backend shells out to `curl`, which must be on `PATH` at runtime.**
-//! This is deliberate and measured, not laziness — see [`ddg`] for the evidence:
-//! DuckDuckGo's anti-bot answers reqwest/hyper with a `202` challenge page and zero
-//! results (with rustls *and* native-tls, over HTTP/1.1 *and* HTTP/2, with
-//! browser-like headers), while `curl` from the same IP in the same second gets
-//! `200` and a full result page. The block keys on the TLS client fingerprint, which
-//! hyper cannot spoof, so every ready-made DDG crate — they all wrap reqwest — hits
-//! the same wall.
+//! The `ddg` backend fetches through **libcurl, in-process** (the `curl` crate) —
+//! not reqwest, and specifically **the system libcurl, not a vendored build**. This
+//! is measured, not incidental; [`ddg`] carries the evidence table. In short: DDG's
+//! anti-bot rejects reqwest's TLS fingerprint (`202` + zero results, with rustls and
+//! native-tls alike) *and* a vendored libcurl's (handshake dropped), while the system
+//! libcurl — the very library the working `curl` command is a shell over — gets `200`
+//! and a full page.
 //!
-//! What this requirement is *not*:
-//! - **Not a library dependency.** We do not link `libcurl`; there are no dev
-//!   headers to install, no shared-library ABI tying a shipped binary to a host's
-//!   libcurl version. (Linking libcurl was tried: without system dev headers the
-//!   crate vendors its own build, whose handshake DDG drops outright.)
-//! - **Not a build-time dependency.** `cargo build` needs nothing extra; only the
-//!   running host needs the executable.
+//! So this crate needs:
+//! - **at build time:** libcurl development files, e.g.
+//!   `sudo apt install libcurl4-openssl-dev` (Debian/Ubuntu). Without them `curl-sys`
+//!   silently vendors its own libcurl and search breaks at runtime.
+//! - **at run time:** `libcurl.so.4`, which is present on every host that has the
+//!   `curl` command (same package), so deployments running the forkd sandbox already
+//!   satisfy it. Build host and target need compatible libcurl, the same way they
+//!   already need compatible glibc.
 //!
-//! If `curl` is missing, a search fails with a clear error naming the binary — the
-//! organ degrades loudly rather than silently returning "no results". Deployments
-//! that already run the forkd sandbox have `curl` by definition (forkd requires it).
-//! A TLS-impersonating client (`rquest`/BoringSSL, curl-impersonate) is the upgrade
-//! path if this dependency ever needs to go away.
+//! **Build trap:** cargo caches `curl-sys`'s build-script decision. If a build ran
+//! before the dev headers were installed, installing them is not enough — run
+//! `cargo clean -p curl-sys` and rebuild, else the vendored copy silently persists.
+//! The linked version is logged when the connector starts (see [`ddg::libcurl_version`]),
+//! so a vendored build is visible rather than a mystery 202 later.
 //!
-//! Backends that talk to a real API (Yandex Search API, next) carry no such
-//! requirement — this is a DuckDuckGo-specific cost of having no official API.
+//! A TLS-impersonating client (`rquest`/BoringSSL) is the alternative if this
+//! dependency ever needs to go away. Backends that talk to a real API (Yandex Search
+//! API, next) carry no such requirement — this is a DuckDuckGo-specific cost of
+//! having no official API.
 
 mod ddg;
 
@@ -125,7 +127,14 @@ impl Connector for SearchConnector {
         let mut cmds = ctx
             .subscribe(Filter::by_target(self.id.clone()), SubscribeOptions::default())
             .await?;
-        tracing::info!(connector = %self.id, backend = self.backend.name(), "search ready");
+        // Log the linked libcurl: a vendored build (see ddg's build trap) shows up
+        // here as an unexpected version, instead of as a puzzling 202 later.
+        tracing::info!(
+            connector = %self.id,
+            backend = self.backend.name(),
+            libcurl = %ddg::libcurl_version(),
+            "search ready"
+        );
         loop {
             tokio::select! {
                 next = cmds.next() => match next {
