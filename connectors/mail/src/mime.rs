@@ -1,7 +1,7 @@
 //! Turn a raw RFC822 message into the JSON shape the agent reads. `mail-parser`
 //! does the heavy lifting — MIME tree walk, transfer-encoding, charset (cp1251 &
 //! co.), RFC 2047 headers — we pick the fields and add a tiny VEVENT extractor
-//! for calendar invites (title / time / organizer), matching the openclaw skill.
+//! for calendar invites (title / time / organizer).
 
 use mail_parser::{Address, MessageParser, MimeHeaders};
 use serde_json::{json, Value};
