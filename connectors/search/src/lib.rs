@@ -11,6 +11,34 @@
 //!
 //! It returns a clean hit list — never raw HTML — so the model spends context on
 //! results, not markup. Fetching a page's content is a separate organ.
+//!
+//! # Runtime requirement: the `curl` binary (DuckDuckGo backend only)
+//!
+//! **The `ddg` backend shells out to `curl`, which must be on `PATH` at runtime.**
+//! This is deliberate and measured, not laziness — see [`ddg`] for the evidence:
+//! DuckDuckGo's anti-bot answers reqwest/hyper with a `202` challenge page and zero
+//! results (with rustls *and* native-tls, over HTTP/1.1 *and* HTTP/2, with
+//! browser-like headers), while `curl` from the same IP in the same second gets
+//! `200` and a full result page. The block keys on the TLS client fingerprint, which
+//! hyper cannot spoof, so every ready-made DDG crate — they all wrap reqwest — hits
+//! the same wall.
+//!
+//! What this requirement is *not*:
+//! - **Not a library dependency.** We do not link `libcurl`; there are no dev
+//!   headers to install, no shared-library ABI tying a shipped binary to a host's
+//!   libcurl version. (Linking libcurl was tried: without system dev headers the
+//!   crate vendors its own build, whose handshake DDG drops outright.)
+//! - **Not a build-time dependency.** `cargo build` needs nothing extra; only the
+//!   running host needs the executable.
+//!
+//! If `curl` is missing, a search fails with a clear error naming the binary — the
+//! organ degrades loudly rather than silently returning "no results". Deployments
+//! that already run the forkd sandbox have `curl` by definition (forkd requires it).
+//! A TLS-impersonating client (`rquest`/BoringSSL, curl-impersonate) is the upgrade
+//! path if this dependency ever needs to go away.
+//!
+//! Backends that talk to a real API (Yandex Search API, next) carry no such
+//! requirement — this is a DuckDuckGo-specific cost of having no official API.
 
 mod ddg;
 
