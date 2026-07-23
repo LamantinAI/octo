@@ -1,25 +1,44 @@
-//! DuckDuckGo backend — a small engine over the system `curl`.
+//! DuckDuckGo backend — a small engine over **libcurl** (in-process, via the `curl`
+//! crate). No official DDG API exists, so this stays best-effort: a challenge page or
+//! a markup change surfaces as an honest error/empty list, never a panic.
 //!
-//! **Why curl and not reqwest.** Measured, not guessed: DDG's anti-bot answers
-//! reqwest/hyper with a `202 Accepted` "anomaly" challenge page and zero results —
-//! with rustls *and* with native-tls (OpenSSL), over HTTP/1.1 *and* HTTP/2, with
-//! browser-ish headers. curl from the same IP, same second, gets `200` and a full
-//! result page. So the block keys on the TLS/HTTP client fingerprint, which hyper
-//! can't spoof. Every ready-made DDG crate wraps reqwest, so they all hit this wall.
+//! # Why libcurl and not reqwest — and why the *system* libcurl specifically
 //!
-//! curl is already a hard requirement on our targets (the forkd sandbox needs it),
-//! so leaning on it costs no new dependency. A TLS-impersonating client (e.g.
-//! `rquest`/BoringSSL) is the upgrade if we ever want to drop the curl binary.
+//! Measured, not guessed. DDG's anti-bot answers reqwest/hyper with `202 Accepted`
+//! and a challenge page carrying zero results — with rustls **and** native-tls (the
+//! very same system OpenSSL curl uses), over HTTP/1.1 **and** HTTP/2, with
+//! browser-like headers. The same request through curl, same IP, same second, gets
+//! `200` and a full result page. The block keys on the TLS/transport fingerprint
+//! (cipher and extension order, ALPN offer), which hyper does not let you reshape —
+//! so every ready-made DDG crate, all of them reqwest wrappers, hits the same wall.
 //!
-//! No official DDG API exists, so this stays best-effort: a challenge page or a
-//! markup change surfaces as an honest error/empty list, never a panic.
+//! The curl binary is only a thin shell over `libcurl`, so linking libcurl gives the
+//! same handshake in-process. **But it must be the *system* libcurl.** Verified both
+//! ways on the same box:
+//!
+//! | client | result |
+//! |---|---|
+//! | reqwest (rustls / native-tls, h1 / h2) | `202`, 0 results |
+//! | `curl` crate against a **vendored** build (curl 8.21, no system dev headers) | TLS `CURLE_SSL_CONNECT_ERROR` — peer drops the handshake |
+//! | `curl` crate against the **system** libcurl (8.5.0, OpenSSL 3.0.13, nghttp2) | `200`, 10 results |
+//!
+//! A vendored build is compiled with a different feature set (e.g. no nghttp2, so a
+//! different ALPN offer), which changes the fingerprint enough to be rejected.
+//!
+//! ## Build trap
+//!
+//! `curl-sys` links the system library **only if it can find it** (pkg-config); with
+//! no `libcurl4-openssl-dev` present it silently vendors its own copy, and search
+//! then fails at runtime. Worse, cargo caches that build-script decision: installing
+//! the headers afterwards is not enough — run `cargo clean -p curl-sys` and rebuild.
+//! [`libcurl_version`] is logged at connector start so the linked build is visible.
 
-use std::process::Stdio;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use curl::easy::{Easy, List};
 use scraper::{Html, Selector};
-use tokio::process::Command;
+use tokio::task::spawn_blocking;
 
 use crate::{SearchBackend, SearchHit};
 
@@ -29,10 +48,14 @@ const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
 const ACCEPT: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
 const ACCEPT_LANG: &str = "en-US,en;q=0.9,ru;q=0.8";
 
-/// DuckDuckGo search over the HTML endpoint, fetched with `curl`.
+/// The linked libcurl's version string, e.g. `"8.5.0"`. Logged at startup so a
+/// vendored build (see the module's build trap) is obvious in the logs.
+pub fn libcurl_version() -> String {
+    curl::Version::get().version().to_string()
+}
+
+/// DuckDuckGo search over the HTML endpoint, fetched with libcurl.
 pub struct DdgBackend {
-    /// The curl binary (name on `PATH`, or an absolute path).
-    curl: String,
     timeout: Duration,
     /// DDG `kl` locale (region-language), e.g. `"ru-ru"`; `None` = DDG default.
     region: Option<String>,
@@ -40,50 +63,7 @@ pub struct DdgBackend {
 
 impl DdgBackend {
     pub fn new(timeout: Duration, region: Option<String>) -> Result<Self, String> {
-        Ok(Self { curl: "curl".to_string(), timeout, region })
-    }
-
-    /// Override the curl binary (default: `curl` from `PATH`).
-    pub fn with_curl(mut self, curl: impl Into<String>) -> Self {
-        self.curl = curl.into();
-        self
-    }
-
-    /// POST the query through curl; returns the HTML body.
-    async fn fetch(&self, query: &str) -> Result<String, String> {
-        let secs = self.timeout.as_secs().max(1).to_string();
-        let mut cmd = Command::new(&self.curl);
-        cmd.arg("-sS") // quiet, but keep errors on stderr
-            .arg("-m")
-            .arg(&secs)
-            .arg("-A")
-            .arg(UA)
-            .arg("-H")
-            .arg(format!("Accept: {ACCEPT}"))
-            .arg("-H")
-            .arg(format!("Accept-Language: {ACCEPT_LANG}"))
-            // `--data-urlencode` makes this a POST and encodes the value for us.
-            // The query is a separate argv entry — no shell, so nothing to inject.
-            .arg("--data-urlencode")
-            .arg(format!("q={query}"));
-        if let Some(kl) = &self.region {
-            cmd.arg("--data-urlencode").arg(format!("kl={kl}"));
-        }
-        cmd.arg(ENDPOINT)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-
-        let out = cmd
-            .output()
-            .await
-            .map_err(|e| format!("ddg: cannot run `{}`: {e}", self.curl))?;
-        if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
-            return Err(format!("ddg: curl failed ({}): {}", out.status, err.trim()));
-        }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        Ok(Self { timeout, region })
     }
 }
 
@@ -94,15 +74,61 @@ impl SearchBackend for DdgBackend {
     }
 
     async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, String> {
-        let body = self.fetch(query).await?;
+        // libcurl's easy interface is blocking; keep it off the async runtime.
+        let (query_owned, region, timeout) = (query.to_string(), self.region.clone(), self.timeout);
+        let body = spawn_blocking(move || fetch_blocking(&query_owned, region.as_deref(), timeout))
+            .await
+            .map_err(|e| format!("ddg: fetch task failed: {e}"))??;
+
         let hits = parse_ddg_html(&body, limit);
         // Distinguish "DDG served the bot challenge" from "genuinely no matches", so
-        // the agent is told the truth instead of silently believing nothing exists.
+        // the agent is told the truth instead of believing nothing exists.
         if hits.is_empty() && looks_like_challenge(&body) {
             return Err("ddg: blocked by the anti-bot challenge (no results served)".into());
         }
         Ok(hits)
     }
+}
+
+/// One blocking libcurl POST; returns the HTML body.
+fn fetch_blocking(query: &str, region: Option<&str>, timeout: Duration) -> Result<String, String> {
+    let mut easy = Easy::new();
+    easy.url(ENDPOINT).map_err(|e| format!("ddg: url: {e}"))?;
+    easy.timeout(timeout).map_err(|e| format!("ddg: timeout: {e}"))?;
+    easy.useragent(UA).map_err(|e| format!("ddg: user-agent: {e}"))?;
+
+    let mut headers = List::new();
+    headers
+        .append(&format!("Accept: {ACCEPT}"))
+        .and_then(|()| headers.append(&format!("Accept-Language: {ACCEPT_LANG}")))
+        .map_err(|e| format!("ddg: headers: {e}"))?;
+    easy.http_headers(headers).map_err(|e| format!("ddg: headers: {e}"))?;
+
+    // Form body, percent-encoded by libcurl itself.
+    let mut form = format!("q={}", easy.url_encode(query.as_bytes()));
+    if let Some(kl) = region {
+        form.push_str(&format!("&kl={}", easy.url_encode(kl.as_bytes())));
+    }
+    easy.post(true).map_err(|e| format!("ddg: post: {e}"))?;
+    easy.post_fields_copy(form.as_bytes()).map_err(|e| format!("ddg: body: {e}"))?;
+
+    let mut buf = Vec::new();
+    {
+        let mut transfer = easy.transfer();
+        transfer
+            .write_function(|chunk| {
+                buf.extend_from_slice(chunk);
+                Ok(chunk.len())
+            })
+            .map_err(|e| format!("ddg: writer: {e}"))?;
+        transfer.perform().map_err(|e| format!("ddg: request failed: {e}"))?;
+    }
+
+    let code = easy.response_code().unwrap_or_default();
+    if !(200..300).contains(&code) {
+        return Err(format!("ddg: http {code}"));
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// DDG's anomaly/challenge interstitial, as opposed to a real empty result page.
@@ -189,11 +215,20 @@ mod tests {
         assert!(!looks_like_challenge(FIXTURE));
     }
 
-    /// Live smoke test against DuckDuckGo — needs network + `curl`, so it is
-    /// ignored by default. Run with `cargo test -p octo-connector-search -- --ignored`.
+    /// Live smoke test against DuckDuckGo — needs network and a *system* libcurl, so
+    /// it is ignored by default. Run with
+    /// `cargo test -p octo-connector-search -- --ignored`.
+    ///
+    /// Two ways this fails that are NOT a broken backend:
+    /// - **Rate limiting.** DDG throttles rapid repeats from one IP, so back-to-back
+    ///   runs can come back empty. Wait a moment and re-run before believing it.
+    /// - **A vendored libcurl.** A challenge/`202` failure usually means `curl-sys`
+    ///   vendored its own build (see the module's build trap) rather than DDG changing;
+    ///   the printed libcurl version tells you which build you linked.
     #[tokio::test]
     #[ignore = "hits the network"]
     async fn live_ddg_search_returns_hits() {
+        println!("linked libcurl: {}", libcurl_version());
         let backend = DdgBackend::new(Duration::from_secs(20), None).unwrap();
         let hits = backend.search("rust async runtime", 5).await.unwrap();
         assert!(!hits.is_empty(), "expected some hits");

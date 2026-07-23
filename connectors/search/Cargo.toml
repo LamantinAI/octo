@@ -10,9 +10,7 @@ description = "Web-search connector for the Octo runtime: an env-as-tools `searc
 
 [dependencies]
 octo-core = { path = "../../octo-core" }
-# `process` for the DDG backend: it fetches via the system `curl` (see ddg.rs — DDG's
-# anti-bot serves reqwest/rustls a 202 challenge, but lets curl's TLS fingerprint through).
-tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "process"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -22,6 +20,10 @@ toml = { workspace = true }
 # HTML parsing for the DDG backend (html5ever CSS selectors). Kept to this crate —
 # only the search organ needs it.
 scraper = "0.20"
+# libcurl bindings — the DDG backend fetches through the SYSTEM libcurl (see ddg.rs:
+# DDG rejects reqwest's TLS fingerprint, and even a vendored libcurl build). Needs
+# libcurl4-openssl-dev at build time; links libcurl.so.4 at runtime.
+curl = "0.4"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

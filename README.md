@@ -161,7 +161,7 @@ not a crate. `connectors/petstore` is a worked example.
 | `telegram`  | bidirectional chat (teloxide) + file transfer + per-chat ACL | in: `chat.message`; out: `chat.reply` / `chat.send_file` |
 | `scheduler` | reminders / alarms (manageable actor) | control commands mutate persisted state |
 | `forkd`     | sandboxed script execution (executable skills) | `forkd.run` |
-| `search`    | web search, swappable backend (DuckDuckGo now, Yandex later) — the DDG backend needs the `curl` **binary** on `PATH` at runtime, see its crate docs | `search.web` |
+| `search`    | web search, swappable backend (DuckDuckGo now, Yandex later) — the DDG backend links the **system libcurl** (`libcurl4-openssl-dev` to build, `libcurl.so.4` to run); see its crate docs for why reqwest can't be used | `search.web` |
 
 ### Writing one
 
