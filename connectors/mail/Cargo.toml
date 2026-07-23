@@ -1,0 +1,34 @@
+[package]
+name = "octo-connector-mail"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "IMAP/SMTP mail connector for the Octo runtime. One crate, one mailbox — read (list/search/read a message, MIME + charset decoded, calendar invites extracted) and send (send/reply with threading) via env-as-tools dispatch. Implicit-TLS IMAP (async-imap + rustls) and SMTP (lettre)."
+
+[dependencies]
+octo-core = { path = "../../octo-core" }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "net", "io-util"] }
+tokio-util = { workspace = true, features = ["compat"] }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+futures = { workspace = true }
+chrono = { workspace = true }
+# IMAP over implicit TLS (rustls, to match the rest of octo). async-imap speaks
+# futures-io, so tokio streams are bridged with tokio-util's compat shim.
+async-imap = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
+tokio-rustls = "0.26"
+webpki-roots = "0.26"
+# MIME + charset (cp1251, RFC 2047 encoded-words, HTML→text) — the hard part.
+mail-parser = "0.11"
+# SMTP send/reply, implicit TLS, threading headers.
+lettre = { version = "0.11", default-features = false, features = ["tokio1", "tokio1-rustls-tls", "smtp-transport", "builder"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
