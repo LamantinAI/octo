@@ -13,6 +13,7 @@ members = [
     "connectors/storage",
     "connectors/forkd",
     "connectors/mail",
+    "connectors/search",
     "octo-rig",
     "octo-code",
 ]
@@ -29,6 +30,7 @@ default-members = [
     "connectors/scheduler",
     "connectors/caldav",
     "connectors/storage",
+    "connectors/search",
     "connectors/mail",
     "octo-code",
 ]
