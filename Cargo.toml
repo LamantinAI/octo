@@ -15,9 +15,8 @@ members = [
     "connectors/mail",
     "octo-rig",
     "octo-code",
-    "octolab",
 ]
-# Keep `cargo test` (no --workspace) light — octo-rig/telegram/octolab pull the
+# Keep `cargo test` (no --workspace) light — octo-rig / telegram pull the
 # rig/LLM and teloxide trees. The components/ libs are light, so they stay in the
 # default set.
 default-members = [

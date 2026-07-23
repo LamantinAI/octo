@@ -30,10 +30,8 @@ Workspace members:
   (alarms), `caldav` (generic CalDAV calendar), `http` (dyn TOML-configured), and
   `petstore` (example instance).
 - `octo-rig/` — a `rig` `Tool` bridging native tool-calling to connector dispatch
-  (`dispatch_to_connector`: publish a command, await the correlated result).
-- `octolab/` — the playground: a real ReAct LLM agent over the runtime; the
-  reference for config-driven wiring. Excluded from `default-members` so plain
-  `cargo test` stays light.
+  (`dispatch_to_connector`: publish a command, await the correlated result), plus
+  typed tools (file tools behind `code`, `SendFileTool`, `RestartTool`).
 
 Design detail lives in the research vault (`research/`, a separate git repo) and
 the `README.md`.
@@ -65,10 +63,8 @@ Orient by crate and responsibility first:
 ## Local Runbook
 
 - `cargo test` — kernel + light crates (`default-members` deliberately excludes
-  `octo-rig` / `telegram` / `octolab`, which pull the rig / teloxide trees).
+  `octo-rig` / `telegram`, which pull the rig / teloxide trees).
 - `cargo test --workspace` — everything, including the heavy crates.
-- `cargo run -p octolab` — the playground agent (needs `OCTO_*` env / repo-root
-  `.env`). Telegram if a token is set, else a console channel.
 
 ## Module Organisation
 

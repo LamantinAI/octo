@@ -175,29 +175,6 @@ picks it up the moment its factory is registered and a manifest exists.
 - **Cognition is userland.** The `Cogitator` is a single pluggable trait; the
   runtime supervises it like any actor but holds no opinion about how it thinks.
 
-## Layout
-
-```
-octo/                       ← workspace root
-├── octo-core/              ← the kernel: bus, envelope, connectors, lifecycle, router, runtime
-├── components/             ← pluggable, backend-swappable libraries (not the kernel, not connectors)
-│   ├── history/            ← per-channel conversation history (in-memory / file / SQLite)
-│   ├── http-auth/          ← reusable auth modes (basic / bearer / oauth2)
-│   └── workspace/          ← shared path-jail + atomic writes for file faculties
-├── octo-rig/               ← rig Tools: connector dispatch + file tools (`code`) + send_file / restart
-├── octo-code/              ← file tools (read/write/edit/list/glob/grep) as rig Tools, workspace-jailed
-├── connectors/
-│   ├── http/               ← dynamic, TOML-configured HTTP connector (one crate, many APIs)
-│   ├── petstore/           ← example HTTP connector instance
-│   ├── telegram/           ← bidirectional Telegram (teloxide): chat + files + per-chat ACL
-│   ├── scheduler/          ← manageable-actor scheduler (reminders / alarms; control commands)
-│   ├── caldav/             ← generic CalDAV calendars (one crate, many calendars)
-│   ├── mail/               ← generic IMAP/SMTP mailbox (read + send)
-│   ├── storage/            ← durable object store (local now, S3-ready) + workspace bridge
-│   └── forkd/              ← sandboxed script execution for executable skills
-└── octolab/                ← playground: a real ReAct LLM agent over the runtime
-```
-
 ## A taste
 
 ```rust
@@ -228,19 +205,6 @@ async fn main() -> OctoResult<()> {
     // Add a Cogitator and connectors; the runtime supervises them all.
     Octo::builder().add_connector(hb).build().run().await
 }
-```
-
-## octolab
-
-`octolab/` is the playground that exercises the runtime as a real online agent:
-a rig + OpenRouter ReAct cogitator with native tool-calling, the official Telegram
-connector (console fallback), env-as-tools dispatch to an HTTP connector, modular
-per-channel history, and configurable perception. It is excluded from
-`default-members`, so a plain `cargo test` stays light:
-
-```sh
-cargo test                 # kernel + light crates
-cargo run -p octolab       # the agent (needs OCTO_* env / repo-root .env)
 ```
 
 ## Status
