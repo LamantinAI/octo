@@ -6,7 +6,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "IMAP/SMTP mail connector for the Octo runtime. One crate, one mailbox — read (list/search/read a message, MIME + charset decoded, calendar invites extracted) and send (send/reply with threading) via env-as-tools dispatch. Implicit-TLS IMAP (async-imap + rustls) and SMTP (lettre)."
+description = "Generic IMAP/SMTP mail connector for the Octo runtime. One crate, one mailbox, any provider — read (list/search/read a message, MIME + charset decoded, calendar invites extracted) and send (send/reply with threading) via env-as-tools dispatch. Implicit-TLS IMAP (async-imap + rustls) and SMTP (lettre)."
 
 [dependencies]
 octo-core = { path = "../../octo-core" }

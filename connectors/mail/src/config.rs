@@ -1,7 +1,7 @@
 //! Resolved mail config: IMAP + SMTP endpoints and credentials. Built from a
-//! `type = "mail"` manifest whose values name env vars for the secrets (host/port
-//! may be literals). Mirrors the openclaw regru-mail env layout, so the same
-//! REG.RU mailbox works unchanged.
+//! `type = "mail"` manifest whose values name env vars for the secrets; hosts are
+//! required literals (this crate is provider-neutral — no vendor defaults), ports
+//! default to the implicit-TLS standards (993/465).
 
 use serde_json::Value;
 use toml::Value as Toml;
@@ -25,11 +25,19 @@ pub struct MailConfig {
 
 impl MailConfig {
     /// Parse a `[connector]` manifest table. Keys ending `_env` name an env var
-    /// holding the value; host/port/mailbox keys are literals with defaults that
-    /// match REG.RU (`mail.hosting.reg.ru`, 993/465 implicit TLS, `INBOX`).
+    /// holding the value. `imap_host`/`smtp_host` are REQUIRED literals (no
+    /// vendor defaults); ports default to implicit-TLS 993/465, mailbox to INBOX.
     pub(crate) fn from_table(table: &Toml) -> Result<Self> {
         let lit = |key: &str, default: &str| -> String {
             table.get(key).and_then(Toml::as_str).unwrap_or(default).to_string()
+        };
+        let required = |key: &str| -> Result<String> {
+            table
+                .get(key)
+                .and_then(Toml::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| MailError::Config(format!("manifest missing `{key}`")))
         };
         let port = |key: &str, default: u16| -> Result<u16> {
             match table.get(key) {
@@ -68,7 +76,9 @@ impl MailConfig {
 
         let imap_user = secret("imap_user_env")?;
         let imap_pass = secret("imap_pass_env")?;
-        // SMTP creds default to the IMAP ones (REG.RU uses the same login).
+        // SMTP creds default to the IMAP ones (most providers share the login);
+        // the SMTP host defaults to the IMAP host.
+        let imap_host = required("imap_host")?;
         let smtp_user = opt_secret("smtp_user_env")?.unwrap_or_else(|| imap_user.clone());
         let smtp_pass = opt_secret("smtp_pass_env")?.unwrap_or_else(|| imap_pass.clone());
         let from = opt_secret("from_env")?
@@ -76,12 +86,12 @@ impl MailConfig {
             .unwrap_or_else(|| imap_user.clone());
 
         Ok(MailConfig {
-            imap_host: lit("imap_host", "mail.hosting.reg.ru"),
+            smtp_host: lit("smtp_host", &imap_host),
+            imap_host,
             imap_port: port("imap_port", 993)?,
             imap_user,
             imap_pass,
             mailbox: lit("mailbox", "INBOX"),
-            smtp_host: lit("smtp_host", "mail.hosting.reg.ru"),
             smtp_port: port("smtp_port", 465)?,
             smtp_user,
             smtp_pass,

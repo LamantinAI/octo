@@ -68,10 +68,11 @@ fn tls_connector() -> Result<TlsConnector> {
     Ok(TlsConnector::from(Arc::new(config)))
 }
 
-/// List recent messages in the mailbox. Mirrors the openclaw skill: there is no
-/// server-side SEARCH — over-fetch the most recent slice by envelope only, then
-/// filter client-side on `query` (a substring over `from` + `subject`), newest
-/// first, capped at `limit`.
+/// List recent messages in the mailbox. There is no server-side SEARCH —
+/// over-fetch the most recent slice by envelope only, then filter client-side on
+/// `query` (a substring over `from` + `subject`), newest first, capped at
+/// `limit`. (Server-side SEARCH varies too much across providers to be worth the
+/// dialects at this size; the recent window is what a chat assistant needs.)
 pub(crate) async fn list(
     cfg: &MailConfig,
     limit: usize,
