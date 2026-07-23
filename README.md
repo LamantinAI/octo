@@ -39,6 +39,102 @@ header fields; handlers downcast the payload to a known type. Kinds are
 dot-namespaced with glob matching (`vision.**`, `mqtt.factory.*`). An optional
 `PayloadRegistry` enforces the type expected for a kind at publish time.
 
+## Connectors — env-as-tools organs
+
+A connector is a long-lived, supervised task that senses and/or acts on one slice
+of the world (a chat, a calendar, a mailbox, a shell). A **bidirectional**
+connector is also a *capability the agent can invoke*: it advertises a catalog,
+accepts **command** envelopes, and answers with a correlated **result**. The
+cognition layer's entire action space is the set of registered connectors — add a
+connector and the agent gains a skill, with **zero cognition change**. That's
+"env-as-tools".
+
+Because the contract is generic, most connectors are **one crate → many
+instances**: the same code becomes many skills via config (many calendars, many
+mailboxes, many HTTP APIs, a swappable storage backend).
+
+### The dispatch contract (the API)
+
+A command is an envelope addressed at a connector's `id`; the reply is an
+envelope of kind `<command>.result` carrying the command's `id` as its
+`correlation_id`:
+
+```
+command:  Envelope { target = "<connector-id>", kind = "<verb>", payload = <JSON> }
+result:   Envelope { kind = "<verb>.result", correlation_id = <command.id>, payload = <JSON> }
+```
+
+- **Request/response** in one call: `bus.publish_and_await_response(cmd, timeout)`.
+- **Errors are returned as data** (`{ "error": "..." }`), not as failures — so a
+  reasoning layer reads the problem and adapts instead of crashing.
+- **The catalog** each connector sets with `ConnectorCapabilities::with_description(..)`
+  is what tells a model (or a human) which verbs it accepts and their payloads.
+
+From an LLM, [`octo-rig`]'s `OctoDispatchTool` exposes *every* registered
+connector to a rig agent as one tool (`dispatch_to_connector { target, kind,
+payload }`), with the catalogs concatenated into its description. (octo-rig also
+ships typed tools: the octo-code file tools behind its `code` feature, plus
+`SendFileTool` and `RestartTool`.)
+
+### Config-driven assembly (many instances, no new code)
+
+Register a connector *type* once, then every manifest of that type becomes an
+instance:
+
+```rust
+let octo = Octo::builder()
+    .register_connector_type("caldav", octo_connector_caldav::factory())
+    .register_connector_type("mail",   octo_connector_mail::factory())
+    .from_config_file("octo.toml")?      // scans [connectors] dir for <id>.toml files
+    .build();
+```
+
+```toml
+# octo.toml
+[connectors]
+dir = "config/connectors"                # each *.toml here is one connector instance
+
+# config/connectors/calendar-work.toml
+[connector]
+id       = "calendar-work"               # unique — this is how the agent addresses it
+type     = "caldav"                      # picks the factory
+base_url = "https://caldav.yandex.ru"
+auth     = "basic"
+login    = "work@example.com"
+password_env = "OCTO_WORK_APP_PASSWORD"  # secrets are named env vars, never literals
+```
+
+Two work + personal calendars, or three mailboxes, are just N manifest files with
+distinct `id`s — the model sees N distinct tools.
+
+### Shipped connectors
+
+| id / type | what it is | key commands |
+|-----------|------------|--------------|
+| `http`      | dynamic HTTP client (one crate, many APIs) | per-manifest, from a spec |
+| `caldav`    | CalDAV calendars (many calendars) | `calendar.list_events` / `create_event` / `delete_event` |
+| `mail`      | IMAP read + SMTP send (one mailbox) | `mail.cmd.list` / `read` / `send` / `reply` |
+| `storage`   | durable object store (local now, S3-ready) | `storage.put` / `get` / `list` / `delete` / `promote` / `checkout` |
+| `telegram`  | bidirectional chat (teloxide) + file transfer + per-chat ACL | in: `chat.message`; out: `chat.reply` / `chat.send_file` |
+| `scheduler` | reminders / alarms (manageable actor) | control commands mutate persisted state |
+| `forkd`     | sandboxed script execution (executable skills) | `forkd.run` |
+
+### Writing one
+
+A connector is two traits:
+
+- **`Connector`** — `id()`, `capabilities()`, and an async `run(self, ctx)` loop
+  that subscribes to its commands (`Filter::by_target(self.id)`), does the work,
+  and publishes each `<kind>.result` correlated to the request. Return errors as
+  data.
+- **`ConnectorFactory`** — `type_name()` and `create(id, manifest, ctx)`, building
+  one instance from a `[connector]` table (secrets pulled from the env vars it
+  names).
+
+`connectors/caldav`, `connectors/mail` and `connectors/storage` are compact,
+idiomatic templates — copy their shape. A new capability is a new crate; the agent
+picks it up the moment its factory is registered and a manifest exists.
+
 ## Features
 
 - **Connectors as autonomous, supervised tasks** — each owns its own lifecycle
@@ -85,15 +181,20 @@ dot-namespaced with glob matching (`vision.**`, `mqtt.factory.*`). An optional
 octo/                       ← workspace root
 ├── octo-core/              ← the kernel: bus, envelope, connectors, lifecycle, router, runtime
 ├── components/             ← pluggable, backend-swappable libraries (not the kernel, not connectors)
-│   ├── history/            ← per-channel conversation history (in-memory / file backends)
-│   └── http-auth/          ← reusable auth modes for connectors (basic / bearer / oauth2)
-├── octo-rig/               ← a rig Tool bridging native LLM tool-calling → connector dispatch
+│   ├── history/            ← per-channel conversation history (in-memory / file / SQLite)
+│   ├── http-auth/          ← reusable auth modes (basic / bearer / oauth2)
+│   └── workspace/          ← shared path-jail + atomic writes for file faculties
+├── octo-rig/               ← rig Tools: connector dispatch + file tools (`code`) + send_file / restart
+├── octo-code/              ← file tools (read/write/edit/list/glob/grep) as rig Tools, workspace-jailed
 ├── connectors/
 │   ├── http/               ← dynamic, TOML-configured HTTP connector (one crate, many APIs)
 │   ├── petstore/           ← example HTTP connector instance
-│   ├── telegram/           ← bidirectional Telegram connector (teloxide)
-│   ├── scheduler/          ← manageable-actor scheduler (control commands mutate persisted state)
-│   └── caldav/             ← generic CalDAV calendar connector (one crate, many calendars)
+│   ├── telegram/           ← bidirectional Telegram (teloxide): chat + files + per-chat ACL
+│   ├── scheduler/          ← manageable-actor scheduler (reminders / alarms; control commands)
+│   ├── caldav/             ← generic CalDAV calendars (one crate, many calendars)
+│   ├── mail/               ← generic IMAP/SMTP mailbox (read + send)
+│   ├── storage/            ← durable object store (local now, S3-ready) + workspace bridge
+│   └── forkd/              ← sandboxed script execution for executable skills
 └── octolab/                ← playground: a real ReAct LLM agent over the runtime
 ```
 
