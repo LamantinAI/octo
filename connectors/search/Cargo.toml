@@ -6,7 +6,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Web-search connector for the Octo runtime: an env-as-tools `search.web` organ over a swappable backend (DuckDuckGo now, Yandex later). Returns clean {title, url, snippet} hits."
+description = "Web-search connector for the Octo runtime: an env-as-tools `search.web` organ over a swappable backend (DuckDuckGo now, Yandex later), returning clean {title, url, snippet} hits. NOTE: the DuckDuckGo backend requires the `curl` binary on PATH at runtime (DDG's anti-bot rejects reqwest's TLS fingerprint) — no libcurl linkage, no build-time dependency."
 
 [dependencies]
 octo-core = { path = "../../octo-core" }
