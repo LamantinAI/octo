@@ -34,6 +34,10 @@ use octo_core::{
 use serde_json::{json, Value};
 
 pub use config::MailConfig;
+/// Install the rustls CryptoProvider (ring) process-wide. Call once at process
+/// startup, before building the runtime, so no sibling connector's TLS races it.
+/// See [`imap::ensure_crypto_provider`].
+pub use imap::ensure_crypto_provider;
 
 const LIST: &str = "mail.cmd.list";
 const READ: &str = "mail.cmd.read";
@@ -56,7 +60,7 @@ pub struct MailConnector {
 
 impl MailConnector {
     pub fn new(id: impl Into<String>, cfg: MailConfig) -> Arc<Self> {
-        let capabilities = ConnectorCapabilities::output_only()
+        let capabilities = ConnectorCapabilities::bidirectional()
             .with_accept_kinds([
                 EventKind::from_static(LIST),
                 EventKind::from_static(READ),

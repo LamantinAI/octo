@@ -45,12 +45,18 @@ pub(crate) async fn open(cfg: &MailConfig) -> Result<MailSession> {
 }
 
 /// Pin the process-level rustls CryptoProvider to ring, once. The dependency
-/// tree carries BOTH providers (aws-lc-rs via tokio-rustls' defaults, ring via
-/// lettre), and with two enabled `ClientConfig::builder()` PANICS at runtime
-/// ("could not automatically determine the process-level CryptoProvider").
-/// Install ring explicitly before any rustls config is built — this also covers
-/// lettre's SMTP TLS, which builds its config after this point.
-pub(crate) fn ensure_crypto_provider() {
+/// tree carries BOTH providers (aws-lc-rs via reqwest in caldav/http-auth, ring
+/// via lettre/async-imap), and with two enabled `ClientConfig::builder()` PANICS
+/// at runtime ("could not automatically determine the process-level
+/// CryptoProvider").
+///
+/// This is **process-global** state, so it must run before *any* rustls config
+/// is built anywhere in the process — including reqwest's in sibling connectors.
+/// The host should call it once at startup (before building the runtime); the
+/// connector also calls it from `run()` as belt-and-braces, but that call can
+/// lose the race to another connector's first TLS use, so the startup call is
+/// the real fix. Idempotent via `Once`.
+pub fn ensure_crypto_provider() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
