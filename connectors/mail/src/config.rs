@@ -3,13 +3,19 @@
 //! required literals (this crate is provider-neutral — no vendor defaults), ports
 //! default to the implicit-TLS standards (993/465).
 
+use std::fmt;
+
 use serde_json::Value;
 use toml::Value as Toml;
 
 use crate::error::{MailError, Result};
 
 /// Everything the IMAP/SMTP calls need, secrets already pulled from the env.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written to **redact the passwords** — this struct is exactly
+/// the kind of thing that ends up in a `tracing` line, and a derived `Debug`
+/// would leak the plaintext credentials to the logs.
+#[derive(Clone)]
 pub struct MailConfig {
     pub imap_host: String,
     pub imap_port: u16,
@@ -21,6 +27,23 @@ pub struct MailConfig {
     pub smtp_user: String,
     pub smtp_pass: String,
     pub from: String,
+}
+
+impl fmt::Debug for MailConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MailConfig")
+            .field("imap_host", &self.imap_host)
+            .field("imap_port", &self.imap_port)
+            .field("imap_user", &self.imap_user)
+            .field("imap_pass", &"***")
+            .field("mailbox", &self.mailbox)
+            .field("smtp_host", &self.smtp_host)
+            .field("smtp_port", &self.smtp_port)
+            .field("smtp_user", &self.smtp_user)
+            .field("smtp_pass", &"***")
+            .field("from", &self.from)
+            .finish()
+    }
 }
 
 impl MailConfig {
