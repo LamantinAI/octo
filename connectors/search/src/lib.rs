@@ -62,7 +62,7 @@ const SEARCH: &str = "search.web";
 const CATALOG: &str = "Web search — find pages/URLs for a question. Dispatch a command \
 envelope to this connector's id:
 - search.web { query, limit? } -> { query, count, results: [{ title, url, snippet }] }
-`limit` is optional (default 5, capped). Use it to discover sources, then read the \
+`limit` is optional (default 10, capped). Use it to discover sources, then read the \
 promising URLs. Returns a clean hit list, not raw HTML.";
 
 /// One search result.
@@ -216,8 +216,8 @@ impl ConnectorFactory for SearchConnectorFactory {
         let timeout = Duration::from_secs(
             table.get("timeout_secs").and_then(|v| v.as_integer()).unwrap_or(15).max(1) as u64,
         );
-        let default_limit = table.get("default_limit").and_then(|v| v.as_integer()).unwrap_or(5).max(1) as usize;
-        let max_limit = table.get("max_limit").and_then(|v| v.as_integer()).unwrap_or(10).max(1) as usize;
+        let default_limit = table.get("default_limit").and_then(|v| v.as_integer()).unwrap_or(10).max(1) as usize;
+        let max_limit = table.get("max_limit").and_then(|v| v.as_integer()).unwrap_or(25).max(1) as usize;
         let backend: Arc<dyn SearchBackend> = match backend_kind {
             "ddg" => {
                 // DDG's `kl` locale (region-language), e.g. "ru-ru" / "us-en"; optional.
