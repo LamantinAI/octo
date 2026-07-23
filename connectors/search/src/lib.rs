@@ -6,8 +6,15 @@
 //! Search API later — so the command surface is stable while the source changes.
 //!
 //! Command:
-//! - `search.web { query, limit? }` → `{ query, count, results: [{ title, url,
-//!   snippet }] }` (limit clamped to `[1, max_limit]`, default `default_limit`).
+//! - `search.web { query, limit?, engine? }` → `{ engine, query, count, results:
+//!   [{ title, url, snippet }] }` (limit clamped to `[1, max_limit]`, default
+//!   `default_limit`).
+//!
+//! **Choosing the search system happens at both levels.** The manifest declares
+//! which engines exist (`[connector.engines.<name>]`, each with its own settings)
+//! and which is `default_engine`; a caller then overrides per call with `engine`.
+//! One connector instance can therefore front several systems — DuckDuckGo today,
+//! Yandex next — and the model picks per query without any config change.
 //!
 //! It returns a clean hit list — never raw HTML — so the model spends context on
 //! results, not markup. Fetching a page's content is a separate organ.
@@ -44,6 +51,7 @@
 
 mod ddg;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -59,11 +67,21 @@ pub use ddg::DdgBackend;
 
 const SEARCH: &str = "search.web";
 
-const CATALOG: &str = "Web search — find pages/URLs for a question. Dispatch a command \
-envelope to this connector's id:
-- search.web { query, limit? } -> { query, count, results: [{ title, url, snippet }] }
-`limit` is optional (default 10, capped). Use it to discover sources, then read the \
-promising URLs. Returns a clean hit list, not raw HTML.";
+/// The catalog the model reads. Built per instance so it names the engines this
+/// deployment actually has (and which one answers when `engine` is omitted).
+fn catalog(engines: &BTreeMap<String, Arc<dyn SearchBackend>>, default_engine: &str, default_limit: usize, max_limit: usize) -> String {
+    let names: Vec<&str> = engines.keys().map(String::as_str).collect();
+    format!(
+        "Web search — find pages/URLs for a question. Dispatch a command envelope to this \
+         connector's id:\n\
+         - search.web {{ query, limit?, engine? }} -> {{ engine, query, count, results: \
+         [{{ title, url, snippet }}] }}\n\
+         `limit` is optional (default {default_limit}, max {max_limit}). `engine` picks the \
+         search system — available: {}; omit it to use {default_engine}. Use this to discover \
+         sources, then read the promising URLs. Returns a clean hit list, not raw HTML.",
+        names.join(", ")
+    )
+}
 
 /// One search result.
 #[derive(Debug, Clone, Serialize)]
@@ -83,33 +101,47 @@ pub trait SearchBackend: Send + Sync {
     async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, String>;
 }
 
-/// The search organ: routes `search.web` to a [`SearchBackend`].
+/// The search organ: routes `search.web` to one of its [`SearchBackend`]s.
 pub struct SearchConnector {
     id: ConnectorId,
     capabilities: ConnectorCapabilities,
-    backend: Arc<dyn SearchBackend>,
+    /// Every engine this instance fronts, keyed by the name callers pass as `engine`.
+    engines: BTreeMap<String, Arc<dyn SearchBackend>>,
+    /// Which engine answers when the caller omits `engine`.
+    default_engine: String,
     default_limit: usize,
     max_limit: usize,
 }
 
 impl SearchConnector {
+    /// `engines` must be non-empty and contain `default_engine`; the factory checks
+    /// both, so a misconfigured manifest fails at startup rather than at query time.
     pub fn new(
         id: impl Into<String>,
-        backend: Arc<dyn SearchBackend>,
+        engines: BTreeMap<String, Arc<dyn SearchBackend>>,
+        default_engine: impl Into<String>,
         default_limit: usize,
         max_limit: usize,
     ) -> Arc<Self> {
         let max_limit = max_limit.max(1);
+        let default_limit = default_limit.clamp(1, max_limit);
+        let default_engine = default_engine.into();
         let capabilities = ConnectorCapabilities::bidirectional()
             .with_accept_kinds([EventKind::from_static(SEARCH)])
-            .with_description(CATALOG);
+            .with_description(catalog(&engines, &default_engine, default_limit, max_limit));
         Arc::new(Self {
             id: ConnectorId::new(id),
             capabilities,
-            backend,
-            default_limit: default_limit.clamp(1, max_limit),
+            engines,
+            default_engine,
+            default_limit,
             max_limit,
         })
+    }
+
+    /// Engine names this instance can serve, for logs and error messages.
+    fn engine_names(&self) -> String {
+        self.engines.keys().cloned().collect::<Vec<_>>().join(", ")
     }
 }
 
@@ -131,7 +163,8 @@ impl Connector for SearchConnector {
         // here as an unexpected version, instead of as a puzzling 202 later.
         tracing::info!(
             connector = %self.id,
-            backend = self.backend.name(),
+            engines = %self.engine_names(),
+            default_engine = %self.default_engine,
             libcurl = %ddg::libcurl_version(),
             "search ready"
         );
@@ -152,6 +185,9 @@ struct SearchArgs {
     query: String,
     #[serde(default)]
     limit: Option<usize>,
+    /// Which search system to use; omitted → the manifest's `default_engine`.
+    #[serde(default)]
+    engine: Option<String>,
 }
 
 impl SearchConnector {
@@ -176,9 +212,13 @@ impl SearchConnector {
             return Err("`query` is required".into());
         }
         let limit = args.limit.unwrap_or(self.default_limit).clamp(1, self.max_limit);
-        let hits = self.backend.search(query, limit).await?;
-        tracing::info!(query, backend = self.backend.name(), count = hits.len(), "search done");
-        Ok(json!({ "query": query, "count": hits.len(), "results": hits }))
+        let engine = args.engine.as_deref().unwrap_or(&self.default_engine);
+        let backend = self.engines.get(engine).ok_or_else(|| {
+            format!("unknown engine `{engine}`; available: {}", self.engine_names())
+        })?;
+        let hits = backend.search(query, limit).await?;
+        tracing::info!(query, engine, count = hits.len(), "search done");
+        Ok(json!({ "engine": engine, "query": query, "count": hits.len(), "results": hits }))
     }
 }
 
@@ -212,25 +252,146 @@ impl ConnectorFactory for SearchConnectorFactory {
         let table = config
             .get("connector")
             .ok_or("search: manifest has no [connector] table")?;
-        let backend_kind = table.get("backend").and_then(|v| v.as_str()).unwrap_or("ddg");
         let timeout = Duration::from_secs(
             table.get("timeout_secs").and_then(|v| v.as_integer()).unwrap_or(15).max(1) as u64,
         );
         let default_limit = table.get("default_limit").and_then(|v| v.as_integer()).unwrap_or(10).max(1) as usize;
         let max_limit = table.get("max_limit").and_then(|v| v.as_integer()).unwrap_or(25).max(1) as usize;
-        let backend: Arc<dyn SearchBackend> = match backend_kind {
-            "ddg" => {
-                // DDG's `kl` locale (region-language), e.g. "ru-ru" / "us-en"; optional.
-                let region = table.get("region").and_then(|v| v.as_str()).map(str::to_string);
-                Arc::new(DdgBackend::new(timeout, region)?)
+
+        // Preferred form: one `[connector.engines.<name>]` table per search system,
+        // each carrying its own settings. `enabled = false` keeps an engine declared
+        // but out of service.
+        let mut engines: BTreeMap<String, Arc<dyn SearchBackend>> = BTreeMap::new();
+        match table.get("engines").and_then(|v| v.as_table()) {
+            Some(declared) => {
+                for (name, cfg) in declared {
+                    if cfg.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
+                        continue;
+                    }
+                    engines.insert(name.clone(), build_engine(name, cfg, timeout)?);
+                }
             }
-            other => return Err(format!("search: unknown backend `{other}` (have: ddg)").into()),
+            // Shorthand for a single-engine deployment: `backend = "ddg"` with its
+            // settings inline on [connector].
+            None => {
+                let name = table.get("backend").and_then(|v| v.as_str()).unwrap_or("ddg");
+                engines.insert(name.to_string(), build_engine(name, table, timeout)?);
+            }
+        }
+        if engines.is_empty() {
+            return Err("search: no engines enabled — declare at least one".into());
+        }
+
+        // Default engine: explicit, else the only/first one declared.
+        let default_engine = match table.get("default_engine").and_then(|v| v.as_str()) {
+            Some(name) => name.to_string(),
+            None => engines.keys().next().cloned().expect("non-empty checked above"),
         };
-        Ok(SearchConnector::new(id.as_str(), backend, default_limit, max_limit))
+        if !engines.contains_key(&default_engine) {
+            return Err(format!(
+                "search: default_engine `{default_engine}` is not among the enabled engines ({})",
+                engines.keys().cloned().collect::<Vec<_>>().join(", ")
+            )
+            .into());
+        }
+        Ok(SearchConnector::new(id.as_str(), engines, default_engine, default_limit, max_limit))
+    }
+}
+
+/// Build one engine from its config slice. Add a `match` arm per search system —
+/// this is the single place a new backend gets wired in.
+fn build_engine(
+    name: &str,
+    cfg: &toml::Value,
+    timeout: Duration,
+) -> Result<Arc<dyn SearchBackend>, Box<dyn std::error::Error + Send + Sync>> {
+    match name {
+        "ddg" => {
+            // DDG's `kl` locale (region-language), e.g. "ru-ru" / "us-en"; optional.
+            let region = cfg.get("region").and_then(|v| v.as_str()).map(str::to_string);
+            Ok(Arc::new(DdgBackend::new(timeout, region)?))
+        }
+        other => Err(format!(
+            "search: unknown engine `{other}` (have: ddg; yandex planned)"
+        )
+        .into()),
     }
 }
 
 /// Convenience factory handle for registration.
 pub fn factory() -> Arc<dyn ConnectorFactory> {
     Arc::new(SearchConnectorFactory::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A backend that answers with its own name, so a test can see which one ran.
+    struct StubBackend(&'static str);
+
+    #[async_trait]
+    impl SearchBackend for StubBackend {
+        fn name(&self) -> &str {
+            self.0
+        }
+        async fn search(&self, query: &str, _limit: usize) -> Result<Vec<SearchHit>, String> {
+            Ok(vec![SearchHit {
+                title: format!("{} answered {query}", self.0),
+                url: "https://example.com/".into(),
+                snippet: String::new(),
+            }])
+        }
+    }
+
+    fn connector(default_engine: &str) -> Arc<SearchConnector> {
+        let mut engines: BTreeMap<String, Arc<dyn SearchBackend>> = BTreeMap::new();
+        engines.insert("ddg".into(), Arc::new(StubBackend("ddg")));
+        engines.insert("yandex".into(), Arc::new(StubBackend("yandex")));
+        SearchConnector::new("search", engines, default_engine, 10, 25)
+    }
+
+    #[tokio::test]
+    async fn omitting_engine_uses_the_default() {
+        let out = connector("ddg").run_search(json!({ "query": "x" })).await.unwrap();
+        assert_eq!(out["engine"], "ddg");
+    }
+
+    #[tokio::test]
+    async fn an_explicit_engine_wins_over_the_default() {
+        let out = connector("ddg")
+            .run_search(json!({ "query": "x", "engine": "yandex" }))
+            .await
+            .unwrap();
+        assert_eq!(out["engine"], "yandex");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_engine_names_the_available_ones() {
+        let err = connector("ddg")
+            .run_search(json!({ "query": "x", "engine": "bing" }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("unknown engine `bing`"), "{err}");
+        assert!(err.contains("ddg") && err.contains("yandex"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn limit_is_clamped_to_max() {
+        // max_limit is 25 here; asking for more must not error, just clamp.
+        let out = connector("ddg")
+            .run_search(json!({ "query": "x", "limit": 500 }))
+            .await
+            .unwrap();
+        assert_eq!(out["count"], 1);
+    }
+
+    #[test]
+    fn the_catalog_names_engines_and_the_default() {
+        let mut engines: BTreeMap<String, Arc<dyn SearchBackend>> = BTreeMap::new();
+        engines.insert("ddg".into(), Arc::new(StubBackend("ddg")));
+        let text = catalog(&engines, "ddg", 10, 25);
+        assert!(text.contains("available: ddg"), "{text}");
+        assert!(text.contains("omit it to use ddg"), "{text}");
+    }
 }
