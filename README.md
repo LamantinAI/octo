@@ -51,7 +51,15 @@ connector and the agent gains a skill, with **zero cognition change**. That's
 
 Because the contract is generic, most connectors are **one crate → many
 instances**: the same code becomes many skills via config (many calendars, many
-mailboxes, many HTTP APIs, a swappable storage backend).
+mailboxes, a swappable storage backend). And for HTTP APIs there's often **no
+code at all** — the generic `http` connector builds a whole multi-route API from
+a manifest (see [Configurable connectors](#configurable-connectors--a-whole-api-from-a-manifest)).
+
+So there are **two ways to add a capability**:
+- **A native connector** — a Rust crate (caldav / mail / storage / telegram …)
+  when the integration needs real logic, a protocol client, or side effects.
+- **A configurable connector** — just a manifest, no code, when the integration
+  is "call this REST API" (the `http` connector).
 
 ### The dispatch contract (the API)
 
@@ -107,11 +115,46 @@ password_env = "OCTO_WORK_APP_PASSWORD"  # secrets are named env vars, never lit
 Two work + personal calendars, or three mailboxes, are just N manifest files with
 distinct `id`s — the model sees N distinct tools.
 
+### Configurable connectors — a whole API from a manifest
+
+Some capabilities need **no Rust at all**. The **`http` connector** is generic:
+one crate that turns a declarative `type = "http"` manifest into an env-as-tools
+organ. Each `[[connector.endpoint]]` maps a command kind → one HTTP call → a
+correlated response kind, with path/query params pulled from the payload by a
+JSONPath subset, plus optional JSON-schema models, header auth, timeout and
+retry. It's the sweet spot between OpenClaw-style skills and MCP servers:
+**integrate a REST API by writing config, not code.**
+
+```toml
+[connector]
+id       = "petstore"
+type     = "http"
+base_url = "https://petstore.example.com"
+
+[[connector.endpoint]]
+cmd_kind     = "petstore.cmd.find_pets_by_status"  # the command the model dispatches
+method       = "GET"
+path         = "/pet/findByStatus"
+query_params = { status = "$.status" }             # pulled from the command payload
+response_kind = "petstore.event.pets_found"        # the correlated result
+
+[[connector.endpoint]]
+cmd_kind      = "petstore.cmd.delete_pet"
+method        = "DELETE"
+path          = "/pet/{petId}"
+path_params   = { petId = "$.id" }                 # {petId} filled from the payload
+response_kind = "petstore.event.pet_deleted"
+```
+
+Register the `http` factory once and every such manifest becomes a full
+multi-route API the agent can call — so a new integration is often a manifest,
+not a crate. `connectors/petstore` is a worked example.
+
 ### Shipped connectors
 
 | id / type | what it is | key commands |
 |-----------|------------|--------------|
-| `http`      | dynamic HTTP client (one crate, many APIs) | per-manifest, from a spec |
+| `http`      | **configurable** — a whole REST API from a manifest, no code (many APIs) | endpoints declared per-manifest |
 | `caldav`    | CalDAV calendars (many calendars) | `calendar.list_events` / `create_event` / `delete_event` |
 | `mail`      | IMAP read + SMTP send (one mailbox) | `mail.cmd.list` / `read` / `send` / `reply` |
 | `storage`   | durable object store (local now, S3-ready) | `storage.put` / `get` / `list` / `delete` / `promote` / `checkout` |
@@ -132,8 +175,10 @@ A connector is two traits:
   names).
 
 `connectors/caldav`, `connectors/mail` and `connectors/storage` are compact,
-idiomatic templates — copy their shape. A new capability is a new crate; the agent
-picks it up the moment its factory is registered and a manifest exists.
+idiomatic templates — copy their shape. A native capability is a new crate; the
+agent picks it up the moment its factory is registered and a manifest exists. (For
+a plain REST API, don't write a crate — use the configurable `http` connector
+above.)
 
 ## Features
 
