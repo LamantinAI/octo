@@ -23,6 +23,13 @@
 //! Chrome-for-Testing on first fetch into `data_dir` (NOT the default `~/.cache`, which
 //! systemd `ProtectHome` blocks). Chrome's profile lives under `data_dir` too. Set
 //! `executable` to point at a pre-provisioned Chrome instead.
+//!
+//! **The host process needs a writable `HOME`.** zendriver launches Chrome inheriting
+//! this process's environment, and Chrome (its crashpad handler, NSS cert store, …)
+//! writes under `$HOME` regardless of `--user-data-dir`. A service whose `HOME` is
+//! missing or unreadable (e.g. a `--no-create-home` system user, or one blocked by
+//! systemd `ProtectHome`) makes Chrome crash on startup with `SIGTRAP`. Point the
+//! service's `HOME` at a writable dir (the deploy sets `Environment=HOME=…`).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -177,7 +184,14 @@ impl BrowserConnector {
         let out = self.run_fetch(params).await;
         let url = out.get("url").and_then(|v| v.as_str()).unwrap_or("");
         let status = out.get("status").and_then(|v| v.as_str()).unwrap_or("");
-        tracing::info!(url, status, "browser fetch done");
+        if status == "ok" {
+            tracing::info!(url, status, "browser fetch done");
+        } else {
+            // Surface WHY: a failed launch/navigate would otherwise be invisible here
+            // (the reason only rides in the result payload back to the model).
+            let error = out.get("error").and_then(|v| v.as_str()).unwrap_or("");
+            tracing::warn!(url, status, error, "browser fetch failed");
+        }
         let resp = Envelope::new(self.id.clone(), EventKind::new(format!("{FETCH}.result")), out)
             .with_correlation(env.id);
         if let Err(e) = ctx.publish(resp).await {
