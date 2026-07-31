@@ -78,6 +78,11 @@ pub struct ForkdConnector {
     max_timeout: Duration,
     max_output: usize,
     limits: Limits,
+    /// Names of environment variables to forward from forkd's own process into the
+    /// otherwise-cleared script env (manifest `env_passthrough`). A deploy uses it to
+    /// hand scripts a path they need — e.g. `CODEX_HOME` so a skill can drive the Codex
+    /// CLI on the host's login. Only these names pass; everything else stays cleared.
+    env_passthrough: Vec<String>,
     seq: AtomicU64,
 }
 
@@ -91,6 +96,7 @@ impl ForkdConnector {
         max_timeout: Duration,
         max_output: usize,
         limits: Limits,
+        env_passthrough: Vec<String>,
     ) -> Arc<Self> {
         let capabilities = ConnectorCapabilities::bidirectional()
             .with_accept_kinds([EventKind::from_static(RUN)])
@@ -105,6 +111,7 @@ impl ForkdConnector {
             max_timeout,
             max_output,
             limits,
+            env_passthrough,
             seq: AtomicU64::new(0),
         })
     }
@@ -221,6 +228,14 @@ impl ForkdConnector {
             .env("TMPDIR", &workspace)
             .env("LANG", "C.UTF-8")
             .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+            ;
+        // Forward the manifest's allowlisted env vars (by name) from our own process.
+        for name in &self.env_passthrough {
+            if let Some(val) = std::env::var_os(name) {
+                cmd.env(name, val);
+            }
+        }
+        cmd
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
@@ -408,6 +423,13 @@ impl ConnectorFactory for ForkdConnectorFactory {
             .and_then(|v| v.as_str())
             .map(|s| ctx.base_dir.join(s));
 
+        // Env vars to forward from our process into the cleared script env, by name.
+        let env_passthrough: Vec<String> = table
+            .get("env_passthrough")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+
         Ok(ForkdConnector::build(
             id.as_str(),
             workspace,
@@ -417,6 +439,7 @@ impl ConnectorFactory for ForkdConnectorFactory {
             max_timeout,
             max_output,
             limits,
+            env_passthrough,
         ))
     }
 }
@@ -492,7 +515,40 @@ mod tests {
             Duration::from_secs(10),
             8192,
             Limits { cpu_secs: 5, fsize_bytes: 0, mem_bytes: 0 },
+            Vec::new(),
         )
+    }
+
+    #[tokio::test]
+    async fn env_passthrough_forwards_only_allowlisted_names() {
+        let ws = std::env::temp_dir().join("forkd-test-env-ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        // SAFETY: unique var names, set before this test spawns the child.
+        unsafe {
+            std::env::set_var("FORKD_PASS_ME", "kept");
+            std::env::set_var("FORKD_DROP_ME", "gone");
+        }
+        let conn = ForkdConnector::build(
+            "forkd",
+            Some(ws.clone()),
+            None,
+            None,
+            Duration::from_secs(5),
+            Duration::from_secs(10),
+            8192,
+            Limits { cpu_secs: 5, fsize_bytes: 0, mem_bytes: 0 },
+            vec!["FORKD_PASS_ME".to_string()],
+        );
+        let out = conn
+            .run_script(&json!({
+                "script": "echo \"pass=[${FORKD_PASS_ME:-}] drop=[${FORKD_DROP_ME:-}]\"",
+                "interpreter": "bash",
+            }))
+            .await
+            .unwrap();
+        let stdout = out["stdout"].as_str().unwrap_or("");
+        assert!(stdout.contains("pass=[kept]"), "allowlisted var should pass: {stdout}");
+        assert!(stdout.contains("drop=[]"), "non-allowlisted var must stay cleared: {stdout}");
     }
 
     #[tokio::test]
