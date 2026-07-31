@@ -1,0 +1,22 @@
+[package]
+name = "octo-connector-browser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Headless-browser connector for the Octo runtime: a stealth web-fetch organ (browser.fetch) that renders JS-heavy / anti-bot pages via a real Chrome driven over CDP (zendriver). Returns clean {url, title, text} — the parser half of the web organ, paired with the search connector."
+
+[dependencies]
+octo-core = { path = "../../octo-core" }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+toml = { workspace = true }
+# zendriver — Rust-native stealth browser over CDP (drives real Chrome). `fetcher`
+# auto-provisions a pinned Chrome-for-Testing so no system chromium is required.
+zendriver = { version = "0.4", features = ["fetcher"] }
