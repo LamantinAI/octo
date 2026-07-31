@@ -65,7 +65,8 @@ const ALLOW_CHAT: &str = "octo.telegram.allow_chat";
 const REMOVE_CHAT: &str = "octo.telegram.remove_chat";
 const LIST_CHATS: &str = "octo.telegram.list_chats";
 
-/// Outbound command: send a file from the shared workspace as a document.
+/// Outbound command: send a file from the shared workspace. Images go as a photo
+/// (inline preview), everything else as a document; an optional `caption` rides along.
 /// Payload `{ path, chat?, filename? }` — chat falls back to the envelope channel.
 const SEND_FILE: &str = "chat.send_file";
 
@@ -454,7 +455,8 @@ impl TelegramConnector {
 }
 
 /// Handle `chat.send_file`: load a file from the shared workspace by its path and
-/// send it as a Telegram document. Chat id comes from the payload `chat`, else
+/// send it — a photo for images, a document otherwise, with an optional `caption`.
+/// Chat id comes from the payload `chat`, else
 /// the envelope's channel. Bytes never pass through the model — the payload only
 /// names a path.
 async fn send_workspace_file(bot: &Bot, workspace: &Option<PathBuf>, env: &Envelope) {
@@ -486,10 +488,30 @@ async fn send_workspace_file(bot: &Bot, workspace: &Option<PathBuf>, env: &Envel
         }
     };
     let filename = params.get("filename").and_then(Value::as_str).map(str::to_string).unwrap_or(name);
+    let caption = params.get("caption").and_then(Value::as_str).map(str::to_string);
+    // An image goes as a photo (inline preview) rather than a document. Judge by
+    // extension — the workspace filename is ours, not a remote-controlled string.
+    let is_image = {
+        let lower = filename.to_ascii_lowercase();
+        [".png", ".jpg", ".jpeg", ".webp", ".gif"].iter().any(|ext| lower.ends_with(ext))
+    };
     let file = InputFile::memory(bytes).file_name(filename);
-    match bot.send_document(ChatId(chat), file).await {
-        Ok(_) => tracing::info!(chat, %path, "sent file"),
-        Err(e) => tracing::warn!(error = %e, "telegram send_document failed"),
+    let sent = if is_image {
+        let mut req = bot.send_photo(ChatId(chat), file);
+        if let Some(c) = caption {
+            req = req.caption(c);
+        }
+        req.await.map(|_| ())
+    } else {
+        let mut req = bot.send_document(ChatId(chat), file);
+        if let Some(c) = caption {
+            req = req.caption(c);
+        }
+        req.await.map(|_| ())
+    };
+    match sent {
+        Ok(_) => tracing::info!(chat, %path, image = is_image, "sent file"),
+        Err(e) => tracing::warn!(error = %e, "telegram send_file failed"),
     }
 }
 
