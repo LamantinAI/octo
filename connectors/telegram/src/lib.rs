@@ -6,7 +6,9 @@
 //! text messages become `chat.message` (with `reply_to = chat_id`); `chat.reply`
 //! envelopes targeted at us are sent back to their `channel`'s chat (a `Blob`
 //! payload → photo/document, a `String` → text). Inbound photos and image
-//! documents are downloaded into `Blob` payloads for a vision cogitator. While
+//! documents are downloaded into `Blob` payloads for a vision cogitator, and
+//! voice notes / audio files likewise for a hearing one (with a `duration_secs`
+//! tag; audio sent as a plain document keeps the workspace-path route). While
 //! a turn is running, `chat.typing` keeps the "typing…" indicator alive and
 //! `chat.status` streams a live tool-use trace (see [`live`]).
 //!
@@ -365,6 +367,34 @@ impl Connector for TelegramConnector {
                                     }
                                     Err(e) => tracing::warn!(error = %e, "telegram document download failed"),
                                 }
+                            } else if let Some(audio) = voice_media(&msg) {
+                                // A voice note or an audio file → downloaded into a
+                                // Blob so a hearing cogitator can transcribe it,
+                                // the same way a photo reaches a vision one. Audio
+                                // sent as a plain *document* deliberately keeps the
+                                // workspace route below: long recordings belong to
+                                // a tool, not to the turn itself. Emitted immediately
+                                // (Telegram never groups voice into an album).
+                                match download_bytes(&bot, audio.file_id).await {
+                                    Ok(bytes) => {
+                                        tracing::info!(
+                                            %chat, bytes = bytes.len(), secs = audio.duration_secs,
+                                            "recv: voice"
+                                        );
+                                        let blob = Blob::new(bytes, audio.mime)
+                                            .with_filename(audio.filename);
+                                        publish_flush(&self.id, &ctx, Flush {
+                                            chat: chat.clone(),
+                                            trust,
+                                            emit: Emit::Audio {
+                                                blob,
+                                                caption: msg.caption().map(str::to_string),
+                                                duration_secs: Some(audio.duration_secs),
+                                            },
+                                        }).await;
+                                    }
+                                    Err(e) => tracing::warn!(error = %e, "telegram voice download failed"),
+                                }
                             } else if let Some(doc) = msg.document() {
                                 // Any other file → saved into the shared workspace;
                                 // the cogitator is handed its path (bytes by
@@ -488,6 +518,15 @@ async fn publish_flush(id: &ConnectorId, ctx: &ConnectorContext, flush: Flush) {
         Emit::Image { blob, caption } => {
             chat_envelope(id, &chat, blob, caption.as_deref(), trust)
         }
+        Emit::Audio { blob, caption, duration_secs } => {
+            let env = chat_envelope(id, &chat, blob, caption.as_deref(), trust);
+            // Length is metadata, not content: it lets a cogitator decide whether
+            // to transcribe inline before it downloads a word of the transcript.
+            match duration_secs {
+                Some(secs) => env.with_tag("duration_secs", secs.to_string()),
+                None => env,
+            }
+        }
         Emit::Multipart(msg) => chat_envelope(id, &chat, msg, None, trust),
     };
     if let Err(e) = ctx.publish(env).await {
@@ -519,6 +558,42 @@ fn chat_envelope<P: std::any::Any + Send + Sync>(
         );
     }
     env
+}
+
+/// An inbound voice note or audio file: what's needed to fetch it and label the
+/// resulting [`Blob`].
+struct VoiceMedia<'a> {
+    file_id: &'a teloxide::types::FileId,
+    /// MIME as declared by the sender, defaulted per kind when absent.
+    mime: String,
+    filename: String,
+    duration_secs: u32,
+}
+
+/// Inbound audio: a voice note (`voice`) or an audio file sent as music (`audio`).
+/// A voice note is OGG/Opus and its MIME is often missing, hence the defaults.
+fn voice_media(msg: &teloxide::types::Message) -> Option<VoiceMedia<'_>> {
+    if let Some(voice) = msg.voice() {
+        return Some(VoiceMedia {
+            file_id: &voice.file.id,
+            mime: voice
+                .mime_type
+                .as_ref()
+                .map_or_else(|| "audio/ogg".to_string(), |m| m.essence_str().to_string()),
+            filename: "voice.ogg".to_string(),
+            duration_secs: voice.duration.seconds(),
+        });
+    }
+    let audio = msg.audio()?;
+    Some(VoiceMedia {
+        file_id: &audio.file.id,
+        mime: audio
+            .mime_type
+            .as_ref()
+            .map_or_else(|| "audio/mpeg".to_string(), |m| m.essence_str().to_string()),
+        filename: audio.file_name.clone().unwrap_or_else(|| "audio".to_string()),
+        duration_secs: audio.duration.seconds(),
+    })
 }
 
 /// A document attachment that is actually an image (`image/*` MIME), with its
@@ -702,6 +777,52 @@ pub fn factory() -> Arc<dyn ConnectorFactory> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Telegram `Message` from its wire JSON, so the media classifiers can be
+    /// tested against what the API actually sends.
+    fn message(media: &str) -> teloxide::types::Message {
+        let json = format!(
+            r#"{{"message_id":1,"date":1700000000,
+                 "chat":{{"id":42,"type":"private","first_name":"T"}},
+                 "from":{{"id":42,"is_bot":false,"first_name":"T"}},{media}}}"#
+        );
+        serde_json::from_str(&json).expect("valid Telegram message JSON")
+    }
+
+    #[test]
+    fn voice_note_is_recognized_with_its_duration() {
+        // A voice note carries no file_name, and its MIME may be null — both defaulted.
+        let msg = message(
+            r#""voice":{"file_id":"AwACF","file_unique_id":"u1","file_size":4242,
+                        "duration":7,"mime_type":null}"#,
+        );
+        let media = voice_media(&msg).expect("a voice note is inbound audio");
+        assert_eq!(media.file_id.0, "AwACF");
+        assert_eq!(media.mime, "audio/ogg");
+        assert_eq!(media.filename, "voice.ogg");
+        assert_eq!(media.duration_secs, 7);
+    }
+
+    #[test]
+    fn audio_file_keeps_its_own_mime_and_name() {
+        let msg = message(
+            r#""audio":{"file_id":"CQACG","file_unique_id":"u2","file_size":99,"duration":183,
+                       "file_name":"lecture.m4a","mime_type":"audio/mp4"}"#,
+        );
+        let media = voice_media(&msg).expect("an audio file is inbound audio");
+        assert_eq!(media.mime, "audio/mp4");
+        assert_eq!(media.filename, "lecture.m4a");
+        assert_eq!(media.duration_secs, 183);
+    }
+
+    #[test]
+    fn text_and_photo_are_not_audio() {
+        assert!(voice_media(&message(r#""text":"привет""#)).is_none());
+        let photo = message(
+            r#""photo":[{"file_id":"P","file_unique_id":"u3","file_size":1,"width":1,"height":1}]"#,
+        );
+        assert!(voice_media(&photo).is_none());
+    }
 
     #[test]
     fn factory_builds_connector_from_manifest() {
