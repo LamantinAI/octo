@@ -60,6 +60,13 @@ impl Blob {
         self.content_type.starts_with("image/")
     }
 
+    /// `true` if the content type is audio (`audio/*`) — a voice message or a
+    /// sound file, which a cogitator perceives by transcribing rather than by
+    /// feeding it to the model directly.
+    pub fn is_audio(&self) -> bool {
+        self.content_type.starts_with("audio/")
+    }
+
     pub fn len(&self) -> usize {
         self.bytes.len()
     }
@@ -83,6 +90,15 @@ mod tests {
 
         let doc = Blob::new(Bytes::from_static(b"hi"), "application/pdf");
         assert!(!doc.is_image());
+        assert!(!doc.is_audio());
         assert_eq!(doc.filename(), None);
+    }
+
+    #[test]
+    fn audio_is_distinguished_from_image() {
+        let voice = Blob::new(vec![0u8; 4], "audio/ogg").with_filename("voice.ogg");
+        assert!(voice.is_audio());
+        assert!(!voice.is_image());
+        assert!(!Blob::new(vec![1u8], "image/jpeg").is_audio());
     }
 }
