@@ -44,6 +44,10 @@ pub(crate) enum Emit {
     Text { text: String, caption: Option<String> },
     /// A lone image.
     Image { blob: Blob, caption: Option<String> },
+    /// A voice message or audio file. Never coalesced (Telegram doesn't group
+    /// these), so it has no `Part` counterpart. `duration_secs` rides along as a
+    /// tag so a cogitator can judge the cost of transcribing before it starts.
+    Audio { blob: Blob, caption: Option<String>, duration_secs: Option<u32> },
     /// A coalesced burst mixing text and/or multiple images.
     Multipart(InboundMessage),
 }
