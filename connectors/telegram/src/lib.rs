@@ -328,9 +328,20 @@ impl Connector for TelegramConnector {
                                 match download_bytes(&bot, &photo.file.id).await {
                                     Ok(bytes) => {
                                         tracing::info!(%chat, bytes = bytes.len(), "recv: photo");
+                                        // Also persist a copy to the workspace inbox: the
+                                        // Blob is ephemeral (it lives only for the turn), so
+                                        // without this the image can't be saved, forwarded,
+                                        // or referenced later. Perception is unaffected if
+                                        // the save fails — the Blob still goes out.
+                                        let saved = self
+                                            .save_incoming(&inbox_name("photo.jpg"), &bytes)
+                                            .map_err(|e| tracing::warn!(error = %e, "failed to save incoming photo"))
+                                            .ok();
                                         let blob = Blob::new(bytes, "image/jpeg")
                                             .with_filename("photo.jpg");
-                                        let caption = msg.caption().map(str::to_string);
+                                        let caption = caption_with_saved(
+                                            msg.caption().map(str::to_string), saved.as_deref(),
+                                        );
                                         if buffer {
                                             batcher.push_image(
                                                 coalesce_key.unwrap(), &chat, blob, caption, trust, now,
@@ -346,24 +357,27 @@ impl Connector for TelegramConnector {
                                     Err(e) => tracing::warn!(error = %e, "telegram photo download failed"),
                                 }
                             } else if let Some((doc, mime)) = image_document(&msg) {
-                                // An image sent "as a file" (uncompressed) — the
-                                // same Blob path as a photo (a vision cogitator
-                                // should SEE it, not get a workspace path),
-                                // keeping its real MIME type. Emitted immediately.
+                                // An image sent "as a file" (uncompressed): perceived as
+                                // a photo (the vision Blob, keeping its real MIME) AND
+                                // saved to the workspace inbox so it persists — same as a
+                                // compressed photo above. Emitted immediately.
                                 match download_bytes(&bot, &doc.file.id).await {
                                     Ok(bytes) => {
                                         tracing::info!(%chat, bytes = bytes.len(), %mime, "recv: image document");
-                                        let mut blob = Blob::new(bytes, mime);
-                                        if let Some(name) = &doc.file_name {
-                                            blob = blob.with_filename(name.clone());
-                                        }
+                                        let fname =
+                                            doc.file_name.clone().unwrap_or_else(|| "image".into());
+                                        let saved = self
+                                            .save_incoming(&inbox_name(&fname), &bytes)
+                                            .map_err(|e| tracing::warn!(error = %e, "failed to save incoming image document"))
+                                            .ok();
+                                        let blob = Blob::new(bytes, mime).with_filename(fname);
+                                        let caption = caption_with_saved(
+                                            msg.caption().map(str::to_string), saved.as_deref(),
+                                        );
                                         publish_flush(&self.id, &ctx, Flush {
                                             chat: chat.clone(),
                                             trust,
-                                            emit: Emit::Image {
-                                                blob,
-                                                caption: msg.caption().map(str::to_string),
-                                            },
+                                            emit: Emit::Image { blob, caption },
                                         }).await;
                                     }
                                     Err(e) => tracing::warn!(error = %e, "telegram document download failed"),
@@ -382,6 +396,14 @@ impl Connector for TelegramConnector {
                                             %chat, bytes = bytes.len(), secs = audio.duration_secs,
                                             "recv: voice"
                                         );
+                                        // Persist the raw audio to the workspace inbox too:
+                                        // transcription is perception, but the file itself
+                                        // should survive so it can be kept, forwarded, or
+                                        // moved to storage. Save failure doesn't stop the
+                                        // transcription turn.
+                                        let _ = self
+                                            .save_incoming(&inbox_name(&audio.filename), &bytes)
+                                            .map_err(|e| tracing::warn!(error = %e, "failed to save incoming voice"));
                                         let blob = Blob::new(bytes, audio.mime)
                                             .with_filename(audio.filename);
                                         publish_flush(&self.id, &ctx, Flush {
@@ -624,6 +646,34 @@ fn image_document(msg: &teloxide::types::Message) -> Option<(&teloxide::types::D
     let doc = msg.document()?;
     let mime = doc.mime_type.as_ref()?;
     (mime.type_() == "image").then(|| (doc, mime.essence_str().to_string()))
+}
+
+/// A unique inbox filename for an incoming image: `<unix_millis>-<basename>`.
+/// Telegram photos all arrive named `photo.jpg`, so a bare basename would have
+/// each new image clobber the previous one in the inbox.
+fn inbox_name(base: &str) -> String {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let base = std::path::Path::new(base)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("image");
+    format!("{ts}-{base}")
+}
+
+/// Fold the saved workspace path into the image caption, so a cogitator learns
+/// the image also lives on disk (and can be saved / forwarded / referenced) —
+/// mirroring the `saved to workspace path` note a plain document already gets.
+/// With no saved path (the write failed), the caption is passed through untouched.
+fn caption_with_saved(caption: Option<String>, saved: Option<&str>) -> Option<String> {
+    let Some(rel) = saved else { return caption };
+    let note = format!("[image saved to workspace path `{rel}`]");
+    Some(match caption {
+        Some(c) if !c.is_empty() => format!("{c}\n\n{note}"),
+        _ => note,
+    })
 }
 
 /// Resolve a Telegram `file_id` and download its bytes.
@@ -890,5 +940,36 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("not set"), "got: {err}");
+    }
+
+    #[test]
+    fn caption_with_saved_folds_the_path_and_preserves_the_caption() {
+        // No saved path (write failed): the caption passes through untouched.
+        assert_eq!(caption_with_saved(Some("hi".into()), None), Some("hi".into()));
+        assert_eq!(caption_with_saved(None, None), None);
+
+        // A caption present: the saved-path note is appended, not replaced.
+        let both = caption_with_saved(Some("what is this?".into()), Some("inbox/1-photo.jpg")).unwrap();
+        assert!(both.starts_with("what is this?"));
+        assert!(both.contains("inbox/1-photo.jpg"));
+
+        // No caption: the note stands alone (so the file is still discoverable).
+        assert_eq!(
+            caption_with_saved(None, Some("inbox/1-photo.jpg")),
+            Some("[image saved to workspace path `inbox/1-photo.jpg`]".into())
+        );
+    }
+
+    #[test]
+    fn inbox_name_is_basenamed_and_timestamped() {
+        // A crafted path is reduced to its basename (no escaping the inbox).
+        assert!(inbox_name("../../etc/passwd").ends_with("-passwd"));
+        assert!(!inbox_name("../../etc/passwd").contains('/'));
+
+        // The timestamp prefix keeps same-named files (every photo is `photo.jpg`)
+        // from clobbering each other.
+        let a = inbox_name("photo.jpg");
+        assert!(a.ends_with("-photo.jpg"));
+        assert!(a.len() > "-photo.jpg".len());
     }
 }
