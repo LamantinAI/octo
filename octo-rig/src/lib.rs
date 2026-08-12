@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use octo_core::{
-    control::{RESTART_CONNECTOR, RESTART_PROCESS},
+    control::{CANCEL, CANCEL_SCOPE_TAG, RESTART_CONNECTOR, RESTART_PROCESS},
     ChannelId, ConnectorId, Envelope, EventBus, EventKind, InProcessBus,
 };
 use rig::completion::ToolDefinition;
@@ -44,6 +44,11 @@ pub struct OctoDispatchTool {
     source: ConnectorId,
     catalog: String,
     timeout: Duration,
+    /// Cancellation scope stamped onto every dispatched command (the `cancel_scope`
+    /// tag). A connector honouring `octo.control.cancel` registers in-flight work under
+    /// it and aborts on a matching cancel. `None` → commands are not cancellable by
+    /// scope. The host sets it per-turn to that turn's id.
+    scope: Option<String>,
 }
 
 impl OctoDispatchTool {
@@ -53,11 +58,19 @@ impl OctoDispatchTool {
             source,
             catalog: catalog.into(),
             timeout: DEFAULT_TIMEOUT,
+            scope: None,
         }
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Tag every dispatched command with this cancellation scope, so an
+    /// `octo.control.cancel { scope }` can abort the connector work it started.
+    pub fn with_scope(mut self, scope: impl Into<String>) -> Self {
+        self.scope = Some(scope.into());
         self
     }
 }
@@ -102,12 +115,17 @@ impl Tool for OctoDispatchTool {
     }
 
     async fn call(&self, args: DispatchArgs) -> Result<Value, Self::Error> {
-        let cmd = Envelope::new(
+        let mut cmd = Envelope::new(
             self.source.clone(),
             EventKind::new(args.kind.clone()),
             args.payload,
         )
         .with_target(ConnectorId::new(args.target.clone()));
+        // Stamp the turn's cancel scope so a later octo.control.cancel can reach any
+        // long-running connector work this dispatch starts (e.g. a forkd script).
+        if let Some(scope) = &self.scope {
+            cmd = cmd.with_tag(CANCEL_SCOPE_TAG, scope.clone());
+        }
 
         tracing::info!(target = %args.target, kind = %args.kind, "rig tool → dispatch");
         let out = match self.bus.publish_and_await_response(cmd, self.timeout).await {
@@ -293,5 +311,19 @@ pub async fn carry_out_restart(
         )
     };
     tracing::info!(target = %target, "carrying out restart");
+    bus.publish(env).await.map_err(|e| e.to_string())
+}
+
+/// Publish an `octo.control.cancel { scope }` so every connector honouring it aborts
+/// the in-flight work it started under that scope (killing forkd process groups). The
+/// scope is the id the host stamped on the turn's dispatches (see
+/// [`OctoDispatchTool::with_scope`]). Fire-and-forget: the connectors act on their own.
+pub async fn carry_out_cancel(
+    bus: &Arc<InProcessBus>,
+    source: &ConnectorId,
+    scope: &str,
+) -> Result<(), String> {
+    let env = Envelope::new(source.clone(), EventKind::from_static(CANCEL), scope.to_string());
+    tracing::info!(scope = %scope, "carrying out cancel");
     bus.publish(env).await.map_err(|e| e.to_string())
 }
