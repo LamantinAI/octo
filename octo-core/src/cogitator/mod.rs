@@ -72,6 +72,10 @@ pub trait Cogitator: Send + Sync + 'static {
 
 /// Runtime context for a cogitator. Carries shutdown + bus handle for
 /// publishing follow-up actions or registering additional subscriptions.
+///
+/// `Clone` is cheap (a token + an `Arc` + a small `Vec` of connector info) — a
+/// cogitator that spawns a per-turn task moves an owned clone into it.
+#[derive(Clone)]
 pub struct CogitatorContext {
     pub shutdown: CancellationToken,
     bus: Arc<InProcessBus>,
