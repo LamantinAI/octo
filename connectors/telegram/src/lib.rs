@@ -5,7 +5,9 @@
 //! only the `channel` carries transport detail: here it's the `chat_id`. Inbound
 //! text messages become `chat.message` (with `reply_to = chat_id`); `chat.reply`
 //! envelopes targeted at us are sent back to their `channel`'s chat (a `Blob`
-//! payload → photo/document, a `String` → text). Inbound photos and image
+//! payload → photo/document, a `String` → a rich message whose Markdown Telegram
+//! lays out itself, falling back to the older HTML rendering — see [`format`] —
+//! if the server has no rich messages). Inbound photos and image
 //! documents are downloaded into `Blob` payloads for a vision cogitator, and
 //! voice notes / audio files likewise for a hearing one (with a `duration_secs`
 //! tag; audio sent as a plain document keeps the workspace-path route). While
@@ -21,6 +23,7 @@
 //! in the environment, the ACL in a JSON state file named by the manifest.
 
 mod acl;
+mod api;
 mod batch;
 mod format;
 mod fs;
@@ -44,6 +47,7 @@ use teloxide::prelude::*;
 use teloxide::types::{ChatId, InputFile, ParseMode, UpdateKind};
 use teloxide::update_listeners::{polling_default, AsUpdateStream};
 
+use crate::api::{is_unsupported, send_rich_markdown};
 use crate::batch::{Batcher, Emit, Flush};
 
 pub use acl::{Acl, AclEntry, Role};
@@ -181,6 +185,10 @@ impl Connector for TelegramConnector {
         let out_workspace = self.workspace.clone();
         let live = live::Live::new();
         tokio::spawn(async move {
+            // Latched off the first time the server says it has no rich messages
+            // (an older self-hosted Bot API), so replies stop paying for a call
+            // that can't succeed. A per-message rejection doesn't clear it.
+            let mut rich_messages = true;
             loop {
                 tokio::select! {
                     reply = replies.next() => match reply {
@@ -236,27 +244,7 @@ impl Connector for TelegramConnector {
                                     Err(e) => tracing::warn!(error = %e, "telegram media send failed"),
                                 }
                             } else if let Some(text) = env.payload_as::<String>() {
-                                // Render the model's Markdown to Telegram HTML so it
-                                // shows formatted (not raw `**`/`#`/tables), split to
-                                // the message-length limit, and fall back to plain
-                                // text if the Bot API rejects a chunk's HTML.
-                                let html = format::to_telegram_html(text);
-                                for chunk in format::split_for_telegram(&html) {
-                                    let sent = out_bot
-                                        .send_message(chat_id, chunk.clone())
-                                        .parse_mode(ParseMode::Html)
-                                        .await;
-                                    match sent {
-                                        Ok(_) => tracing::info!(chat, "sent reply"),
-                                        Err(e) => {
-                                            tracing::warn!(error = %e, "telegram HTML send failed; retrying as plain text");
-                                            let plain = format::strip_tags(&chunk);
-                                            if let Err(e2) = out_bot.send_message(chat_id, plain).await {
-                                                tracing::warn!(error = %e2, "telegram plain send failed");
-                                            }
-                                        }
-                                    }
-                                }
+                                send_reply(&out_bot, chat_id, text, &mut rich_messages).await;
                             }
                         }
                         None => break,
@@ -473,6 +461,52 @@ impl TelegramConnector {
     ) -> Result<String, octo_workspace::WorkspaceError> {
         let root = fs::workspace_root(&self.workspace)?;
         fs::save_incoming(&root, filename, bytes)
+    }
+}
+
+/// Send a model reply to a chat: a rich message where the server has them
+/// (Markdown as-is, laid out by Telegram), dropping to the pre-10.1 HTML
+/// renderer and then to plain text if it doesn't — so a reply always lands, and
+/// only its formatting degrades.
+async fn send_reply(bot: &Bot, chat: ChatId, text: &str, rich_messages: &mut bool) {
+    if !*rich_messages {
+        send_html(bot, chat, text).await;
+        return;
+    }
+    for chunk in format::split_rich(text) {
+        let markdown = format::sanitize_rich(&chunk);
+        match send_rich_markdown(bot, chat, &markdown).await {
+            Ok(()) => tracing::info!(%chat, "sent reply (rich)"),
+            Err(e) => {
+                if is_unsupported(&e) {
+                    tracing::warn!(error = %e, "telegram: server has no rich messages; using the HTML renderer from here on");
+                    *rich_messages = false;
+                } else {
+                    tracing::warn!(error = %e, "telegram rich send failed; falling back to HTML");
+                }
+                send_html(bot, chat, &chunk).await;
+            }
+        }
+    }
+}
+
+/// The pre-10.1 path, and the fallback under a rejected rich send: the model's
+/// Markdown rendered into Telegram's HTML subset, split to the message-length
+/// limit, and stripped to plain text if the Bot API rejects a chunk's HTML.
+async fn send_html(bot: &Bot, chat: ChatId, text: &str) {
+    let html = format::to_telegram_html(text);
+    for chunk in format::split_for_telegram(&html) {
+        let sent = bot.send_message(chat, chunk.clone()).parse_mode(ParseMode::Html).await;
+        match sent {
+            Ok(_) => tracing::info!(%chat, "sent reply"),
+            Err(e) => {
+                tracing::warn!(error = %e, "telegram HTML send failed; retrying as plain text");
+                let plain = format::strip_tags(&chunk);
+                if let Err(e2) = bot.send_message(chat, plain).await {
+                    tracing::warn!(error = %e2, "telegram plain send failed");
+                }
+            }
+        }
     }
 }
 
