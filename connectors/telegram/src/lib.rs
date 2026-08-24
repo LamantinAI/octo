@@ -80,6 +80,39 @@ const SEND_FILE: &str = "chat.send_file";
 const TYPING: &str = "chat.typing";
 const STATUS: &str = "chat.status";
 
+/// What the runtime tells cognition about this channel — its commands, and how a
+/// reply is rendered. The second half is the point: the model picks the shape of
+/// its answer, and only the connector knows which shapes survive the trip.
+///
+/// Note that a chat channel opting into the env-as-tools catalogue stretches what
+/// [`ConnectorCapabilities::description`] has meant so far ("I am an agent-callable
+/// tool"); here it also says "I am an environment, and this is how to speak in it".
+///
+/// Two deliberate omissions:
+///
+/// - The `octo.telegram.*` ACL commands. They still work when dispatched, but the
+///   allow-list is this connector's security edge and an inbound message is
+///   untrusted input — telling the model how to grant chat access would turn a
+///   prompt injection into privilege escalation.
+/// - Anything about *who* is on the other end. This string reaches a model and,
+///   through it, a chat log; chat ids, the allow-list, the workspace path and the
+///   token all stay out of it. It is a `const` so it cannot drift into carrying
+///   them — see `catalog_is_static_and_holds_no_deployment_detail`.
+const CATALOG: &str = "A chat channel with a person — conversation, not a tool call. A reply is a \
+`chat.reply` envelope carrying the chat id on its channel; these commands are accepted too:
+- chat.send_file { path, chat?, filename?, caption? } -> send a file from the shared workspace (an image as a photo, anything else as a document)
+- chat.typing -> hold the \"typing…\" indicator while a turn runs
+- chat.status \"<line>\" -> append a line to the turn's progress trace, which is deleted when the reply lands
+
+Reply text is Markdown and Telegram lays it out, so structure survives the trip: \
+headings, ordered/unordered lists, task lists, tables, block quotes, fenced code with \
+a language, thematic breaks, **bold**, *italic*, ~~strikethrough~~, `code`, ==marked==, \
+||spoiler|| and links all render as themselves. Answer tabular things with a table — it \
+arrives as a table, not as ASCII art. Raw HTML is shown literally rather than parsed: \
+write `<details>` or `<b>` and the reader sees the tag, so reach for Markdown instead. \
+Table cells carry inline formatting only. A long reply is split between top-level \
+blocks on the way out, so there is no need to chunk it by hand.";
+
 /// Shared, mutable ACL state: the list behind a lock + where it persists.
 struct AclState {
     acl: RwLock<Acl>,
@@ -147,7 +180,8 @@ impl TelegramConnector {
                 EventKind::from_static(ALLOW_CHAT),
                 EventKind::from_static(REMOVE_CHAT),
                 EventKind::from_static(LIST_CHATS),
-            ]);
+            ])
+            .with_description(CATALOG);
         Arc::new(Self {
             id: ConnectorId::new(id),
             capabilities,
@@ -893,6 +927,35 @@ mod tests {
                  "from":{{"id":42,"is_bot":false,"first_name":"T"}},{media}}}"#
         );
         serde_json::from_str(&json).expect("valid Telegram message JSON")
+    }
+
+    /// The catalogue reaches a model, and through it a chat log and whatever the
+    /// model writes next. Nothing about *this* deployment may ride along, so it
+    /// must not vary with the token, the allow-list, or where that list is kept.
+    #[test]
+    fn catalog_is_static_and_holds_no_deployment_detail() {
+        let mut acl = Acl::new();
+        acl.insert(424242, Role::Owner);
+        let configured = TelegramConnector::with_acl(
+            "telegram",
+            "111222:SECRETTOKEN",
+            acl,
+            Some(PathBuf::from("/home/someone/private-acl.json")),
+        );
+        let bare = TelegramConnector::new("telegram", "333444:OTHERTOKEN");
+
+        let described = configured.capabilities().description.as_deref();
+        assert_eq!(described, bare.capabilities().description.as_deref());
+        assert_eq!(described, Some(CATALOG));
+
+        let catalog = described.expect("the channel describes itself");
+        for private in ["424242", "SECRETTOKEN", "someone", "private-acl"] {
+            assert!(!catalog.contains(private), "catalogue leaked {private}");
+        }
+        // The ACL commands stay dispatchable but undocumented — see CATALOG.
+        for hidden in [ALLOW_CHAT, REMOVE_CHAT, LIST_CHATS] {
+            assert!(!catalog.contains(hidden), "catalogue advertises {hidden}");
+        }
     }
 
     #[test]

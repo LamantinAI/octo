@@ -21,15 +21,18 @@ pub(crate) async fn send_rich_markdown(bot: &Bot, chat: ChatId, markdown: &str) 
         "chat_id": chat.0,
         "rich_message": { "markdown": markdown },
     });
+    // `without_url` before stringifying: a reqwest error prints the URL it was
+    // for, and this one carries the bot token — a transport hiccup must not put
+    // it in the log.
     let response = bot
         .client()
         .post(url)
         .json(&body)
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.without_url().to_string())?;
     let status = response.status();
-    let payload: Value = response.json().await.map_err(|e| e.to_string())?;
+    let payload: Value = response.json().await.map_err(|e| e.without_url().to_string())?;
     if payload.get("ok").and_then(Value::as_bool) == Some(true) {
         return Ok(());
     }
