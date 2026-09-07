@@ -222,12 +222,14 @@ impl Connector for TelegramConnector {
                             // the status trace.
                             live.end_turn(&out_bot, chat_id);
 
-                            // A media payload → photo/document; a String → text.
+                            // A media payload → photo/voice/document; a String → text.
                             if let Some(blob) = env.payload_as::<Blob>() {
                                 let file = InputFile::memory(blob.bytes().clone())
                                     .file_name(blob.filename().unwrap_or("file").to_string());
                                 let sent = if blob.is_image() {
                                     out_bot.send_photo(chat_id, file).await.map(|_| ())
+                                } else if is_voice_blob(blob) {
+                                    out_bot.send_voice(chat_id, file).await.map(|_| ())
                                 } else {
                                     out_bot.send_document(chat_id, file).await.map(|_| ())
                                 };
@@ -476,8 +478,44 @@ impl TelegramConnector {
     }
 }
 
+/// How an outgoing file is presented in Telegram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outbound {
+    /// `sendPhoto`: an inline preview.
+    Photo,
+    /// `sendVoice`: the play-in-place voice bubble. Telegram only renders OGG/Opus
+    /// this way — an MP3 or M4A sent as a voice note comes back as an error.
+    Voice,
+    /// `sendDocument`: everything else.
+    Document,
+}
+
+/// Classify an outgoing file by its extension. The name is ours (a workspace path
+/// or a caller-chosen `filename`), not a remote-controlled string.
+fn outbound_kind(filename: &str) -> Outbound {
+    let lower = filename.to_ascii_lowercase();
+    let has = |exts: &[&str]| exts.iter().any(|ext| lower.ends_with(ext));
+    if has(&[".png", ".jpg", ".jpeg", ".webp", ".gif"]) {
+        Outbound::Photo
+    } else if has(&[".ogg", ".oga", ".opus"]) {
+        Outbound::Voice
+    } else {
+        Outbound::Document
+    }
+}
+
+/// An audio `Blob` that Telegram will accept as a voice note: OGG/Opus by MIME, or
+/// by the filename it was labelled with.
+fn is_voice_blob(blob: &Blob) -> bool {
+    blob.content_type().starts_with("audio/ogg")
+        || blob
+            .filename()
+            .is_some_and(|f| outbound_kind(f) == Outbound::Voice)
+}
+
 /// Handle `chat.send_file`: load a file from the shared workspace by its path and
-/// send it — a photo for images, a document otherwise, with an optional `caption`.
+/// send it — a photo for images, a voice note for OGG/Opus audio, a document
+/// otherwise, with an optional `caption`.
 /// Chat id comes from the payload `chat`, else
 /// the envelope's channel. Bytes never pass through the model — the payload only
 /// names a path.
@@ -487,10 +525,11 @@ async fn send_workspace_file(bot: &Bot, workspace: &Option<PathBuf>, env: &Envel
         tracing::warn!("chat.send_file without a `path`; dropped");
         return;
     };
-    let chat = params
-        .get("chat")
-        .and_then(Value::as_i64)
-        .or_else(|| env.channel.as_ref().and_then(|c| c.as_str().parse::<i64>().ok()));
+    let chat = params.get("chat").and_then(Value::as_i64).or_else(|| {
+        env.channel
+            .as_ref()
+            .and_then(|c| c.as_str().parse::<i64>().ok())
+    });
     let Some(chat) = chat else {
         tracing::warn!("chat.send_file without a chat id; dropped");
         return;
@@ -509,30 +548,45 @@ async fn send_workspace_file(bot: &Bot, workspace: &Option<PathBuf>, env: &Envel
             return;
         }
     };
-    let filename = params.get("filename").and_then(Value::as_str).map(str::to_string).unwrap_or(name);
-    let caption = params.get("caption").and_then(Value::as_str).map(str::to_string);
-    // An image goes as a photo (inline preview) rather than a document. Judge by
-    // extension — the workspace filename is ours, not a remote-controlled string.
-    let is_image = {
-        let lower = filename.to_ascii_lowercase();
-        [".png", ".jpg", ".jpeg", ".webp", ".gif"].iter().any(|ext| lower.ends_with(ext))
-    };
+    let filename = params
+        .get("filename")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or(name);
+    let caption = params
+        .get("caption")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    // An image goes as a photo (inline preview) and OGG/Opus as a voice note (the
+    // play-in-place bubble) rather than a document. Judge by extension — the workspace
+    // filename is ours, not a remote-controlled string.
+    let kind = outbound_kind(&filename);
     let file = InputFile::memory(bytes).file_name(filename);
-    let sent = if is_image {
-        let mut req = bot.send_photo(ChatId(chat), file);
-        if let Some(c) = caption {
-            req = req.caption(c);
+    let sent = match kind {
+        Outbound::Photo => {
+            let mut req = bot.send_photo(ChatId(chat), file);
+            if let Some(c) = caption {
+                req = req.caption(c);
+            }
+            req.await.map(|_| ())
         }
-        req.await.map(|_| ())
-    } else {
-        let mut req = bot.send_document(ChatId(chat), file);
-        if let Some(c) = caption {
-            req = req.caption(c);
+        Outbound::Voice => {
+            let mut req = bot.send_voice(ChatId(chat), file);
+            if let Some(c) = caption {
+                req = req.caption(c);
+            }
+            req.await.map(|_| ())
         }
-        req.await.map(|_| ())
+        Outbound::Document => {
+            let mut req = bot.send_document(ChatId(chat), file);
+            if let Some(c) = caption {
+                req = req.caption(c);
+            }
+            req.await.map(|_| ())
+        }
     };
     match sent {
-        Ok(_) => tracing::info!(chat, %path, image = is_image, "sent file"),
+        Ok(_) => tracing::info!(chat, %path, kind = ?kind, "sent file"),
         Err(e) => tracing::warn!(error = %e, "telegram send_file failed"),
     }
 }
@@ -885,6 +939,35 @@ mod tests {
         assert_eq!(media.mime, "audio/mp4");
         assert_eq!(media.filename, "lecture.m4a");
         assert_eq!(media.duration_secs, 183);
+    }
+
+    #[test]
+    fn outgoing_files_are_classified_by_extension() {
+        assert_eq!(outbound_kind("cover.PNG"), Outbound::Photo);
+        assert_eq!(outbound_kind("shot.jpeg"), Outbound::Photo);
+        assert_eq!(outbound_kind("reply.ogg"), Outbound::Voice);
+        assert_eq!(outbound_kind("reply.oga"), Outbound::Voice);
+        assert_eq!(outbound_kind("speech.opus"), Outbound::Voice);
+        // Telegram rejects these as voice notes, so they stay documents.
+        assert_eq!(outbound_kind("song.mp3"), Outbound::Document);
+        assert_eq!(outbound_kind("lecture.m4a"), Outbound::Document);
+        assert_eq!(outbound_kind("report.pdf"), Outbound::Document);
+    }
+
+    #[test]
+    fn voice_blob_is_ogg_by_mime_or_name() {
+        assert!(is_voice_blob(&Blob::new(vec![1], "audio/ogg")));
+        assert!(is_voice_blob(&Blob::new(vec![1], "audio/ogg; codecs=opus")));
+        // A generic MIME with an .ogg name still goes out as a voice note.
+        assert!(is_voice_blob(
+            &Blob::new(vec![1], "application/octet-stream").with_filename("say.ogg")
+        ));
+        assert!(!is_voice_blob(
+            &Blob::new(vec![1], "audio/mpeg").with_filename("song.mp3")
+        ));
+        assert!(!is_voice_blob(
+            &Blob::new(vec![1], "image/png").with_filename("a.png")
+        ));
     }
 
     #[test]
