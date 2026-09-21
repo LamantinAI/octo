@@ -2,6 +2,11 @@
 //! `parse_mode=HTML` understands, so replies show as formatted text instead of
 //! raw `**`/`#`/`-` and broken tables.
 //!
+//! Since Bot API 10.1 this is the *fallback* renderer — [`super::rich`] sends the
+//! Markdown as-is and lets Telegram lay it out. This path still runs whenever a
+//! rich send is rejected (an older local Bot API server, say), so it keeps
+//! working against the pre-10.1 surface described below.
+//!
 //! Telegram supports only a handful of inline tags (`b i u s a code pre
 //! blockquote`) and **no** block structures — no headings, lists, or tables. So
 //! headings become bold lines, list items get `•`/`N.` bullets, and Markdown
