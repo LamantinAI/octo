@@ -5,7 +5,9 @@
 //! only the `channel` carries transport detail: here it's the `chat_id`. Inbound
 //! text messages become `chat.message` (with `reply_to = chat_id`); `chat.reply`
 //! envelopes targeted at us are sent back to their `channel`'s chat (a `Blob`
-//! payload → photo/document, a `String` → text). Inbound photos and image
+//! payload → photo/document, a `String` → a rich message whose Markdown Telegram
+//! lays out itself, falling back to the older HTML rendering — see [`format`] —
+//! if the server has no rich messages). Inbound photos and image
 //! documents are downloaded into `Blob` payloads for a vision cogitator, and
 //! voice notes / audio files likewise for a hearing one (with a `duration_secs`
 //! tag; audio sent as a plain document keeps the workspace-path route). Videos
@@ -24,6 +26,7 @@
 //! in the environment, the ACL in a JSON state file named by the manifest.
 
 mod acl;
+mod api;
 mod batch;
 mod format;
 mod fs;
@@ -47,6 +50,7 @@ use teloxide::prelude::*;
 use teloxide::types::{ChatId, InputFile, ParseMode, UpdateKind};
 use teloxide::update_listeners::{polling_default, AsUpdateStream};
 
+use crate::api::{is_unsupported, send_rich_markdown};
 use crate::batch::{Batcher, Emit, Flush};
 
 pub use acl::{Acl, AclEntry, Role};
@@ -78,6 +82,39 @@ const SEND_FILE: &str = "chat.send_file";
 /// edited status message.
 const TYPING: &str = "chat.typing";
 const STATUS: &str = "chat.status";
+
+/// What the runtime tells cognition about this channel — its commands, and how a
+/// reply is rendered. The second half is the point: the model picks the shape of
+/// its answer, and only the connector knows which shapes survive the trip.
+///
+/// Note that a chat channel opting into the env-as-tools catalogue stretches what
+/// [`ConnectorCapabilities::description`] has meant so far ("I am an agent-callable
+/// tool"); here it also says "I am an environment, and this is how to speak in it".
+///
+/// Two deliberate omissions:
+///
+/// - The `octo.telegram.*` ACL commands. They still work when dispatched, but the
+///   allow-list is this connector's security edge and an inbound message is
+///   untrusted input — telling the model how to grant chat access would turn a
+///   prompt injection into privilege escalation.
+/// - Anything about *who* is on the other end. This string reaches a model and,
+///   through it, a chat log; chat ids, the allow-list, the workspace path and the
+///   token all stay out of it. It is a `const` so it cannot drift into carrying
+///   them — see `catalog_is_static_and_holds_no_deployment_detail`.
+const CATALOG: &str = "A chat channel with a person — conversation, not a tool call. A reply is a \
+`chat.reply` envelope carrying the chat id on its channel; these commands are accepted too:
+- chat.send_file { path, chat?, filename?, caption? } -> send a file from the shared workspace (an image as a photo, anything else as a document)
+- chat.typing -> hold the \"typing…\" indicator while a turn runs
+- chat.status \"<line>\" -> append a line to the turn's progress trace, which is deleted when the reply lands
+
+Reply text is Markdown and Telegram lays it out, so structure survives the trip: \
+headings, ordered/unordered lists, task lists, tables, block quotes, fenced code with \
+a language, thematic breaks, **bold**, *italic*, ~~strikethrough~~, `code`, ==marked==, \
+||spoiler|| and links all render as themselves. Answer tabular things with a table — it \
+arrives as a table, not as ASCII art. Raw HTML is shown literally rather than parsed: \
+write `<details>` or `<b>` and the reader sees the tag, so reach for Markdown instead. \
+Table cells carry inline formatting only. A long reply is split between top-level \
+blocks on the way out, so there is no need to chunk it by hand.";
 
 /// Shared, mutable ACL state: the list behind a lock + where it persists.
 struct AclState {
@@ -146,7 +183,8 @@ impl TelegramConnector {
                 EventKind::from_static(ALLOW_CHAT),
                 EventKind::from_static(REMOVE_CHAT),
                 EventKind::from_static(LIST_CHATS),
-            ]);
+            ])
+            .with_description(CATALOG);
         Arc::new(Self {
             id: ConnectorId::new(id),
             capabilities,
@@ -184,6 +222,10 @@ impl Connector for TelegramConnector {
         let out_workspace = self.workspace.clone();
         let live = live::Live::new();
         tokio::spawn(async move {
+            // Latched off the first time the server says it has no rich messages
+            // (an older self-hosted Bot API), so replies stop paying for a call
+            // that can't succeed. A per-message rejection doesn't clear it.
+            let mut rich_messages = true;
             loop {
                 tokio::select! {
                     reply = replies.next() => match reply {
@@ -241,27 +283,7 @@ impl Connector for TelegramConnector {
                                     Err(e) => tracing::warn!(error = %e, "telegram media send failed"),
                                 }
                             } else if let Some(text) = env.payload_as::<String>() {
-                                // Render the model's Markdown to Telegram HTML so it
-                                // shows formatted (not raw `**`/`#`/tables), split to
-                                // the message-length limit, and fall back to plain
-                                // text if the Bot API rejects a chunk's HTML.
-                                let html = format::to_telegram_html(text);
-                                for chunk in format::split_for_telegram(&html) {
-                                    let sent = out_bot
-                                        .send_message(chat_id, chunk.clone())
-                                        .parse_mode(ParseMode::Html)
-                                        .await;
-                                    match sent {
-                                        Ok(_) => tracing::info!(chat, "sent reply"),
-                                        Err(e) => {
-                                            tracing::warn!(error = %e, "telegram HTML send failed; retrying as plain text");
-                                            let plain = format::strip_tags(&chunk);
-                                            if let Err(e2) = out_bot.send_message(chat_id, plain).await {
-                                                tracing::warn!(error = %e2, "telegram plain send failed");
-                                            }
-                                        }
-                                    }
-                                }
+                                send_reply(&out_bot, chat_id, text, &mut rich_messages).await;
                             }
                         }
                         None => break,
@@ -578,6 +600,52 @@ fn is_voice_blob(blob: &Blob) -> bool {
         || blob
             .filename()
             .is_some_and(|f| outbound_kind(f) == Outbound::Voice)
+}
+
+/// Send a model reply to a chat: a rich message where the server has them
+/// (Markdown as-is, laid out by Telegram), dropping to the pre-10.1 HTML
+/// renderer and then to plain text if it doesn't — so a reply always lands, and
+/// only its formatting degrades.
+async fn send_reply(bot: &Bot, chat: ChatId, text: &str, rich_messages: &mut bool) {
+    if !*rich_messages {
+        send_html(bot, chat, text).await;
+        return;
+    }
+    for chunk in format::split_rich(text) {
+        let markdown = format::sanitize_rich(&chunk);
+        match send_rich_markdown(bot, chat, &markdown).await {
+            Ok(()) => tracing::info!(%chat, "sent reply (rich)"),
+            Err(e) => {
+                if is_unsupported(&e) {
+                    tracing::warn!(error = %e, "telegram: server has no rich messages; using the HTML renderer from here on");
+                    *rich_messages = false;
+                } else {
+                    tracing::warn!(error = %e, "telegram rich send failed; falling back to HTML");
+                }
+                send_html(bot, chat, &chunk).await;
+            }
+        }
+    }
+}
+
+/// The pre-10.1 path, and the fallback under a rejected rich send: the model's
+/// Markdown rendered into Telegram's HTML subset, split to the message-length
+/// limit, and stripped to plain text if the Bot API rejects a chunk's HTML.
+async fn send_html(bot: &Bot, chat: ChatId, text: &str) {
+    let html = format::to_telegram_html(text);
+    for chunk in format::split_for_telegram(&html) {
+        let sent = bot.send_message(chat, chunk.clone()).parse_mode(ParseMode::Html).await;
+        match sent {
+            Ok(_) => tracing::info!(%chat, "sent reply"),
+            Err(e) => {
+                tracing::warn!(error = %e, "telegram HTML send failed; retrying as plain text");
+                let plain = format::strip_tags(&chunk);
+                if let Err(e2) = bot.send_message(chat, plain).await {
+                    tracing::warn!(error = %e2, "telegram plain send failed");
+                }
+            }
+        }
+    }
 }
 
 /// Handle `chat.send_file`: load a file from the shared workspace by its path and
@@ -1049,6 +1117,35 @@ mod tests {
                  "from":{{"id":42,"is_bot":false,"first_name":"T"}},{media}}}"#
         );
         serde_json::from_str(&json).expect("valid Telegram message JSON")
+    }
+
+    /// The catalogue reaches a model, and through it a chat log and whatever the
+    /// model writes next. Nothing about *this* deployment may ride along, so it
+    /// must not vary with the token, the allow-list, or where that list is kept.
+    #[test]
+    fn catalog_is_static_and_holds_no_deployment_detail() {
+        let mut acl = Acl::new();
+        acl.insert(424242, Role::Owner);
+        let configured = TelegramConnector::with_acl(
+            "telegram",
+            "111222:SECRETTOKEN",
+            acl,
+            Some(PathBuf::from("/home/someone/private-acl.json")),
+        );
+        let bare = TelegramConnector::new("telegram", "333444:OTHERTOKEN");
+
+        let described = configured.capabilities().description.as_deref();
+        assert_eq!(described, bare.capabilities().description.as_deref());
+        assert_eq!(described, Some(CATALOG));
+
+        let catalog = described.expect("the channel describes itself");
+        for private in ["424242", "SECRETTOKEN", "someone", "private-acl"] {
+            assert!(!catalog.contains(private), "catalogue leaked {private}");
+        }
+        // The ACL commands stay dispatchable but undocumented — see CATALOG.
+        for hidden in [ALLOW_CHAT, REMOVE_CHAT, LIST_CHATS] {
+            assert!(!catalog.contains(hidden), "catalogue advertises {hidden}");
+        }
     }
 
     #[test]
