@@ -8,7 +8,10 @@
 //! payload → photo/document, a `String` → text). Inbound photos and image
 //! documents are downloaded into `Blob` payloads for a vision cogitator, and
 //! voice notes / audio files likewise for a hearing one (with a `duration_secs`
-//! tag; audio sent as a plain document keeps the workspace-path route). While
+//! tag; audio sent as a plain document keeps the workspace-path route). Videos
+//! and video notes are saved to the workspace for a tool to open, and reach the
+//! cogitator as Telegram's own thumbnail plus a note naming that path — the
+//! bytes themselves never travel to a model. While
 //! a turn is running, `chat.typing` keeps the "typing…" indicator alive and
 //! `chat.status` streams a live tool-use trace (see [`live`]).
 //!
@@ -418,6 +421,70 @@ impl Connector for TelegramConnector {
                                     }
                                     Err(e) => tracing::warn!(error = %e, "telegram voice download failed"),
                                 }
+                            } else if let Some(video) = video_media(&msg) {
+                                // A video clip or a round video note. The bytes never
+                                // travel to the model — no model perceives video, and
+                                // clips are large — so the file lands in the workspace
+                                // for a tool (ffprobe/ffmpeg, transcription) while
+                                // Telegram's OWN thumbnail rides along as an `Image`
+                                // blob, so a vision cogitator sees what arrived instead
+                                // of a bare path. Emitted immediately (Telegram groups
+                                // video into an album only with photos, handled above).
+                                match download_bytes(&bot, video.file_id).await {
+                                    Ok(bytes) => {
+                                        let saved = self
+                                            .save_incoming(&inbox_name(&video.filename), &bytes)
+                                            .map_err(|e| tracing::warn!(error = %e, "failed to save incoming video"))
+                                            .ok();
+                                        tracing::info!(
+                                            %chat, bytes = bytes.len(), secs = video.duration_secs,
+                                            rel = saved.as_deref().unwrap_or("-"), "recv: video"
+                                        );
+                                        let caption = video_caption(
+                                            &video,
+                                            msg.caption().map(str::to_string),
+                                            saved.as_deref(),
+                                        );
+                                        // The poster frame, when Telegram sent one — a
+                                        // failed thumbnail download must not cost us the
+                                        // whole turn, so it degrades to plain text.
+                                        let thumb = match video.thumbnail {
+                                            Some(t) => download_bytes(&bot, &t.file.id).await.ok(),
+                                            None => None,
+                                        };
+                                        let emit = match thumb {
+                                            Some(bytes) => Emit::Image {
+                                                blob: Blob::new(bytes, "image/jpeg")
+                                                    .with_filename("video-thumb.jpg"),
+                                                caption: Some(caption),
+                                            },
+                                            None => Emit::Text { text: caption, caption: None },
+                                        };
+                                        publish_flush(&self.id, &ctx, Flush {
+                                            chat: chat.clone(),
+                                            trust,
+                                            emit,
+                                        }).await;
+                                    }
+                                    Err(e) => {
+                                        // The Bot API caps downloads at 20 MB, so a long
+                                        // clip fails right here. Say so: staying silent
+                                        // reads as the bot ignoring the message.
+                                        tracing::warn!(error = %e, "telegram video download failed");
+                                        publish_flush(&self.id, &ctx, Flush {
+                                            chat: chat.clone(),
+                                            trust,
+                                            emit: Emit::Text {
+                                                text: format!(
+                                                    "[received a video ({}) but could not download it \
+                                                     — Telegram caps bot downloads at 20 MB]",
+                                                    hms(video.duration_secs)
+                                                ),
+                                                caption: None,
+                                            },
+                                        }).await;
+                                    }
+                                }
                             } else if let Some(doc) = msg.document() {
                                 // Any other file → saved into the shared workspace;
                                 // the cogitator is handed its path (bytes by
@@ -638,6 +705,75 @@ fn voice_media(msg: &teloxide::types::Message) -> Option<VoiceMedia<'_>> {
         filename: audio.file_name.clone().unwrap_or_else(|| "audio".to_string()),
         duration_secs: audio.duration.seconds(),
     })
+}
+
+/// An inbound video: what's needed to fetch it, name it in the workspace, and
+/// describe it to a cogitator.
+struct VideoMedia<'a> {
+    file_id: &'a teloxide::types::FileId,
+    /// Telegram's own poster frame, when it sent one — a free first look at the
+    /// clip that costs no local decoding.
+    thumbnail: Option<&'a teloxide::types::PhotoSize>,
+    filename: String,
+    duration_secs: u32,
+    /// A round `video_note` rather than a regular clip; the two read differently
+    /// in a chat, so the note says which arrived.
+    is_note: bool,
+}
+
+/// Inbound video: a clip (`video`) or a round video note (`video_note`). Video
+/// sent as a plain *document* deliberately keeps the generic workspace route,
+/// exactly as audio documents do.
+fn video_media(msg: &teloxide::types::Message) -> Option<VideoMedia<'_>> {
+    if let Some(video) = msg.video() {
+        return Some(VideoMedia {
+            file_id: &video.file.id,
+            thumbnail: video.thumbnail.as_ref(),
+            filename: video.file_name.clone().unwrap_or_else(|| "video.mp4".to_string()),
+            duration_secs: video.duration.seconds(),
+            is_note: false,
+        });
+    }
+    let note = msg.video_note()?;
+    Some(VideoMedia {
+        file_id: &note.file.id,
+        thumbnail: note.thumbnail.as_ref(),
+        // A video note carries no name of its own.
+        filename: "video_note.mp4".to_string(),
+        duration_secs: note.duration.seconds(),
+        is_note: true,
+    })
+}
+
+/// A clip length as `m:ss`, or `h:mm:ss` once it passes an hour.
+fn hms(secs: u32) -> String {
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+/// What the cogitator reads for an inbound video: the sender's caption (if any)
+/// plus a note naming the clip, its length and the workspace path it was saved
+/// to — the handle every ffmpeg/transcription tool needs. Mirrors the
+/// `saved to workspace path` wording a plain document already gets.
+fn video_caption(video: &VideoMedia<'_>, caption: Option<String>, saved: Option<&str>) -> String {
+    let kind = if video.is_note { "video note" } else { "video" };
+    let (name, len) = (&video.filename, hms(video.duration_secs));
+    let note = match saved {
+        Some(rel) => {
+            format!("[received {kind} `{name}` ({len}) — saved to workspace path `{rel}`]")
+        }
+        // Perception still happens (the thumbnail is attached); only the handle
+        // for tools is missing, so say that rather than naming a path that isn't.
+        None => format!("[received {kind} `{name}` ({len}) — could not save it to the workspace]"),
+    };
+    match caption {
+        Some(c) if !c.is_empty() => format!("{c}\n\n{note}"),
+        _ => note,
+    }
 }
 
 /// A document attachment that is actually an image (`image/*` MIME), with its
@@ -885,6 +1021,84 @@ mod tests {
         assert_eq!(media.mime, "audio/mp4");
         assert_eq!(media.filename, "lecture.m4a");
         assert_eq!(media.duration_secs, 183);
+    }
+
+    #[test]
+    fn video_clip_is_recognized_with_name_length_and_thumbnail() {
+        let msg = message(
+            r#""video":{"file_id":"BAACV","file_unique_id":"u4","file_size":900,"duration":95,
+                       "width":1920,"height":1080,"file_name":"clip.mp4","mime_type":"video/mp4",
+                       "thumbnail":{"file_id":"THUMB","file_unique_id":"u5","file_size":2,
+                                    "width":320,"height":180}}"#,
+        );
+        let media = video_media(&msg).expect("a video is inbound video");
+        assert_eq!(media.file_id.0, "BAACV");
+        assert_eq!(media.filename, "clip.mp4");
+        assert_eq!(media.duration_secs, 95);
+        assert!(!media.is_note);
+        assert_eq!(
+            media.thumbnail.expect("Telegram sent a poster frame").file.id.0,
+            "THUMB"
+        );
+    }
+
+    #[test]
+    fn video_note_is_recognized_and_named() {
+        // A round video note carries neither file_name nor mime_type.
+        let msg = message(
+            r#""video_note":{"file_id":"DQACN","file_unique_id":"u6","file_size":700,
+                            "duration":8,"length":384}"#,
+        );
+        let media = video_media(&msg).expect("a video note is inbound video");
+        assert_eq!(media.filename, "video_note.mp4");
+        assert_eq!(media.duration_secs, 8);
+        assert!(media.is_note);
+        assert!(media.thumbnail.is_none());
+    }
+
+    #[test]
+    fn video_caption_carries_the_workspace_path_and_the_senders_words() {
+        let msg = message(
+            r#""video":{"file_id":"B","file_unique_id":"u7","file_size":1,"duration":62,
+                       "width":2,"height":2,"file_name":"clip.mp4","mime_type":"video/mp4"}"#,
+        );
+        let media = video_media(&msg).unwrap();
+
+        // The path is the handle every ffmpeg/transcription tool needs, and the
+        // sender's own words must survive alongside it.
+        let with_caption =
+            video_caption(&media, Some("посмотри".into()), Some("inbox/17-clip.mp4"));
+        assert!(with_caption.starts_with("посмотри\n\n"));
+        assert!(with_caption.contains("saved to workspace path `inbox/17-clip.mp4`"));
+        assert!(with_caption.contains("(1:02)"), "length is rendered m:ss");
+
+        // No caption → just the note; no saved path → no invented path.
+        assert!(video_caption(&media, None, Some("inbox/a.mp4")).starts_with("[received video"));
+        let unsaved = video_caption(&media, None, None);
+        assert!(unsaved.contains("could not save"));
+        assert!(!unsaved.contains("workspace path `"));
+    }
+
+    #[test]
+    fn hms_renders_minutes_and_only_then_hours() {
+        assert_eq!(hms(7), "0:07");
+        assert_eq!(hms(62), "1:02");
+        assert_eq!(hms(600), "10:00");
+        assert_eq!(hms(3661), "1:01:01");
+    }
+
+    #[test]
+    fn text_photo_and_voice_are_not_video() {
+        assert!(video_media(&message(r#""text":"привет""#)).is_none());
+        let photo = message(
+            r#""photo":[{"file_id":"P","file_unique_id":"u8","file_size":1,"width":1,"height":1}]"#,
+        );
+        assert!(video_media(&photo).is_none());
+        let voice = message(
+            r#""voice":{"file_id":"V","file_unique_id":"u9","file_size":1,"duration":3,
+                       "mime_type":null}"#,
+        );
+        assert!(video_media(&voice).is_none());
     }
 
     #[test]
