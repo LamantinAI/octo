@@ -336,17 +336,23 @@ impl Connector for TelegramConnector {
                             // emitted immediately — zero latency for normal chat.
                             let coalesce_key = coalesce_key(&msg, &chat);
                             let buffer = batcher.enabled() && coalesce_key.is_some();
+                            // A reply carries the message it answers — fold a short context
+                            // of that quoted message into the perceived text/caption so the
+                            // cogitator sees what is being replied to (#17).
+                            let reply = reply_context(&msg);
                             if let Some(text) = msg.text() {
                                 tracing::info!(%chat, "recv: {text}");
+                                let body =
+                                    with_reply(&reply, Some(text.to_string())).unwrap_or_default();
                                 if buffer {
                                     batcher.push_text(
-                                        coalesce_key.unwrap(), &chat, text.to_string(), trust, now,
+                                        coalesce_key.unwrap(), &chat, body, trust, now,
                                     );
                                 } else {
                                     publish_flush(&self.id, &ctx, Flush {
                                         chat: chat.clone(),
                                         trust,
-                                        emit: Emit::Text { text: text.to_string(), caption: None },
+                                        emit: Emit::Text { text: body, caption: None },
                                     }).await;
                                 }
                             } else if let Some(photo) = msg.photo().and_then(<[_]>::last) {
@@ -367,7 +373,8 @@ impl Connector for TelegramConnector {
                                         let blob = Blob::new(bytes, "image/jpeg")
                                             .with_filename("photo.jpg");
                                         let caption = caption_with_saved(
-                                            msg.caption().map(str::to_string), saved.as_deref(),
+                                            with_reply(&reply, msg.caption().map(str::to_string)),
+                                            saved.as_deref(),
                                         );
                                         if buffer {
                                             batcher.push_image(
@@ -399,7 +406,8 @@ impl Connector for TelegramConnector {
                                             .ok();
                                         let blob = Blob::new(bytes, mime).with_filename(fname);
                                         let caption = caption_with_saved(
-                                            msg.caption().map(str::to_string), saved.as_deref(),
+                                            with_reply(&reply, msg.caption().map(str::to_string)),
+                                            saved.as_deref(),
                                         );
                                         publish_flush(&self.id, &ctx, Flush {
                                             chat: chat.clone(),
@@ -438,7 +446,7 @@ impl Connector for TelegramConnector {
                                             trust,
                                             emit: Emit::Audio {
                                                 blob,
-                                                caption: msg.caption().map(str::to_string),
+                                                caption: with_reply(&reply, msg.caption().map(str::to_string)),
                                                 duration_secs: Some(audio.duration_secs),
                                             },
                                         }).await;
@@ -466,7 +474,7 @@ impl Connector for TelegramConnector {
                                         );
                                         let caption = video_caption(
                                             &video,
-                                            msg.caption().map(str::to_string),
+                                            with_reply(&reply, msg.caption().map(str::to_string)),
                                             saved.as_deref(),
                                         );
                                         // The poster frame, when Telegram sent one — a
@@ -934,6 +942,44 @@ fn caption_with_saved(caption: Option<String>, saved: Option<&str>) -> Option<St
     })
 }
 
+/// A short context line for a message that replies to another one, naming what it
+/// answers so the cogitator has the quoted message in view. Quoted text (or caption)
+/// is included, trimmed to a snippet; quoted media is named, never downloaded.
+/// `None` when the message is not a reply.
+fn reply_context(msg: &teloxide::types::Message) -> Option<String> {
+    let replied = msg.reply_to_message()?;
+    let what = if let Some(text) = replied.text().or_else(|| replied.caption()) {
+        let text = text.trim();
+        let snippet: String = text.chars().take(300).collect();
+        let ellipsis = if text.chars().count() > 300 { "…" } else { "" };
+        format!("\"{snippet}{ellipsis}\"")
+    } else if replied.photo().is_some() {
+        "a photo".to_string()
+    } else if replied.video().is_some() || replied.video_note().is_some() {
+        "a video".to_string()
+    } else if replied.voice().is_some() {
+        "a voice message".to_string()
+    } else if replied.audio().is_some() {
+        "an audio file".to_string()
+    } else if replied.document().is_some() {
+        "a file".to_string()
+    } else {
+        "an earlier message".to_string()
+    };
+    Some(format!("[replying to {what}]"))
+}
+
+/// Fold an optional reply-context line onto the front of the user's text/caption, so
+/// the quoted message rides with what they actually wrote. Empty body → the context
+/// stands alone; no reply → the body passes through untouched.
+fn with_reply(reply: &Option<String>, body: Option<String>) -> Option<String> {
+    match (reply, body) {
+        (Some(r), Some(b)) if !b.trim().is_empty() => Some(format!("{r}\n{b}")),
+        (Some(r), _) => Some(r.clone()),
+        (None, b) => b,
+    }
+}
+
 /// Resolve a Telegram `file_id` and download its bytes.
 async fn download_bytes(
     bot: &Bot,
@@ -1352,6 +1398,44 @@ mod tests {
             caption_with_saved(None, Some("inbox/1-photo.jpg")),
             Some("[image saved to workspace path `inbox/1-photo.jpg`]".into())
         );
+    }
+
+    #[test]
+    fn a_reply_carries_the_quoted_message_into_context() {
+        // Reply to a text message: the quoted text rides into the context line.
+        let to_text = message(
+            r#""text":"and the deadline?","reply_to_message":{"message_id":7,"date":1699999999,
+                 "chat":{"id":42,"type":"private","first_name":"T"},
+                 "from":{"id":9,"is_bot":true,"first_name":"Albert"},
+                 "text":"The report is due Friday."}"#,
+        );
+        let ctx = reply_context(&to_text).expect("this message is a reply");
+        assert!(ctx.contains("The report is due Friday."), "got: {ctx}");
+        assert!(ctx.starts_with("[replying to \""));
+
+        // A message that is not a reply → no context.
+        assert!(reply_context(&message(r#""text":"hi""#)).is_none());
+
+        // Reply to media: named, never downloaded.
+        let to_photo = message(
+            r#""text":"who is this?","reply_to_message":{"message_id":8,"date":1699999999,
+                 "chat":{"id":42,"type":"private","first_name":"T"},
+                 "from":{"id":9,"is_bot":false,"first_name":"T"},
+                 "photo":[{"file_id":"P","file_unique_id":"u","file_size":1,"width":1,"height":1}]}"#,
+        );
+        assert_eq!(reply_context(&to_photo).as_deref(), Some("[replying to a photo]"));
+    }
+
+    #[test]
+    fn with_reply_folds_context_onto_the_body() {
+        let r = Some("[replying to \"x\"]".to_string());
+        assert_eq!(with_reply(&r, Some("hi".into())).unwrap(), "[replying to \"x\"]\nhi");
+        // An empty body leaves the context standing alone (a bare reply, e.g. a sticker).
+        assert_eq!(with_reply(&r, Some("  ".into())).unwrap(), "[replying to \"x\"]");
+        assert_eq!(with_reply(&r, None).unwrap(), "[replying to \"x\"]");
+        // No reply → the body passes through untouched.
+        assert_eq!(with_reply(&None, Some("hi".into())), Some("hi".into()));
+        assert_eq!(with_reply(&None, None), None);
     }
 
     #[test]
