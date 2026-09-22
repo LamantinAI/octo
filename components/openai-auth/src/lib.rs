@@ -37,9 +37,9 @@ pub type Result<T> = std::result::Result<T, AuthError>;
 
 
 /// The public first-party Codex OAuth client (shared by `codex` and `albert login`).
-pub(crate) const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 /// The OAuth token endpoint (code exchange + refresh).
-pub(crate) const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+pub const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 /// Refresh once the access token has this little life left (or is already expired).
 const REFRESH_WINDOW_SECS: i64 = 300;
 
@@ -291,7 +291,7 @@ fn jwt_claims(jwt: &str) -> Option<Value> {
 }
 
 /// The ChatGPT account id from the OpenAI auth claim namespace.
-pub(crate) fn account_id_from_jwt(jwt: &str) -> Option<String> {
+pub fn account_id_from_jwt(jwt: &str) -> Option<String> {
     jwt_claims(jwt)?
         .get("https://api.openai.com/auth")?
         .get("chatgpt_account_id")?
@@ -300,7 +300,7 @@ pub(crate) fn account_id_from_jwt(jwt: &str) -> Option<String> {
 }
 
 /// The ChatGPT plan (`plus` / `pro` / `team` / …) from the OpenAI auth claim.
-pub(crate) fn plan_from_jwt(jwt: &str) -> Option<String> {
+pub fn plan_from_jwt(jwt: &str) -> Option<String> {
     jwt_claims(jwt)?
         .get("https://api.openai.com/auth")?
         .get("chatgpt_plan_type")?
