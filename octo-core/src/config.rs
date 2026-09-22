@@ -189,8 +189,15 @@ pub(crate) fn load_config(
     let mut connectors = Vec::new();
 
     for file in files {
-        let connector = instantiate(&file, factories, &mut seen)?;
-        connectors.push(connector);
+        // A single malformed manifest must NOT take down the whole runtime: log it
+        // loudly and carry on without that one connector, rather than aborting the load.
+        // (A headerless leftover manifest once crash-looped a deployment for a week —
+        // one bad connector config should degrade to that connector's absence, not an
+        // outage of everything.)
+        match instantiate(&file, factories, &mut seen) {
+            Ok(connector) => connectors.push(connector),
+            Err(e) => tracing::error!(error = %e, "skipping connector: its manifest failed to load"),
+        }
     }
 
     Ok(LoadedConfig {
@@ -314,4 +321,72 @@ fn instantiate(
             path: path.to_path_buf(),
             source,
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+
+    use crate::{Connector, ConnectorCapabilities, ConnectorContext, ConnectorId, OctoResult};
+
+    struct TestConnector {
+        id: ConnectorId,
+        caps: ConnectorCapabilities,
+    }
+
+    #[async_trait]
+    impl Connector for TestConnector {
+        fn id(&self) -> &ConnectorId {
+            &self.id
+        }
+        fn capabilities(&self) -> &ConnectorCapabilities {
+            &self.caps
+        }
+        async fn run(self: Arc<Self>, _ctx: ConnectorContext) -> OctoResult<()> {
+            Ok(())
+        }
+    }
+
+    struct TestFactory;
+
+    impl ConnectorFactory for TestFactory {
+        fn type_name(&self) -> &str {
+            "test"
+        }
+        fn create(
+            &self,
+            id: ConnectorId,
+            _config: &toml::Value,
+            _ctx: FactoryContext<'_>,
+        ) -> Result<Arc<dyn Connector>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Arc::new(TestConnector { id, caps: ConnectorCapabilities::bidirectional() }))
+        }
+    }
+
+    /// A single malformed manifest (here: a `[connector]` with an id but no `type`, the
+    /// shape that once crash-looped a live deployment) must be skipped, not abort the whole
+    /// load — the good connectors beside it still come up.
+    #[test]
+    fn a_malformed_manifest_is_skipped_not_fatal() {
+        let dir = std::env::temp_dir().join(format!("octo-cfg-skip-{}", std::process::id()));
+        let conns = dir.join("connectors");
+        std::fs::create_dir_all(&conns).unwrap();
+        std::fs::write(dir.join("octo.toml"), "[connectors]\ndir = \"connectors\"\n").unwrap();
+        std::fs::write(conns.join("good.toml"), "[connector]\nid = \"good\"\ntype = \"test\"\n")
+            .unwrap();
+        // Broken: an id but no type -> MissingConnectorHeader, previously fatal.
+        std::fs::write(conns.join("bad.toml"), "[connector]\nid = \"bad\"\n").unwrap();
+
+        let mut factories: HashMap<String, Arc<dyn ConnectorFactory>> = HashMap::new();
+        factories.insert("test".to_string(), Arc::new(TestFactory));
+
+        let loaded = load_config(&dir.join("octo.toml"), &factories, &HashSet::new())
+            .expect("a broken manifest must not fail the whole load");
+
+        assert_eq!(loaded.connectors.len(), 1, "the good connector loads; the bad one is skipped");
+        assert_eq!(loaded.connectors[0].id(), &ConnectorId::new("good"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
