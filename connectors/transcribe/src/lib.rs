@@ -275,4 +275,33 @@ mod tests {
         // The raw audio bytes are present between the header and the closing boundary.
         assert!(body.windows(2).any(|w| w == b"\x00\x01"));
     }
+
+    /// LIVE: transcribe a real recording against the subscription dictation endpoint.
+    /// Ignored by default (hits the network + needs a real subscription auth.json):
+    ///   TRANSCRIBE_FILE=/path/to/audio.ogg \
+    ///     cargo test -p octo-connector-transcribe live_transcribe -- --ignored --nocapture
+    /// The token store defaults to $HOME/.codex/auth.json (override with ALBERT_AUTH_JSON).
+    #[tokio::test]
+    #[ignore = "hits chatgpt.com; needs a real subscription auth.json + a voice file"]
+    async fn live_transcribe() {
+        use super::{content_type_for, transcribe};
+        use octo_openai_auth::SubscriptionAuth;
+        use std::path::{Path, PathBuf};
+
+        let file = std::env::var("TRANSCRIBE_FILE").expect("set TRANSCRIBE_FILE=/path/to/audio");
+        let auth_path = std::env::var("ALBERT_AUTH_JSON").unwrap_or_else(|_| {
+            format!("{}/.codex/auth.json", std::env::var("HOME").expect("HOME"))
+        });
+
+        let auth = SubscriptionAuth::new(PathBuf::from(auth_path));
+        let sub = auth.fresh().await.expect("a fresh subscription token");
+        let bytes = std::fs::read(&file).expect("read the audio file");
+        let name = Path::new(&file).file_name().and_then(|s| s.to_str()).unwrap_or("audio");
+
+        let text = transcribe(&bytes, name, content_type_for(name), Some("ru"), &sub)
+            .await
+            .expect("the endpoint transcribes the recording");
+        println!("\n=== TRANSCRIPT ({} chars) ===\n{text}\n=== end ===\n", text.len());
+        assert!(!text.trim().is_empty(), "transcript should not be empty");
+    }
 }
