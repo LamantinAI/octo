@@ -19,14 +19,12 @@ reqwest = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
-# str0m — sans-IO WebRTC: we own the UDP socket and the poll loop, so a recording can
-# wait for NACK retransmissions and reorder late packets (recover, not conceal).
+# str0m — sans-IO WebRTC: we own the UDP socket and the poll loop; its depacketizer puts
+# reordered audio back in order before we remux it.
 # default features drop `examples` (which pulls a whole rouille web server); we keep the
 # aws-lc-rs crypto backend — the same one reqwest's rustls-tls already links.
 str0m = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
-# ogg — the Ogg container muxer: we remux the reordered Opus frames straight into Ogg
+# ogg — the Ogg container muxer: we remux the Opus frames straight into Ogg
 # (OpusHead/OpusTags + data pages), no decode/encode.
 ogg = "0.9"
 
-[dev-dependencies]
-tokio-util = { workspace = true }
