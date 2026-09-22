@@ -17,6 +17,7 @@ members = [
     "connectors/search",
     "connectors/transcribe",
     "connectors/speak",
+    "connectors/imagegen",
     "connectors/browser",
     "octo-rig",
     "octo-code",
@@ -37,6 +38,7 @@ default-members = [
     "connectors/storage",
     "connectors/search",
     "connectors/transcribe",
+    "connectors/imagegen",
     "connectors/mail",
     "octo-code",
 ]
