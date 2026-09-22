@@ -18,15 +18,15 @@ use tokio::process::Command;
 
 use crate::{looks_truncated, transcribe, TranscribeError};
 
-/// Chunk length to aim for: well under the endpoint's silent-truncation point.
+/// Default chunk length to aim for: well under the endpoint's silent-truncation point.
 pub const TARGET_SECS: f64 = 300.0;
 /// A proven-safe upper bound for one chunk (23 min worked; 24 min answers 500).
-const HARD_LIMIT_SECS: f64 = 1380.0;
+pub const HARD_LIMIT_SECS: f64 = 1380.0;
 /// `silencedetect` settings: what counts as a pause worth cutting at.
 const SILENCE_NOISE: &str = "-30dB";
 const SILENCE_MIN_SECS: f64 = 0.6;
-/// How many chunks of a long recording are uploaded at once.
-const PARALLEL_UPLOADS: usize = 4;
+/// Default number of chunks uploaded at once.
+pub const PARALLEL_UPLOADS: usize = 4;
 /// Attempts per chunk for a transient failure (network, 5xx).
 const CHUNK_ATTEMPTS: u64 = 3;
 /// Extensions that are (or usually are) video: always split, so only the audio goes up.
@@ -146,16 +146,17 @@ async fn run(cmd: &mut Command) -> Result<std::process::Output, String> {
     Ok(out)
 }
 
-/// Upload the `which` chunks, [`PARALLEL_UPLOADS`] at a time.
+/// Upload the `which` chunks, `parallel` at a time.
 pub(crate) async fn upload_chunks(
     chunks: &[PathBuf],
     which: &[usize],
     language: Option<&str>,
     sub: &Subscription,
+    parallel: usize,
 ) -> Vec<(usize, Result<String, TranscribeError>)> {
     stream::iter(which.iter().copied())
         .map(|i| async move { (i, upload_chunk(&chunks[i], language, sub).await) })
-        .buffer_unordered(PARALLEL_UPLOADS)
+        .buffer_unordered(parallel.max(1))
         .collect()
         .await
 }

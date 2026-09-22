@@ -10,6 +10,9 @@
 //! comes from the shared [`SubscriptionAuth`] handed in at construction — the SAME
 //! refresh-owner the cogitator's LLM path uses.
 //!
+//! Declared by a manifest (`type = "imagegen"`, see [`factory`]) whose `[connector]` table
+//! may set the defaults a call falls back to: `size`, `quality`, `background`.
+//!
 //! This is the request Codex's own `image_gen` tool makes: a plain JSON POST to
 //! `{codex base}/images/generations` (or `/images/edits`, inputs as data URLs) answered with
 //! base64 PNGs — one call, no agent loop in between.
@@ -49,8 +52,12 @@ const USER_AGENT: &str = "Codex Desktop";
 const TIMEOUT: Duration = Duration::from_secs(300);
 /// The edit endpoint takes at most this many input images.
 const MAX_INPUT_IMAGES: usize = 5;
-const QUALITIES: [&str; 4] = ["low", "medium", "high", "auto"];
-const BACKGROUNDS: [&str; 3] = ["transparent", "opaque", "auto"];
+pub(crate) const QUALITIES: [&str; 4] = ["low", "medium", "high", "auto"];
+pub(crate) const BACKGROUNDS: [&str; 3] = ["transparent", "opaque", "auto"];
+
+mod manifest;
+
+pub use crate::manifest::{factory, Defaults};
 
 const CATALOG: &str = "Draw or edit an image with gpt-image-2 on the ChatGPT subscription. Dispatch to this connector's id:
 - imagegen.run { prompt, size?, quality?, background?, images? } -> { path }
@@ -68,6 +75,8 @@ pub struct ImagegenConnector {
     auth: Arc<SubscriptionAuth>,
     /// Explicit workspace root; `None` -> resolved from the environment at use.
     workspace: Option<PathBuf>,
+    /// What a call falls back to when it omits a setting (from the manifest).
+    defaults: Defaults,
 }
 
 impl ImagegenConnector {
@@ -78,10 +87,20 @@ impl ImagegenConnector {
         auth: Arc<SubscriptionAuth>,
         workspace: Option<PathBuf>,
     ) -> Arc<Self> {
+        Self::with_defaults(id, auth, workspace, Defaults::default())
+    }
+
+    /// Like [`new`](Self::new), with the defaults a call falls back to.
+    pub fn with_defaults(
+        id: impl Into<String>,
+        auth: Arc<SubscriptionAuth>,
+        workspace: Option<PathBuf>,
+        defaults: Defaults,
+    ) -> Arc<Self> {
         let capabilities = ConnectorCapabilities::bidirectional()
             .with_accept_kinds([EventKind::from_static(RUN)])
             .with_description(CATALOG);
-        Arc::new(Self { id: ConnectorId::new(id), capabilities, auth, workspace })
+        Arc::new(Self { id: ConnectorId::new(id), capabilities, auth, workspace, defaults })
     }
 
     async fn handle(&self, env: &Envelope, ctx: &ConnectorContext) {
@@ -99,7 +118,7 @@ impl ImagegenConnector {
 
     async fn run(&self, params: &Value) -> Result<Value, String> {
         let root = workspace_root(self.workspace.as_deref()).map_err(|e| e.to_string())?;
-        let request = ImageRequest::from_params(params, |path| {
+        let request = ImageRequest::from_params(params, &self.defaults, |path| {
             read_in_root(&root, path).map_err(|e| e.to_string())
         })?;
         let sub = self.auth.fresh().await.map_err(|e| e.to_string())?;
@@ -161,9 +180,11 @@ struct ImageRequest {
 }
 
 impl ImageRequest {
-    /// Validate the dispatch params; `read` loads a workspace input image by path.
+    /// Validate the dispatch params (falling back to `defaults`); `read` loads a workspace
+    /// input image by path.
     fn from_params(
         params: &Value,
+        defaults: &Defaults,
         read: impl Fn(&str) -> Result<Vec<u8>, String>,
     ) -> Result<Self, String> {
         let prompt = params
@@ -173,10 +194,15 @@ impl ImageRequest {
             .filter(|p| !p.is_empty())
             .ok_or("provide `prompt` (the image spec)")?
             .to_string();
-        let size = optional_str(params, "size").map(validate_size).transpose()?;
-        let quality = optional_str(params, "quality").map(|q| one_of(q, &QUALITIES, "quality")).transpose()?;
-        let background =
-            optional_str(params, "background").map(|b| one_of(b, &BACKGROUNDS, "background")).transpose()?;
+        let size = optional_str(params, "size").map(validate_size).transpose()?.or_else(|| defaults.size.clone());
+        let quality = optional_str(params, "quality")
+            .map(|q| one_of(q, &QUALITIES, "quality"))
+            .transpose()?
+            .or_else(|| defaults.quality.clone());
+        let background = optional_str(params, "background")
+            .map(|b| one_of(b, &BACKGROUNDS, "background"))
+            .transpose()?
+            .or_else(|| defaults.background.clone());
 
         let paths: Vec<&str> = match params.get("images") {
             None | Some(Value::Null) => Vec::new(),
@@ -293,7 +319,7 @@ fn explain_http(code: u16, body: &str) -> String {
 }
 
 /// `"WxH"` with both edges multiples of 16 and a ratio no steeper than 3:1, or `"auto"`.
-fn validate_size(size: &str) -> Result<String, String> {
+pub(crate) fn validate_size(size: &str) -> Result<String, String> {
     if size == "auto" {
         return Ok(size.into());
     }
@@ -306,7 +332,7 @@ fn validate_size(size: &str) -> Result<String, String> {
     Ok(size.into())
 }
 
-fn one_of(value: &str, allowed: &[&str], what: &str) -> Result<String, String> {
+pub(crate) fn one_of(value: &str, allowed: &[&str], what: &str) -> Result<String, String> {
     if allowed.contains(&value) {
         Ok(value.into())
     } else {
@@ -337,7 +363,7 @@ fn snippet(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{first_image, validate_size, ImageRequest};
+    use super::{first_image, validate_size, Defaults, ImageRequest};
     use serde_json::json;
 
     fn no_files(_: &str) -> Result<Vec<u8>, String> {
@@ -356,7 +382,8 @@ mod tests {
 
     #[test]
     fn a_plain_request_is_a_generation() {
-        let r = ImageRequest::from_params(&json!({ "prompt": "a fox", "quality": "low" }), no_files).unwrap();
+        let r = ImageRequest::from_params(&json!({ "prompt": "a fox", "quality": "low" }), &Defaults::default(), no_files)
+            .unwrap();
         assert_eq!(r.route(), "images/generations");
         let body = r.body();
         assert_eq!(body["model"], "gpt-image-2");
@@ -368,6 +395,7 @@ mod tests {
     fn input_images_make_an_edit_with_data_urls() {
         let r = ImageRequest::from_params(
             &json!({ "prompt": "swap the background", "images": ["in/photo.jpg"] }),
+            &Defaults::default(),
             |_| Ok(vec![0xff, 0xd8]),
         )
         .unwrap();
@@ -378,12 +406,14 @@ mod tests {
 
     #[test]
     fn bad_params_are_refused_with_a_reason() {
-        assert!(ImageRequest::from_params(&json!({}), no_files).is_err());
-        assert!(ImageRequest::from_params(&json!({ "prompt": "x", "quality": "ultra" }), no_files).is_err());
-        assert!(ImageRequest::from_params(&json!({ "prompt": "x", "images": "a.png" }), no_files).is_err());
+        let d = Defaults::default();
+        assert!(ImageRequest::from_params(&json!({}), &d, no_files).is_err());
+        assert!(ImageRequest::from_params(&json!({ "prompt": "x", "quality": "ultra" }), &d, no_files).is_err());
+        assert!(ImageRequest::from_params(&json!({ "prompt": "x", "images": "a.png" }), &d, no_files).is_err());
         let six: Vec<String> = (0..6).map(|i| format!("{i}.png")).collect();
-        assert!(ImageRequest::from_params(&json!({ "prompt": "x", "images": six }), |_| Ok(vec![1])).is_err());
+        assert!(ImageRequest::from_params(&json!({ "prompt": "x", "images": six }), &d, |_| Ok(vec![1])).is_err());
     }
+
 
     #[test]
     fn the_first_image_is_decoded() {
@@ -411,7 +441,9 @@ mod tests {
 
         let auth = SubscriptionAuth::new(PathBuf::from(auth_path));
         let sub = auth.fresh().await.expect("a fresh subscription token");
-        let request = ImageRequest::from_params(&json!({ "prompt": prompt, "quality": "low" }), no_files).unwrap();
+        let request =
+            ImageRequest::from_params(&json!({ "prompt": prompt, "quality": "low" }), &Defaults::default(), no_files)
+                .unwrap();
         let png = generate(&request, &sub).await.expect("the endpoint draws the image");
         std::fs::write(&out, &png).expect("write the png");
         println!("\n=== DREW {} bytes -> {out} ===", png.len());
