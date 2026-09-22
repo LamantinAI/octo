@@ -8,6 +8,10 @@
 //! comes from the shared [`SubscriptionAuth`] handed to the connector at construction —
 //! the SAME refresh-owner the cogitator's LLM path uses, so there is one token owner.
 //!
+//! Declared by a manifest (`type = "transcribe"`, see [`factory`]) whose `[connector]`
+//! table may set `language` (the default hint), `chunk_secs` (target chunk length for long
+//! recordings, 60-1380) and `parallel_uploads` (1-8).
+//!
 //! The upload itself, [`transcribe`], is public so an assembly can hear a voice message
 //! inline (without a dispatch round-trip) through the same code path.
 //!
@@ -19,6 +23,9 @@
 //! recording. Without ffmpeg, a file is uploaded whole, as before.
 
 mod chunk;
+mod manifest;
+
+pub use crate::manifest::{factory, Settings};
 
 use crate::chunk::{is_video, merge, upload_chunks, Scratch};
 
@@ -65,6 +72,7 @@ pub struct TranscribeConnector {
     auth: Arc<SubscriptionAuth>,
     /// Explicit workspace root; `None` -> resolved from the environment at use.
     workspace: Option<PathBuf>,
+    settings: Settings,
 }
 
 impl TranscribeConnector {
@@ -75,10 +83,20 @@ impl TranscribeConnector {
         auth: Arc<SubscriptionAuth>,
         workspace: Option<PathBuf>,
     ) -> Arc<Self> {
+        Self::with_settings(id, auth, workspace, Settings::default())
+    }
+
+    /// Like [`new`](Self::new), with manifest settings.
+    pub fn with_settings(
+        id: impl Into<String>,
+        auth: Arc<SubscriptionAuth>,
+        workspace: Option<PathBuf>,
+        settings: Settings,
+    ) -> Arc<Self> {
         let capabilities = ConnectorCapabilities::bidirectional()
             .with_accept_kinds([EventKind::from_static(RUN)])
             .with_description(CATALOG);
-        Arc::new(Self { id: ConnectorId::new(id), capabilities, auth, workspace })
+        Arc::new(Self { id: ConnectorId::new(id), capabilities, auth, workspace, settings })
     }
 
     async fn handle(&self, env: &Envelope, ctx: &ConnectorContext) {
@@ -99,7 +117,7 @@ impl TranscribeConnector {
             .get("path")
             .and_then(Value::as_str)
             .ok_or("provide `path` (a workspace-relative audio/video file)")?;
-        let language = params.get("language").and_then(Value::as_str);
+        let language = params.get("language").and_then(Value::as_str).or(self.settings.language.as_deref());
 
         let root = workspace_root(self.workspace.as_deref()).map_err(|e| e.to_string())?;
         let filename = Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or("audio");
@@ -108,7 +126,7 @@ impl TranscribeConnector {
         // ffmpeg on the host the file goes up whole, as it always did.
         let file = resolve_file_in_root(&root, path).map_err(|e| e.to_string())?;
         match chunk::duration(&file).await {
-            Ok(total) if is_video(filename) || total > chunk::TARGET_SECS * 1.4 => {
+            Ok(total) if is_video(filename) || total > self.settings.chunk_secs * 1.4 => {
                 return self.run_chunked(&file, total, language).await;
             }
             Ok(_) => {}
@@ -137,7 +155,7 @@ impl TranscribeConnector {
     /// retried; any other failure is marked in place.
     async fn run_chunked(&self, file: &Path, total: f64, language: Option<&str>) -> Result<Value, String> {
         let pauses = chunk::pauses(file).await?;
-        let spans = chunk::plan(total, &pauses, chunk::TARGET_SECS);
+        let spans = chunk::plan(total, &pauses, self.settings.chunk_secs);
         let scratch = Scratch::new()?;
         let mut chunks = Vec::with_capacity(spans.len());
         for (i, span) in spans.iter().enumerate() {
@@ -150,7 +168,7 @@ impl TranscribeConnector {
         let mut pending: Vec<usize> = (0..chunks.len()).collect();
         for pass in 0..2 {
             let mut refused = Vec::new();
-            for (i, result) in upload_chunks(&chunks, &pending, language, &sub).await {
+            for (i, result) in upload_chunks(&chunks, &pending, language, &sub, self.settings.parallel_uploads).await {
                 if matches!(result, Err(TranscribeError::Unauthorized(_))) {
                     refused.push(i);
                 }
@@ -338,6 +356,7 @@ fn snippet(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{content_type_for, looks_truncated, multipart_body};
+
 
     #[test]
     fn content_type_is_guessed_from_the_extension() {

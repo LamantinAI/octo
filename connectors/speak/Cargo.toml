@@ -27,6 +27,7 @@ str0m = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 # ogg — the Ogg container muxer: we remux the Opus frames straight into Ogg
 # (OpusHead/OpusTags + data pages), no decode/encode.
 ogg = "0.9"
+toml = { workspace = true }
 
 [dev-dependencies]
 # The live test prints the per-frame trace (RUST_LOG=octo_connector_speak=debug).
