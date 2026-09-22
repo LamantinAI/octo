@@ -1,0 +1,23 @@
+[package]
+name = "octo-connector-transcribe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Transcription connector for the Octo runtime: turns a workspace audio/video file into text via the ChatGPT-subscription dictation endpoint (no API key, no per-minute billing). An env-as-tools organ that shares the runtime's subscription token through octo-openai-auth."
+
+[dependencies]
+octo-core = { path = "../../octo-core" }
+octo-workspace = { path = "../../components/workspace" }
+octo-openai-auth = { path = "../../components/openai-auth" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio-util = { workspace = true }
