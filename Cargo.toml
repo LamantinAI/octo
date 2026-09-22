@@ -16,6 +16,7 @@ members = [
     "connectors/mail",
     "connectors/search",
     "connectors/transcribe",
+    "connectors/speak",
     "connectors/browser",
     "octo-rig",
     "octo-code",

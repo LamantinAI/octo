@@ -1,0 +1,32 @@
+[package]
+name = "octo-connector-speak"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Speech-synthesis connector for the Octo runtime: turns text into a spoken Ogg/Opus voice note via a native WebRTC call to ChatGPT Voice on the subscription (no API key, no per-character billing). An env-as-tools organ that shares the runtime's subscription token through octo-openai-auth."
+
+[dependencies]
+octo-core = { path = "../../octo-core" }
+octo-workspace = { path = "../../components/workspace" }
+octo-openai-auth = { path = "../../components/openai-auth" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+# str0m — sans-IO WebRTC: we own the UDP socket and the poll loop, so a recording can
+# wait for NACK retransmissions and reorder late packets (recover, not conceal).
+# default features drop `examples` (which pulls a whole rouille web server); we keep the
+# aws-lc-rs crypto backend — the same one reqwest's rustls-tls already links.
+str0m = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
+# ogg — the Ogg container muxer: we remux the reordered Opus frames straight into Ogg
+# (OpusHead/OpusTags + data pages), no decode/encode.
+ogg = "0.9"
+
+[dev-dependencies]
+tokio-util = { workspace = true }
