@@ -9,13 +9,14 @@
 //! store and, only when the access token is at/near expiry, refreshes it via the OAuth
 //! token endpoint and writes the new tokens back; the bearer + account id then flow into
 //! the Codex request headers. When the server rejects a token that `exp` still calls valid
-//! (revocation), the caller escalates to [`force_refresh`]. [`SubscriptionAuth`] wraps both
-//! behind a lock, so the refresh stays single-owner when the handle is shared across the
-//! LLM path and the voice connectors.
+//! (revocation), the caller escalates to [`SubscriptionAuth::force_refresh`]. The handle is
+//! the only way in: it serialises every refresh behind a lock, so the refresh stays
+//! single-owner when one `Arc` is shared across the LLM path and the voice connectors.
 
 use std::{
     fs::read_to_string,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -35,13 +36,18 @@ pub struct AuthError(pub String);
 /// Result over [`AuthError`].
 pub type Result<T> = std::result::Result<T, AuthError>;
 
-
-/// The public first-party Codex OAuth client (shared by `codex` and `albert login`).
+/// The public first-party Codex OAuth client (shared by `codex` and any assembly's own
+/// login flow).
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 /// The OAuth token endpoint (code exchange + refresh).
 pub const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 /// Refresh once the access token has this little life left (or is already expired).
 const REFRESH_WINDOW_SECS: i64 = 300;
+/// A forced refresh this recent already answered a revocation: a second caller that hit
+/// the same 401 concurrently reuses it instead of POSTing another refresh.
+const FORCE_DEDUPE: Duration = Duration::from_secs(30);
+/// The sign-in command named in errors unless the assembly supplies its own.
+const DEFAULT_LOGIN_HINT: &str = "codex login";
 
 /// The runtime view a Codex request needs: the OAuth access token (-> the
 /// `Authorization: Bearer` header) and the account id (-> the mandatory
@@ -100,21 +106,21 @@ impl AuthDotJson {
 }
 
 /// Load the subscription material, refreshing the access token first if it is at or
-/// near expiry. Errors — clearly, pointing at `albert login` — when the store is
+/// near expiry. Errors — clearly, pointing at the login command — when the store is
 /// missing/empty or a needed refresh can't be done.
-pub async fn ensure_fresh(path: &Path) -> Result<Subscription> {
+async fn ensure_fresh(path: &Path, login: &str) -> Result<Subscription> {
     let mut auth = AuthDotJson::load(path)?;
 
     if needs_refresh(&auth.tokens.access_token) {
         if auth.tokens.refresh_token.is_empty() {
             return Err(AuthError(format!(
                 "access token in {} is expiring and there is no refresh_token; \
-                 run `albert login` (or `codex login`)",
+                 run `{login}`",
                 path.display()
             )));
         }
         info!("refreshing subscription access token");
-        match refresh(&auth.tokens.refresh_token).await {
+        match refresh(&auth.tokens.refresh_token, login).await {
             Ok(refreshed) => {
                 apply_refresh(&mut auth.tokens, refreshed);
                 auth.last_refresh = Some(now_rfc3339());
@@ -136,19 +142,19 @@ pub async fn ensure_fresh(path: &Path) -> Result<Subscription> {
 /// with `exp` still eight days out), and [`ensure_fresh`] trusts `exp` — so it would
 /// keep serving the revoked token forever. This is the escape hatch for a caller
 /// that has just watched the token bounce off the server. A rejected refresh errors
-/// through [`refresh`], which already points at `albert login`.
-pub async fn force_refresh(path: &Path) -> Result<Subscription> {
+/// through [`refresh`], which already points at the login command.
+async fn force_refresh(path: &Path, login: &str) -> Result<Subscription> {
     let mut auth = AuthDotJson::load(path)?;
     if auth.tokens.refresh_token.is_empty() {
         return Err(AuthError(format!(
             "the server no longer accepts the access token in {} and there is no \
-             refresh_token; run `albert login` (or `codex login`)",
+             refresh_token; run `{login}`",
             path.display()
         )));
     }
     info!("server rejected the access token ahead of its exp; forcing a refresh");
     let rejected = auth.tokens.access_token.clone();
-    let refreshed = refresh(&auth.tokens.refresh_token).await?;
+    let refreshed = refresh(&auth.tokens.refresh_token, login).await?;
     apply_refresh(&mut auth.tokens, refreshed);
     auth.last_refresh = Some(now_rfc3339());
     auth.save(path)?;
@@ -160,41 +166,62 @@ pub async fn force_refresh(path: &Path) -> Result<Subscription> {
     if auth.tokens.access_token == rejected {
         return Err(AuthError(format!(
             "the token endpoint did not reissue the access token for {}; it is still \
-             the one the server rejected — run `albert login` (or `codex login`)",
+             the one the server rejected — run `{login}`",
             path.display()
         )));
     }
     subscription_from(&auth.tokens)
 }
 
-/// A shared, refresh-serialised handle over the subscription token store. Wraps the
-/// stateless [`ensure_fresh`] / [`force_refresh`] with a lock so the refresh is
-/// SINGLE-OWNER: cheap to clone behind an `Arc` and safe to share across the cogitator's
-/// LLM backend and the voice connectors, because two concurrent callers can never both
-/// POST a refresh and invalidate each other's token — the second waits, re-reads the
-/// store the first has just refreshed, and returns it without a second POST.
+/// A shared, refresh-serialised handle over the subscription token store — the one way
+/// in. Every refresh happens under a lock, so it is SINGLE-OWNER: safe to share behind an
+/// `Arc` across the cogitator's LLM backend and the voice connectors, because two
+/// concurrent callers can never both POST a refresh and invalidate each other's token —
+/// the second waits, re-reads the store the first has just refreshed, and returns it
+/// without a second POST. The same holds for two callers that hit one revocation (a 401)
+/// at once: the second reuses the first's forced refresh.
 pub struct SubscriptionAuth {
     path: PathBuf,
-    refresh: Mutex<()>,
+    /// The sign-in command errors point at (e.g. an assembly's own `albert login`).
+    login_hint: String,
+    /// Serialises refreshes; holds when the last forced refresh completed.
+    last_forced: Mutex<Option<Instant>>,
 }
 
 impl SubscriptionAuth {
     /// A handle over the codex-style `auth.json` at `path`.
     pub fn new(path: PathBuf) -> Self {
-        Self { path, refresh: Mutex::new(()) }
+        Self { path, login_hint: DEFAULT_LOGIN_HINT.into(), last_forced: Mutex::new(None) }
+    }
+
+    /// Name the sign-in command errors point at (default: `codex login`).
+    pub fn with_login_hint(mut self, hint: impl Into<String>) -> Self {
+        self.login_hint = hint.into();
+        self
+    }
+
+    /// The token store this handle reads and refreshes.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// A fresh [`Subscription`], refreshing the access token first if it is near expiry.
     pub async fn fresh(&self) -> Result<Subscription> {
-        let _serialise = self.refresh.lock().await;
-        ensure_fresh(&self.path).await
+        let _serialise = self.last_forced.lock().await;
+        ensure_fresh(&self.path, &self.login_hint).await
     }
 
     /// Force a refresh now — the escape hatch for a live 401 the JWT `exp` still calls
-    /// valid (revocation). Serialised the same way, so it can't race a concurrent `fresh`.
+    /// valid (revocation). Serialised the same way, so it can't race a concurrent `fresh`;
+    /// a forced refresh that completed moments ago is reused rather than repeated.
     pub async fn force_refresh(&self) -> Result<Subscription> {
-        let _serialise = self.refresh.lock().await;
-        force_refresh(&self.path).await
+        let mut last_forced = self.last_forced.lock().await;
+        if last_forced.is_some_and(|at| at.elapsed() < FORCE_DEDUPE) {
+            return ensure_fresh(&self.path, &self.login_hint).await;
+        }
+        let sub = force_refresh(&self.path, &self.login_hint).await?;
+        *last_forced = Some(Instant::now());
+        Ok(sub)
     }
 }
 
@@ -235,7 +262,7 @@ fn subscription_from(tokens: &Tokens) -> Result<Subscription> {
 
 /// The refresh-token grant (`grant_type=refresh_token`), sent as JSON — matching the
 /// codex flow. Returns the new tokens; a non-2xx is a hard error pointing at re-login.
-async fn refresh(refresh_token: &str) -> Result<RefreshResponse> {
+async fn refresh(refresh_token: &str, login: &str) -> Result<RefreshResponse> {
     let resp = HttpClient::new()
         .post(TOKEN_URL)
         .json(&json!({
@@ -250,7 +277,7 @@ async fn refresh(refresh_token: &str) -> Result<RefreshResponse> {
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
         return Err(AuthError(format!(
-            "token refresh rejected ({status}): {body}; run `albert login`"
+            "token refresh rejected ({status}): {body}; run `{login}`"
         )));
     }
     from_str(&body).map_err(|e| AuthError(format!("token refresh parse: {e}")))
@@ -312,36 +339,50 @@ fn now_rfc3339() -> String {
     Utc::now().to_rfc3339()
 }
 
-/// Write `bytes` to `path` with `0600` established before any bytes land: create new
-/// files at `0600`, and tighten a pre-existing file to `0600` *before* writing (the
-/// open truncates old content first, so no tokens are ever exposed at a looser mode).
+/// Write `bytes` to `path` atomically at `0600`: into a sibling temp file created at
+/// `0600` (no world-readable window), flushed, then renamed over the store. A crash
+/// mid-write leaves the old store intact — which matters, because a refresh can rotate the
+/// single-use refresh token: a torn write would lose the new one after spending the old.
 #[cfg(unix)]
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::{
-        fs::{set_permissions, OpenOptions},
+        fs::{rename, set_permissions, OpenOptions},
         io::Write,
         os::unix::fs::{OpenOptionsExt, PermissionsExt},
     };
+    let tmp = temp_sibling(path);
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .open(path)?;
-    set_permissions(path, PermissionsExt::from_mode(0o600))?;
-    file.write_all(bytes)
+        .open(&tmp)?;
+    // A stale temp from an earlier crash keeps its old mode; tighten before writing.
+    set_permissions(&tmp, PermissionsExt::from_mode(0o600))?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    rename(&tmp, path)
 }
 
 #[cfg(not(unix))]
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    std::fs::write(path, bytes)
+    let tmp = temp_sibling(path);
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// `auth.json` -> `auth.json.tmp`, in the same directory (so the rename stays atomic).
+fn temp_sibling(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    path.with_file_name(name)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        account_id_from_jwt, apply_refresh, force_refresh, jwt_claims, plan_from_jwt,
-        AuthDotJson, RefreshResponse, SubscriptionAuth, Tokens,
+        account_id_from_jwt, apply_refresh, jwt_claims, plan_from_jwt, AuthDotJson,
+        RefreshResponse, SubscriptionAuth, Tokens,
     };
 
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -427,13 +468,13 @@ mod tests {
 
     /// The force path exists for a live 401 despite an unexpired JWT — so it must
     /// run even when `exp` says the token is fine, and without a refresh_token it
-    /// must point the user at re-login rather than 401-looping.
+    /// must point the user at re-login (the assembly's own command) rather than 401-looping.
     #[tokio::test]
     async fn force_refresh_without_refresh_token_points_at_login() {
         use std::fs::remove_file;
 
         let path =
-            std::env::temp_dir().join(format!("albert_auth_force_{}.json", std::process::id()));
+            std::env::temp_dir().join(format!("octo_auth_force_{}.json", std::process::id()));
         AuthDotJson::new(Tokens {
             id_token: String::new(),
             // exp far in the future: irrelevant to the force path by design.
@@ -445,7 +486,8 @@ mod tests {
         .expect("save");
 
         // No expect_err: Subscription deliberately has no Debug (it holds the token).
-        let err = match force_refresh(&path).await {
+        let auth = SubscriptionAuth::new(path.clone()).with_login_hint("albert login");
+        let err = match auth.force_refresh().await {
             Ok(_) => panic!("no refresh_token must fail"),
             Err(e) => e,
         };
@@ -464,7 +506,7 @@ mod tests {
             os::unix::fs::PermissionsExt,
         };
 
-        let path = std::env::temp_dir().join(format!("albert_auth_test_{}.json", std::process::id()));
+        let path = std::env::temp_dir().join(format!("octo_auth_test_{}.json", std::process::id()));
         write(&path, b"{}").unwrap();
         set_permissions(&path, PermissionsExt::from_mode(0o644)).unwrap();
 
@@ -477,8 +519,10 @@ mod tests {
         store.save(&path).expect("save");
 
         let mode = metadata(&path).unwrap().permissions().mode() & 0o777;
+        let tmp_left = super::temp_sibling(&path).exists();
         let _ = remove_file(&path);
         assert_eq!(mode, 0o600, "auth.json must be 0600, got {mode:o}");
+        assert!(!tmp_left, "the atomic write must not leave its temp file behind");
     }
 
     /// The shared provider delegates to the store and is Send + Sync, so one `Arc` can
@@ -489,7 +533,7 @@ mod tests {
         use std::fs::remove_file;
 
         let path =
-            std::env::temp_dir().join(format!("albert_shared_auth_{}.json", std::process::id()));
+            std::env::temp_dir().join(format!("octo_shared_auth_{}.json", std::process::id()));
         AuthDotJson::new(Tokens {
             id_token: String::new(),
             access_token: jwt(&json!({
@@ -514,11 +558,11 @@ mod tests {
     /// Live check that the refresh request reaches the token endpoint and a bad
     /// token is handled as a clean rejection (not a TLS/connection failure). Uses a
     /// throwaway bogus token, so it never touches a real refresh token. Ignored by
-    /// default: `cargo test --bin albert refresh_rejects -- --ignored --nocapture`.
+    /// default: `cargo test -p octo-openai-auth refresh_rejects -- --ignored --nocapture`.
     #[tokio::test]
     #[ignore = "hits auth.openai.com; run with --ignored"]
     async fn refresh_rejects_bad_token() {
-        let result = super::refresh("definitely-not-a-valid-refresh-token").await;
+        let result = super::refresh("definitely-not-a-valid-refresh-token", "codex login").await;
         println!("refresh(bogus) -> {result:?}");
         assert!(result.is_err(), "a bogus refresh token must be rejected");
         let msg = format!("{:?}", result.unwrap_err());

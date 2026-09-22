@@ -4,8 +4,8 @@
 //!
 //! An env-as-tools organ: dispatch `speak.run { text, voice? }` and get a correlated
 //! `speak.run.result { path }` (or `{ error }`). The `.ogg` is written into the shared
-//! workspace (jailed against `..`/absolute escapes); the channel then sends that file as a
-//! voice note (octo's telegram connector already sends an `audio/ogg` blob via `sendVoice`).
+//! workspace (jailed against `..`/absolute escapes); `chat.send_file { path }` on the
+//! telegram connector then sends it as a voice note (an `.ogg` goes out via `sendVoice`).
 //! The subscription token comes from the shared [`SubscriptionAuth`] handed in at
 //! construction — the SAME refresh-owner the cogitator's LLM path uses.
 //!
@@ -13,15 +13,15 @@
 //! GPT-Live whose session instructions are "read this text verbatim"; the model speaks on
 //! its own as soon as the session starts, so those instructions turn the call into a TTS
 //! engine. We drive the call with [`str0m`] (sans-IO WebRTC): we own the UDP socket and the
-//! poll loop, so — because we RECORD rather than play live — a late or lost packet is not
-//! masked by Opus PLC/FEC; str0m's depacketizing buffer reorders it and, with NACK, waits
-//! for the retransmission (a recording has no playout deadline). We remux the reordered
-//! Opus frames straight into Ogg, no decode/encode. Recovery, not concealment.
+//! poll loop. str0m's depacketizer puts reordered packets back in order; a packet that never
+//! arrives becomes a zero-length Opus frame, which the player conceals (PLC), so the timeline
+//! keeps its length instead of the voice skipping ahead. The Opus frames are remuxed
+//! straight into Ogg — no decode/encode.
 //!
 //! FIRST CUT: one call per `speak.run`, up to ~3000 chars (≈ under two minutes of speech).
 //! Longer text should be split by the caller. Non-trickle ICE with a single host candidate
-//! off the default route — enough on a public-IP host (the deploy); behind NAT a srflx
-//! candidate via STUN is the follow-up.
+//! off the default route — enough on a public-IP host (the deploy); a srflx candidate via
+//! STUN for hosts behind NAT is the follow-up.
 
 use std::{
     io::ErrorKind,
@@ -39,7 +39,7 @@ use octo_core::{
 };
 use octo_openai_auth::{Subscription, SubscriptionAuth};
 use octo_workspace::{workspace_root, write_in_root};
-use reqwest::Client as HttpClient;
+use reqwest::{Client as HttpClient, StatusCode};
 use serde_json::{json, Value};
 use str0m::{
     change::SdpAnswer,
@@ -84,12 +84,18 @@ const SILENCE_FRAME: [u8; 3] = [0xf8, 0xff, 0xfe];
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// Hard ceiling on one recording, in case `turn.done` never lands.
 const TURN_TIMEOUT: Duration = Duration::from_secs(180);
+/// Keep receiving this long after `turn.done`, so the audio tail lands.
+const TAIL_GRACE: Duration = Duration::from_millis(1000);
+/// Audio packets str0m waits for a reordered one before releasing a gap (default 15).
+const REORDER_PACKETS: usize = 25;
+/// Fill at most one second of lost packets; a longer hole is a dead link or a pause.
+const MAX_FILL_FRAMES: u64 = 50;
 
 const CATALOG: &str = "Speak text aloud as a voice note on the ChatGPT subscription. Dispatch to this connector's id:
 - speak.run { text, voice? } -> { path }
   `text` is what to say (up to ~3000 chars per call, about one voice message); `voice` is optional,
   one of cove/juniper/maple/spruce/ember/vale/breeze/arbor/sol (default cove). Returns `path`: a
-  workspace-relative Ogg/Opus file to send as a voice note.";
+  workspace-relative Ogg/Opus file; send it with chat.send_file { path } and it arrives as a voice note.";
 
 /// str0m installs a process-wide crypto provider (for DTLS/SRTP); do it once.
 static CRYPTO: Once = Once::new();
@@ -155,7 +161,16 @@ impl SpeakConnector {
         let sub = self.auth.fresh().await.map_err(|e| e.to_string())?;
 
         info!(chars = text.chars().count(), %voice, "speak: run");
-        let (ogg, transcript) = synthesize(text, voice, &sub).await?;
+        let (ogg, transcript) = match synthesize(text, voice, &sub).await {
+            // The server can revoke a token ahead of its `exp`: refresh once and retry.
+            Err(CallError::Unauthorized(_)) => {
+                warn!("speak: token refused; forcing a refresh and retrying once");
+                let sub = self.auth.force_refresh().await.map_err(|e| e.to_string())?;
+                synthesize(text, voice, &sub).await
+            }
+            other => other,
+        }
+        .map_err(CallError::into_message)?;
 
         let rel = format!("speech-{}.ogg", Utc::now().timestamp_nanos_opt().unwrap_or_default());
         write_in_root(&root, &rel, &ogg).map_err(|e| e.to_string())?;
@@ -208,9 +223,42 @@ fn session_payload(text: &str, voice: &str) -> Value {
     })
 }
 
+/// Why a call failed. `Unauthorized` means the server refused the token — the caller can
+/// force a refresh and retry once (a revocation ahead of the JWT's `exp`).
+#[derive(Debug)]
+enum CallError {
+    Unauthorized(String),
+    Failed(String),
+}
+
+impl CallError {
+    fn into_message(self) -> String {
+        match self {
+            Self::Unauthorized(msg) | Self::Failed(msg) => msg,
+        }
+    }
+}
+
+impl From<String> for CallError {
+    fn from(msg: String) -> Self {
+        Self::Failed(msg)
+    }
+}
+
+impl From<&str> for CallError {
+    fn from(msg: &str) -> Self {
+        Self::Failed(msg.to_string())
+    }
+}
+
 /// POST the SDP offer + the session to the call endpoint on the subscription token,
 /// returning the SDP answer. Ports the desktop client's headers/session verbatim.
-async fn post_call(offer_sdp: &str, text: &str, voice: &str, sub: &Subscription) -> Result<String, String> {
+async fn post_call(
+    offer_sdp: &str,
+    text: &str,
+    voice: &str,
+    sub: &Subscription,
+) -> Result<String, CallError> {
     let body = json!({ "sdp": offer_sdp, "session": session_payload(text, voice) });
     let resp = HttpClient::new()
         .post(CALL_URL)
@@ -233,8 +281,11 @@ async fn post_call(offer_sdp: &str, text: &str, voice: &str, sub: &Subscription)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     let text_body = resp.text().await.unwrap_or_default();
+    if status == StatusCode::UNAUTHORIZED {
+        return Err(CallError::Unauthorized(explain_http(status.as_u16(), &text_body)));
+    }
     if !status.is_success() {
-        return Err(explain_http(status.as_u16(), &text_body));
+        return Err(CallError::Failed(explain_http(status.as_u16(), &text_body)));
     }
     if let Some(pct) = used {
         info!(voice, quota_used_percent = %pct, "speak: call created");
@@ -248,9 +299,9 @@ async fn post_call(offer_sdp: &str, text: &str, voice: &str, sub: &Subscription)
         v.get("sdp")
             .and_then(Value::as_str)
             .map(str::to_string)
-            .ok_or_else(|| format!("no SDP in call response: {}", snippet(&text_body)))
+            .ok_or_else(|| format!("no SDP in call response: {}", snippet(&text_body)).into())
     } else {
-        Err(format!("call response is neither SDP nor JSON: {}", snippet(&text_body)))
+        Err(format!("call response is neither SDP nor JSON: {}", snippet(&text_body)).into())
     }
 }
 
@@ -262,7 +313,7 @@ fn snippet(text: &str) -> String {
 /// Map the endpoint's errors to something the agent can act on.
 fn explain_http(code: u16, body: &str) -> String {
     match code {
-        401 => "401 — the subscription token expired; run `albert login`.".into(),
+        401 => "401 — the subscription token was refused; sign in again.".into(),
         403 if body.contains("Voice session access denied") => format!(
             "403 Voice session access denied — usually an unknown voice; use one of {VOICES:?}"
         ),
@@ -273,21 +324,26 @@ fn explain_http(code: u16, body: &str) -> String {
 
 /// Run one WebRTC call end-to-end: build the offer, POST it, accept the answer, then drive
 /// the sans-IO loop (off the async runtime) collecting Opus frames into Ogg.
-async fn synthesize(text: &str, voice: &str, sub: &Subscription) -> Result<(Vec<u8>, Option<String>), String> {
+async fn synthesize(
+    text: &str,
+    voice: &str,
+    sub: &Subscription,
+) -> Result<(Vec<u8>, Option<String>), CallError> {
     install_crypto();
 
-    // Bind a UDP socket and advertise a routable host candidate (the default-route IP with
-    // the socket's port), so the offer is complete before we POST (non-trickle ICE).
-    let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("bind udp: {e}"))?;
-    let port = socket.local_addr().map_err(|e| e.to_string())?.port();
-    let host = SocketAddr::new(routable_ip()?, port);
+    // Bind to the default-route IP (not 0.0.0.0): the ICE agent only accepts traffic whose
+    // destination is one of our host candidates, so the socket's address must BE the
+    // candidate. The offer carries it before we POST (non-trickle ICE).
+    let socket = UdpSocket::bind(SocketAddr::new(routable_ip()?, 0)).map_err(|e| format!("bind udp: {e}"))?;
+    let local = socket.local_addr().map_err(|e| e.to_string())?;
 
     let mut rtc = RtcConfig::new()
-        // A recording has no playout deadline, so wait generously for reordered/retransmitted
-        // audio packets before giving up on them.
-        .set_reordering_size_audio(300)
+        // A recording has no playout deadline, so hold out a little longer than the default
+        // (15) for reordered audio before releasing a gap; not much longer, or frames stuck
+        // behind a lost packet near the end of the turn would miss the tail window.
+        .set_reordering_size_audio(REORDER_PACKETS)
         .build(Instant::now());
-    let candidate = Candidate::host(host, "udp").map_err(|e| format!("host candidate: {e}"))?;
+    let candidate = Candidate::host(local, "udp").map_err(|e| format!("host candidate: {e}"))?;
     rtc.add_local_candidate(candidate);
 
     // One SendRecv audio m-line (the call wants a "mic") + the oai-events data channel.
@@ -306,20 +362,27 @@ async fn synthesize(text: &str, voice: &str, sub: &Subscription) -> Result<(Vec<
 
     // The poll loop is blocking (a std UdpSocket with a read timeout); keep it off the
     // async runtime.
-    tokio::task::spawn_blocking(move || drive_call(rtc, socket, mid))
+    let recorded = tokio::task::spawn_blocking(move || drive_call(rtc, socket, local, mid))
         .await
-        .map_err(|e| format!("speak task panicked: {e}"))?
+        .map_err(|e| format!("speak task panicked: {e}"))?;
+    Ok(recorded?)
 }
 
-/// The sans-IO loop: pump 20 ms outbound silence, collect inbound Opus frames, and stop on
-/// `turn.done`. Returns the muxed Ogg and the model's own transcript (if it reported one).
-fn drive_call(mut rtc: Rtc, socket: UdpSocket, mid: Mid) -> Result<(Vec<u8>, Option<String>), String> {
+/// The sans-IO loop: pump 20 ms outbound silence once connected, collect inbound Opus
+/// frames, and stop shortly after `turn.done` (so the audio tail lands). Returns the muxed
+/// Ogg and the model's own transcript (if it reported one).
+fn drive_call(
+    mut rtc: Rtc,
+    socket: UdpSocket,
+    local: SocketAddr,
+    mid: Mid,
+) -> Result<(Vec<u8>, Option<String>), String> {
     let opus_pt = opus_pt(&rtc).ok_or("no Opus payload type negotiated")?;
 
-    let mut frames: Vec<Vec<u8>> = Vec::new();
+    let mut rec = Recorder::default();
     let mut transcript: Option<String> = None;
     let mut connected = false;
-    let mut gaps = 0u64;
+    let mut stop_at: Option<Instant> = None;
 
     let start = Instant::now();
     let mut out_ts: u64 = 0;
@@ -334,38 +397,47 @@ fn drive_call(mut rtc: Rtc, socket: UdpSocket, mid: Mid) -> Result<(Vec<u8>, Opt
                 Output::Transmit(t) => {
                     let _ = socket.send_to(&t.contents, t.destination);
                 }
-                Output::Event(ev) => match ev {
-                    Event::IceConnectionStateChange(IceConnectionState::Connected) => connected = true,
-                    Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
-                        return finish(frames, transcript);
+                Output::Event(Event::Connected) => {
+                    // ICE + DTLS are up: media writes are no longer dropped. Start the
+                    // silence clock now, not at `start`, so there is no catch-up burst.
+                    connected = true;
+                    next_silence = Instant::now();
+                }
+                // Before the first connect, str0m may report Disconnected while checks are
+                // still running; only a drop of an established call ends the recording.
+                Output::Event(Event::IceConnectionStateChange(IceConnectionState::Disconnected))
+                    if connected =>
+                {
+                    warn!(frames = rec.frames.len(), "speak: call disconnected before turn.done");
+                    return finish(rec, transcript);
+                }
+                Output::Event(Event::MediaData(m)) => rec.push(m.time.numer(), &m.data),
+                Output::Event(Event::ChannelData(d)) => match parse_oai(&d.data) {
+                    Oai::TurnDone(t) => {
+                        transcript = t;
+                        stop_at.get_or_insert(Instant::now() + TAIL_GRACE);
                     }
-                    Event::MediaData(m) => {
-                        if !m.contiguous {
-                            gaps += 1;
-                        }
-                        frames.push(m.data.to_vec());
-                    }
-                    Event::ChannelData(d) => match parse_oai(&d.data) {
-                        Oai::TurnDone(t) => {
-                            transcript = t;
-                            info!(frames = frames.len(), gaps, "speak: turn.done");
-                            return finish(frames, transcript);
-                        }
-                        Oai::Error(e) => return Err(format!("voice session error: {e}")),
-                        Oai::Other => {}
-                    },
-                    _ => {}
+                    Oai::Error(e) => return Err(format!("voice session error: {e}")),
+                    Oai::Other => {}
                 },
+                Output::Event(_) => {}
             }
         };
 
         let now = Instant::now();
-        if frames.is_empty() && now.duration_since(start) > CONNECT_TIMEOUT {
-            return Err("no audio within 20 s — WebRTC did not connect".into());
+        if stop_at.is_some_and(|at| now >= at) {
+            info!(frames = rec.frames.len(), filled = rec.filled, "speak: turn.done");
+            return finish(rec, transcript);
+        }
+        if rec.frames.is_empty() && now.duration_since(start) > CONNECT_TIMEOUT {
+            return Err(format!(
+                "no audio within {} s — WebRTC did not connect",
+                CONNECT_TIMEOUT.as_secs()
+            ));
         }
         if now.duration_since(start) > TURN_TIMEOUT {
-            warn!(frames = frames.len(), "speak: no turn.done within the ceiling — recording may be cut short");
-            return finish(frames, transcript);
+            warn!(frames = rec.frames.len(), "speak: no turn.done within the ceiling — recording may be cut short");
+            return finish(rec, transcript);
         }
 
         // Feed the "microphone": one 20 ms silence frame per due tick.
@@ -380,38 +452,71 @@ fn drive_call(mut rtc: Rtc, socket: UdpSocket, mid: Mid) -> Result<(Vec<u8>, Opt
             }
         }
 
-        // Wait for socket input, but never past the next silence tick or str0m's own timeout.
-        let wait = timeout
-            .saturating_duration_since(now)
-            .min(next_silence.saturating_duration_since(now))
-            .min(Duration::from_millis(20));
-        if wait.is_zero() {
-            rtc.handle_input(Input::Timeout(Instant::now())).map_err(|e| e.to_string())?;
-            continue;
+        // Always read the socket (ICE can't complete otherwise), waiting until str0m's own
+        // timeout — capped at the next silence tick once connected. The 1 ms floor keeps a
+        // past-due timeout from turning this into a busy spin.
+        let mut wait = timeout.saturating_duration_since(now);
+        if connected {
+            wait = wait.min(next_silence.saturating_duration_since(now));
         }
+        let wait = wait.clamp(Duration::from_millis(1), Duration::from_millis(20));
         socket.set_read_timeout(Some(wait)).map_err(|e| e.to_string())?;
         match socket.recv_from(&mut buf) {
             Ok((n, source)) => {
-                let dest = socket.local_addr().map_err(|e| e.to_string())?;
                 let contents = buf[..n].try_into().map_err(|e| format!("bad datagram: {e}"))?;
-                let recv = Receive { proto: Protocol::Udp, source, destination: dest, contents };
+                let recv = Receive { proto: Protocol::Udp, source, destination: local, contents };
                 rtc.handle_input(Input::Receive(Instant::now(), recv)).map_err(|e| e.to_string())?;
             }
-            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                rtc.handle_input(Input::Timeout(Instant::now())).map_err(|e| e.to_string())?;
-            }
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
             Err(e) => return Err(format!("udp recv: {e}")),
         }
+        // Timers are driven only by Input::Timeout; under a steady packet stream the read
+        // never times out, so feed a due timeout explicitly.
+        if Instant::now() >= timeout {
+            rtc.handle_input(Input::Timeout(Instant::now())).map_err(|e| e.to_string())?;
+        }
+    }
+}
+
+/// The inbound Opus frames, in order. A hole left by a lost packet (str0m negotiates NACK
+/// only for video, so audio loss is not retransmitted) is filled with zero-length frames:
+/// per RFC 6716 §3.2.1 the decoder treats those as lost and conceals them, so the timeline
+/// keeps its length instead of the voice skipping ahead.
+#[derive(Default)]
+struct Recorder {
+    frames: Vec<Vec<u8>>,
+    /// RTP time (48 kHz) the next frame is expected at.
+    next_ts: Option<u64>,
+    /// How many frames were filled in for lost packets.
+    filled: u64,
+}
+
+impl Recorder {
+    fn push(&mut self, ts: u64, frame: &[u8]) {
+        let Some(&toc) = frame.first() else { return };
+        // A code-0 TOC alone is one zero-length frame of this frame's duration.
+        let filler = toc & 0xfc;
+        let step = opus_frame_samples_48k(&[filler]).max(1);
+        if let Some(expected) = self.next_ts {
+            let missing = ts.saturating_sub(expected) / step;
+            // Beyond a second of silence it's a dead link or a pause in the stream, not loss.
+            if missing <= MAX_FILL_FRAMES {
+                self.frames.extend((0..missing).map(|_| vec![filler]));
+                self.filled += missing;
+            }
+        }
+        self.next_ts = Some(ts + opus_frame_samples_48k(frame));
+        self.frames.push(frame.to_vec());
     }
 }
 
 /// Mux the collected Opus frames into an Ogg/Opus container, or fail if the call produced
 /// no audio.
-fn finish(frames: Vec<Vec<u8>>, transcript: Option<String>) -> Result<(Vec<u8>, Option<String>), String> {
-    if frames.is_empty() {
+fn finish(rec: Recorder, transcript: Option<String>) -> Result<(Vec<u8>, Option<String>), String> {
+    if rec.frames.is_empty() {
         return Err("the call produced no audio".into());
     }
-    Ok((build_ogg(&frames)?, transcript))
+    Ok((build_ogg(&rec.frames)?, transcript))
 }
 
 /// The negotiated Opus payload type for outbound writes.
@@ -539,7 +644,8 @@ fn opus_frame_samples_48k(pkt: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_ogg, explain_http, opus_frame_samples_48k, parse_oai, session_payload, Oai, SILENCE_FRAME,
+        build_ogg, explain_http, opus_frame_samples_48k, parse_oai, session_payload, Oai, Recorder,
+        SILENCE_FRAME,
     };
 
     #[test]
@@ -550,6 +656,19 @@ mod tests {
         assert_eq!(opus_frame_samples_48k(&[0x18]), 2880); // config 3 -> SILK NB 60 ms
         assert_eq!(opus_frame_samples_48k(&[0x01]), 960); // config 0 (480), count code 1 -> 2 frames
         assert_eq!(opus_frame_samples_48k(&[]), 0);
+    }
+
+    #[test]
+    fn a_lost_packet_is_filled_with_a_concealable_frame() {
+        let mut rec = Recorder::default();
+        rec.push(0, &SILENCE_FRAME);
+        rec.push(960 * 3, &SILENCE_FRAME); // the frames at 960 and 1920 were lost
+        assert_eq!(rec.frames.len(), 4);
+        assert_eq!(rec.frames[1], vec![0xf8]); // TOC only: a zero-length frame -> PLC
+        assert_eq!(rec.filled, 2);
+        // A hole longer than a second is a pause or a dead link, not loss: left as is.
+        rec.push(960 * 4 + 960 * 100, &SILENCE_FRAME);
+        assert_eq!(rec.frames.len(), 5);
     }
 
     #[test]
@@ -574,7 +693,7 @@ mod tests {
 
     #[test]
     fn http_errors_are_actionable() {
-        assert!(explain_http(401, "").contains("albert login"));
+        assert!(explain_http(401, "").contains("sign in again"));
         assert!(explain_http(403, "Voice session access denied").contains("unknown voice"));
         assert!(explain_http(429, "").contains("usage window"));
     }
@@ -592,7 +711,7 @@ mod tests {
     /// Ignored by default (hits the network, needs a real subscription auth.json, and — for
     /// media to flow — a publicly routable host, so it connects on the deploy but may not
     /// behind NAT):
-    ///   SPEAK_TEXT="Привет" SPEAK_OUT=/tmp/speak.ogg \
+    ///   SPEAK_TEXT="Hello" SPEAK_OUT=/tmp/speak.ogg \
     ///     cargo test -p octo-connector-speak live_speak -- --ignored --nocapture
     /// The token store defaults to $HOME/.codex/auth.json (override with ALBERT_AUTH_JSON).
     #[tokio::test]
@@ -603,7 +722,7 @@ mod tests {
         use std::path::PathBuf;
 
         let text = std::env::var("SPEAK_TEXT")
-            .unwrap_or_else(|_| "Привет! Это Альберт — синтез речи прямо через подписку.".into());
+            .unwrap_or_else(|_| "Hi! This is Albert, speaking straight through the subscription.".into());
         let voice = std::env::var("SPEAK_VOICE").unwrap_or_else(|_| "cove".into());
         let out = std::env::var("SPEAK_OUT").unwrap_or_else(|_| "/tmp/speak.ogg".into());
         let auth_path = std::env::var("ALBERT_AUTH_JSON")

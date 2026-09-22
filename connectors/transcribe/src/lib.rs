@@ -8,6 +8,9 @@
 //! comes from the shared [`SubscriptionAuth`] handed to the connector at construction —
 //! the SAME refresh-owner the cogitator's LLM path uses, so there is one token owner.
 //!
+//! The upload itself, [`transcribe`], is public so an assembly can hear a voice message
+//! inline (without a dispatch round-trip) through the same code path.
+//!
 //! FIRST CUT: a single upload per call. The endpoint accepts ~23 minutes but silently
 //! truncates a long transcript mid-sentence (a warning is logged when the text ends
 //! without terminal punctuation). Chunking a long recording on silence — as the
@@ -15,6 +18,7 @@
 //! ceiling.
 
 use std::{
+    fmt,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -28,7 +32,7 @@ use octo_core::{
 };
 use octo_openai_auth::{Subscription, SubscriptionAuth};
 use octo_workspace::{read_in_root, workspace_root};
-use reqwest::Client as HttpClient;
+use reqwest::{Client as HttpClient, StatusCode};
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
@@ -96,8 +100,18 @@ impl TranscribeConnector {
         let sub = self.auth.fresh().await.map_err(|e| e.to_string())?;
 
         let filename = Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or("audio");
+        let content_type = content_type_for(filename);
         info!(%path, bytes = audio.len(), "transcribe: run");
-        let text = transcribe(&audio, filename, content_type_for(filename), language, &sub).await?;
+        let text = match transcribe(&audio, filename, content_type, language, &sub).await {
+            // The server can revoke a token ahead of its `exp`: refresh once and retry.
+            Err(TranscribeError::Unauthorized(_)) => {
+                warn!("transcribe: token refused; forcing a refresh and retrying once");
+                let sub = self.auth.force_refresh().await.map_err(|e| e.to_string())?;
+                transcribe(&audio, filename, content_type, language, &sub).await
+            }
+            other => other,
+        }
+        .map_err(|e| e.to_string())?;
         Ok(json!({ "text": text }))
     }
 }
@@ -129,9 +143,27 @@ impl Connector for TranscribeConnector {
     }
 }
 
+/// Why a transcription failed. `Unauthorized` means the server refused the token — the
+/// caller can force a refresh and retry once (a revocation ahead of the JWT's `exp`).
+#[derive(Debug)]
+pub enum TranscribeError {
+    Unauthorized(String),
+    Failed(String),
+}
+
+impl fmt::Display for TranscribeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unauthorized(msg) | Self::Failed(msg) => f.write_str(msg),
+        }
+    }
+}
+
+impl std::error::Error for TranscribeError {}
+
 /// Guess a content type from the file extension — the dictation endpoint is lenient, so
 /// this only needs to be plausible.
-fn content_type_for(filename: &str) -> &'static str {
+pub fn content_type_for(filename: &str) -> &'static str {
     let lower = filename.to_ascii_lowercase();
     let ext = |e: &str| lower.ends_with(e);
     if ext(".ogg") || ext(".oga") || ext(".opus") {
@@ -151,13 +183,13 @@ fn content_type_for(filename: &str) -> &'static str {
 
 /// POST the audio to the dictation endpoint on the subscription token, returning the
 /// transcript. `language` is an optional hint (e.g. `"ru"`); omitted, the endpoint detects it.
-async fn transcribe(
+pub async fn transcribe(
     audio: &[u8],
     filename: &str,
     content_type: &str,
     language: Option<&str>,
     sub: &Subscription,
-) -> Result<String, String> {
+) -> Result<String, TranscribeError> {
     let boundary = boundary();
     let body = multipart_body(&boundary, audio, filename, content_type, language);
 
@@ -171,23 +203,30 @@ async fn transcribe(
         .body(body)
         .send()
         .await
-        .map_err(|e| format!("request failed: {e}"))?;
+        .map_err(|e| TranscribeError::Failed(format!("request failed: {e}")))?;
 
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
+    if status == StatusCode::UNAUTHORIZED {
+        return Err(TranscribeError::Unauthorized(format!(
+            "HTTP 401: the subscription token was refused: {}",
+            snippet(&text)
+        )));
+    }
     if !status.is_success() {
         // An over-long upload comes back as a plain 500; say what is most likely.
-        return Err(format!(
+        return Err(TranscribeError::Failed(format!(
             "HTTP {status} (audio too long or the subscription token was refused): {}",
             snippet(&text)
-        ));
+        )));
     }
-    let parsed: Value =
-        serde_json::from_str(&text).map_err(|e| format!("bad response body: {e}: {}", snippet(&text)))?;
+    let parsed: Value = serde_json::from_str(&text).map_err(|e| {
+        TranscribeError::Failed(format!("bad response body: {e}: {}", snippet(&text)))
+    })?;
     let transcript = parsed
         .get("text")
         .and_then(Value::as_str)
-        .ok_or_else(|| format!("no `text` in response: {}", snippet(&text)))?
+        .ok_or_else(|| TranscribeError::Failed(format!("no `text` in response: {}", snippet(&text))))?
         .trim()
         .to_string();
 
