@@ -2495,6 +2495,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "futures",
  "octo-core",
  "octo-openai-auth",
  "octo-workspace",
