@@ -11,11 +11,16 @@
 //! The upload itself, [`transcribe`], is public so an assembly can hear a voice message
 //! inline (without a dispatch round-trip) through the same code path.
 //!
-//! FIRST CUT: a single upload per call. The endpoint accepts ~23 minutes but silently
-//! truncates a long transcript mid-sentence (a warning is logged when the text ends
-//! without terminal punctuation). Chunking a long recording on silence — as the
-//! `transcribe` skill does — is the follow-up; until then this suits clips under the
-//! ceiling.
+//! Any length. A short audio clip goes up whole. A long recording, or any video, is first
+//! cut on its pauses into ~5-minute audio-only chunks (see [`chunk`]; needs ffmpeg on the
+//! host), because the endpoint accepts ~23 minutes but silently truncates a long transcript
+//! mid-sentence. The chunks go up in parallel and come back merged with `[hh:mm:ss]`
+//! timecodes; a chunk that still fails is marked in place rather than failing the whole
+//! recording. Without ffmpeg, a file is uploaded whole, as before.
+
+mod chunk;
+
+use crate::chunk::{is_video, merge, upload_chunks, Scratch};
 
 use std::{
     fmt,
@@ -31,7 +36,7 @@ use octo_core::{
     OctoResult, SubscribeOptions,
 };
 use octo_openai_auth::{Subscription, SubscriptionAuth};
-use octo_workspace::{read_in_root, workspace_root};
+use octo_workspace::{read_in_root, resolve_file_in_root, workspace_root};
 use reqwest::{Client as HttpClient, StatusCode};
 use serde_json::{json, Value};
 use tracing::{info, warn};
@@ -49,8 +54,9 @@ const TIMEOUT: Duration = Duration::from_secs(300);
 const CATALOG: &str = "Transcribe a recording to text on the ChatGPT subscription. Dispatch to this connector's id:
 - transcribe.run { path, language? } -> { text }
   `path` is a workspace-relative audio/video file (e.g. a recording sent to the chat and saved to
-  the inbox); `language` is an optional hint like \"ru\" (omitted -> auto-detected). Best for clips
-  up to ~20 minutes; longer recordings can be truncated.";
+  the inbox); `language` is an optional hint like \"ru\" (omitted -> auto-detected). Any length: a
+  long recording or a video is split on its pauses and the text comes back with [hh:mm:ss]
+  timecodes per chunk (plus `chunks`, `failed`, `truncated_chunks`). Runs ~15-30x real time.";
 
 pub struct TranscribeConnector {
     id: ConnectorId,
@@ -96,10 +102,21 @@ impl TranscribeConnector {
         let language = params.get("language").and_then(Value::as_str);
 
         let root = workspace_root(self.workspace.as_deref()).map_err(|e| e.to_string())?;
+        let filename = Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or("audio");
+
+        // Measure first: a long recording or a video is split on its pauses. Without
+        // ffmpeg on the host the file goes up whole, as it always did.
+        let file = resolve_file_in_root(&root, path).map_err(|e| e.to_string())?;
+        match chunk::duration(&file).await {
+            Ok(total) if is_video(filename) || total > chunk::TARGET_SECS * 1.4 => {
+                return self.run_chunked(&file, total, language).await;
+            }
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "transcribe: cannot measure the recording; uploading it whole"),
+        }
+
         let audio = read_in_root(&root, path).map_err(|e| e.to_string())?;
         let sub = self.auth.fresh().await.map_err(|e| e.to_string())?;
-
-        let filename = Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or("audio");
         let content_type = content_type_for(filename);
         info!(%path, bytes = audio.len(), "transcribe: run");
         let text = match transcribe(&audio, filename, content_type, language, &sub).await {
@@ -114,7 +131,43 @@ impl TranscribeConnector {
         .map_err(|e| e.to_string())?;
         Ok(json!({ "text": text }))
     }
+
+    /// Cut the recording on its pauses, upload the chunks in parallel, and merge the text
+    /// with a timecode per chunk. A refused token is refreshed once and the refused chunks
+    /// retried; any other failure is marked in place.
+    async fn run_chunked(&self, file: &Path, total: f64, language: Option<&str>) -> Result<Value, String> {
+        let pauses = chunk::pauses(file).await?;
+        let spans = chunk::plan(total, &pauses, chunk::TARGET_SECS);
+        let scratch = Scratch::new()?;
+        let mut chunks = Vec::with_capacity(spans.len());
+        for (i, span) in spans.iter().enumerate() {
+            chunks.push(chunk::cut(file, *span, scratch.path(), i).await?);
+        }
+        info!(secs = total as u64, pauses = pauses.len(), chunks = chunks.len(), "transcribe: split on pauses");
+
+        let mut sub = self.auth.fresh().await.map_err(|e| e.to_string())?;
+        let mut texts: Vec<Option<Result<String, TranscribeError>>> = chunks.iter().map(|_| None).collect();
+        let mut pending: Vec<usize> = (0..chunks.len()).collect();
+        for pass in 0..2 {
+            let mut refused = Vec::new();
+            for (i, result) in upload_chunks(&chunks, &pending, language, &sub).await {
+                if matches!(result, Err(TranscribeError::Unauthorized(_))) {
+                    refused.push(i);
+                }
+                texts[i] = Some(result);
+            }
+            if refused.is_empty() || pass == 1 {
+                break;
+            }
+            // The server can revoke a token ahead of its `exp`: refresh once and retry.
+            warn!(chunks = refused.len(), "transcribe: token refused; forcing a refresh and retrying");
+            sub = self.auth.force_refresh().await.map_err(|e| e.to_string())?;
+            pending = refused;
+        }
+        merge(&spans, texts, total)
+    }
 }
+
 
 #[async_trait]
 impl Connector for TranscribeConnector {
@@ -313,6 +366,38 @@ mod tests {
         assert!(s.trim_end().ends_with("--B--"));
         // The raw audio bytes are present between the header and the closing boundary.
         assert!(body.windows(2).any(|w| w == b"\x00\x01"));
+    }
+
+    /// LIVE: the full `transcribe.run` path on a long recording — measured, split on its
+    /// pauses, uploaded in parallel, merged with timecodes. Ignored by default:
+    ///   TRANSCRIBE_LONG=/path/to/long.ogg \
+    ///     cargo test -p octo-connector-transcribe live_transcribe_long -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "hits chatgpt.com; needs ffmpeg, a real subscription auth.json and a long recording"]
+    async fn live_transcribe_long() {
+        use super::TranscribeConnector;
+        use octo_openai_auth::SubscriptionAuth;
+        use serde_json::json;
+        use std::{path::PathBuf, sync::Arc};
+
+        let file = PathBuf::from(std::env::var("TRANSCRIBE_LONG").expect("set TRANSCRIBE_LONG"));
+        let auth_path = std::env::var("ALBERT_AUTH_JSON").unwrap_or_else(|_| {
+            format!("{}/.codex/auth.json", std::env::var("HOME").expect("HOME"))
+        });
+        let auth = Arc::new(SubscriptionAuth::new(PathBuf::from(auth_path)));
+        let root = file.parent().expect("a parent dir").to_path_buf();
+        let name = file.file_name().and_then(|s| s.to_str()).expect("a file name");
+
+        let connector = TranscribeConnector::new("transcribe", auth, Some(root));
+        let started = std::time::Instant::now();
+        let out = connector.run(&json!({ "path": name, "language": "ru" })).await.expect("transcribed");
+        let text = out["text"].as_str().unwrap_or_default();
+        println!(
+            "\n=== {} chunks, failed {}, truncated {}, {:.0}s wall ===\n{text}\n=== end ===",
+            out["chunks"], out["failed"], out["truncated_chunks"], started.elapsed().as_secs_f64()
+        );
+        assert!(out["chunks"].as_u64().unwrap_or(1) > 1, "a long recording should be split");
+        assert_eq!(out["failed"], 0);
     }
 
     /// LIVE: transcribe a real recording against the subscription dictation endpoint.
