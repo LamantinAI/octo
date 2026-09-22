@@ -2278,6 +2278,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "octo-openai-auth"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "chrono",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "octo-rig"
 version = "0.1.0"
 dependencies = [

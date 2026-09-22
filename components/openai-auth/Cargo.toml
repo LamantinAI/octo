@@ -1,0 +1,19 @@
+[package]
+name = "octo-openai-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "ChatGPT-subscription credential component for Octo: a codex-compatible auth.json token store with in-place refresh and a shared, refresh-serialised SubscriptionAuth handle. Provider-specific (OpenAI/Codex) and outside octo-core so the runtime stays generic; connectors and assemblies that speak the ChatGPT subscription build on it."
+
+[dependencies]
+base64 = { workspace = true }
+chrono = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
