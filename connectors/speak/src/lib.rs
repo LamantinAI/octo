@@ -48,7 +48,7 @@ use str0m::{
     net::{Protocol, Receive},
     Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig,
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 /// Command kind this connector accepts.
@@ -90,6 +90,9 @@ const TAIL_GRACE: Duration = Duration::from_millis(1000);
 const REORDER_PACKETS: usize = 25;
 /// Fill at most one second of lost packets; a longer hole is a dead link or a pause.
 const MAX_FILL_FRAMES: u64 = 50;
+/// A second RTP packet this far (or further) BEHIND the first is a sequence restart, not a
+/// reorder — see [`drive_call`]'s primer handling.
+const RESTART_MIN_BACKSTEP: u16 = 100;
 
 const CATALOG: &str = "Speak text aloud as a voice note on the ChatGPT subscription. Dispatch to this connector's id:
 - speak.run { text, voice? } -> { path }
@@ -380,6 +383,7 @@ fn drive_call(
     let opus_pt = opus_pt(&rtc).ok_or("no Opus payload type negotiated")?;
 
     let mut rec = Recorder::default();
+    let mut net = NetStats::default();
     let mut transcript: Option<String> = None;
     let mut connected = false;
     let mut stop_at: Option<Instant> = None;
@@ -388,6 +392,16 @@ fn drive_call(
     let mut out_ts: u64 = 0;
     let mut next_silence = start;
     let mut buf = vec![0u8; 2000];
+    // The peer opens the audio with a lone "primer" packet (3 bytes of silence), then
+    // restarts the stream on the SAME SSRC with a fresh sequence number. When the restart
+    // lands numerically behind the primer, str0m's receive register reads every real packet
+    // as an old duplicate and drops the whole utterance. So the first RTP packet is held
+    // until the second shows which way the sequence went, and a primer the peer abandoned
+    // never reaches str0m. (RTP headers are not encrypted under SRTP, so this is readable
+    // before str0m.) A forward restart is left alone: str0m accepts it, and dropping the
+    // primer there would desync the SRTP rollover counter.
+    let mut primer: Option<(u16, Vec<u8>, SocketAddr)> = None;
+    let mut rtp_started = false;
 
     loop {
         // Drain poll_output fully after every input; the loop ends when it yields a Timeout.
@@ -411,7 +425,25 @@ fn drive_call(
                     warn!(frames = rec.frames.len(), "speak: call disconnected before turn.done");
                     return finish(rec, transcript);
                 }
-                Output::Event(Event::MediaData(m)) => rec.push(m.time.numer(), &m.data),
+                Output::Event(Event::MediaData(m)) => {
+                    let (first, last) = (**m.seq_range.start(), **m.seq_range.end());
+                    debug!(
+                        at_ms = start.elapsed().as_millis() as u64,
+                        seq = first,
+                        ts = m.time.numer(),
+                        bytes = m.data.len(),
+                        contiguous = m.contiguous,
+                        "speak: frame"
+                    );
+                    // A jump past a second of packets is the peer restarting its sequence
+                    // (see the primer handling), not loss.
+                    let skipped = rec.last_seq.map_or(0, |prev| first.saturating_sub(prev + 1));
+                    if skipped <= MAX_FILL_FRAMES {
+                        rec.seq_lost += skipped;
+                    }
+                    rec.last_seq = Some(last);
+                    rec.push(m.time.numer(), &m.data);
+                }
                 Output::Event(Event::ChannelData(d)) => match parse_oai(&d.data) {
                     Oai::TurnDone(t) => {
                         transcript = t;
@@ -426,7 +458,13 @@ fn drive_call(
 
         let now = Instant::now();
         if stop_at.is_some_and(|at| now >= at) {
-            info!(frames = rec.frames.len(), filled = rec.filled, "speak: turn.done");
+            info!(
+                frames = rec.frames.len(),
+                filled = rec.filled,
+                seq_lost = rec.seq_lost,
+                "speak: turn.done"
+            );
+            info!(?net, "speak: network");
             return finish(rec, transcript);
         }
         if rec.frames.is_empty() && now.duration_since(start) > CONNECT_TIMEOUT {
@@ -445,7 +483,15 @@ fn drive_call(
             while next_silence <= now {
                 if let Some(writer) = rtc.writer(mid) {
                     let rtp = MediaTime::new(out_ts, Frequency::FORTY_EIGHT_KHZ);
-                    let _ = writer.write(opus_pt, now, rtp, SILENCE_FRAME.to_vec());
+                    match writer.write(opus_pt, now, rtp, SILENCE_FRAME.to_vec()) {
+                        Ok(()) => net.mic_sent += 1,
+                        Err(e) => {
+                            if net.mic_failed == 0 {
+                                warn!(error = %e, "speak: writing the outbound silence failed");
+                            }
+                            net.mic_failed += 1;
+                        }
+                    }
                 }
                 out_ts += SAMPLES_PER_FRAME;
                 next_silence += Duration::from_millis(20);
@@ -463,9 +509,23 @@ fn drive_call(
         socket.set_read_timeout(Some(wait)).map_err(|e| e.to_string())?;
         match socket.recv_from(&mut buf) {
             Ok((n, source)) => {
-                let contents = buf[..n].try_into().map_err(|e| format!("bad datagram: {e}"))?;
-                let recv = Receive { proto: Protocol::Udp, source, destination: local, contents };
-                rtc.handle_input(Input::Receive(Instant::now(), recv)).map_err(|e| e.to_string())?;
+                let datagram = &buf[..n];
+                net.count(datagram, source);
+                match rtp_seq(datagram) {
+                    Some(seq) if !rtp_started => match primer.take() {
+                        None => primer = Some((seq, datagram.to_vec(), source)),
+                        Some((held_seq, held, held_source)) => {
+                            rtp_started = true;
+                            if (RESTART_MIN_BACKSTEP..0x8000).contains(&held_seq.wrapping_sub(seq)) {
+                                debug!(held_seq, seq, "speak: dropping the stream primer; the peer restarted its sequence");
+                            } else {
+                                feed(&mut rtc, &held, held_source, local)?;
+                            }
+                            feed(&mut rtc, datagram, source, local)?;
+                        }
+                    },
+                    _ => feed(&mut rtc, datagram, source, local)?,
+                }
             }
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
             Err(e) => return Err(format!("udp recv: {e}")),
@@ -475,6 +535,40 @@ fn drive_call(
         if Instant::now() >= timeout {
             rtc.handle_input(Input::Timeout(Instant::now())).map_err(|e| e.to_string())?;
         }
+    }
+}
+
+/// Datagram counters by kind (RFC 7983 first-byte demux) and source, plus the outbound
+/// "microphone" writes — enough to tell "the network lost it" from "str0m dropped it".
+#[derive(Default, Debug)]
+struct NetStats {
+    stun: u64,
+    dtls: u64,
+    rtp: u64,
+    other: u64,
+    sources: std::collections::BTreeMap<SocketAddr, u64>,
+    rtp_by_ssrc_pt: std::collections::BTreeMap<(u32, u8), u64>,
+    mic_sent: u64,
+    mic_failed: u64,
+}
+
+impl NetStats {
+    fn count(&mut self, datagram: &[u8], source: SocketAddr) {
+        match datagram.first() {
+            Some(0..=3) => self.stun += 1,
+            Some(20..=63) => self.dtls += 1,
+            Some(128..=191) => {
+                self.rtp += 1;
+                // Tally RTP (not RTCP) by SSRC/PT: which streams the peer actually sends on.
+                if let (Some(_), Some(ssrc)) = (rtp_seq(datagram), datagram.get(8..12)) {
+                    let pt = datagram[1] & 0x7f;
+                    let ssrc = u32::from_be_bytes([ssrc[0], ssrc[1], ssrc[2], ssrc[3]]);
+                    *self.rtp_by_ssrc_pt.entry((ssrc, pt)).or_default() += 1;
+                }
+            }
+            _ => self.other += 1,
+        }
+        *self.sources.entry(source).or_default() += 1;
     }
 }
 
@@ -489,6 +583,10 @@ struct Recorder {
     next_ts: Option<u64>,
     /// How many frames were filled in for lost packets.
     filled: u64,
+    /// Last RTP sequence number seen, and how many numbers were skipped over — the
+    /// network-side loss count, to cross-check `filled` against.
+    last_seq: Option<u64>,
+    seq_lost: u64,
 }
 
 impl Recorder {
@@ -508,6 +606,23 @@ impl Recorder {
         self.next_ts = Some(ts + opus_frame_samples_48k(frame));
         self.frames.push(frame.to_vec());
     }
+}
+
+/// Hand one received datagram to str0m.
+fn feed(rtc: &mut Rtc, datagram: &[u8], source: SocketAddr, local: SocketAddr) -> Result<(), String> {
+    let contents = datagram.try_into().map_err(|e| format!("bad datagram: {e}"))?;
+    let recv = Receive { proto: Protocol::Udp, source, destination: local, contents };
+    rtc.handle_input(Input::Receive(Instant::now(), recv)).map_err(|e| e.to_string())
+}
+
+/// The sequence number of an RTP packet, or `None` for anything else — STUN, DTLS, and
+/// RTCP (whose second byte, marker bit included, falls in 192..=223; RFC 5761 §4).
+fn rtp_seq(datagram: &[u8]) -> Option<u16> {
+    let (&first, &second) = (datagram.first()?, datagram.get(1)?);
+    if !(128..=191).contains(&first) || (192..=223).contains(&second) {
+        return None;
+    }
+    Some(u16::from_be_bytes([*datagram.get(2)?, *datagram.get(3)?]))
 }
 
 /// Mux the collected Opus frames into an Ogg/Opus container, or fail if the call produced
@@ -644,8 +759,8 @@ fn opus_frame_samples_48k(pkt: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_ogg, explain_http, opus_frame_samples_48k, parse_oai, session_payload, Oai, Recorder,
-        SILENCE_FRAME,
+        build_ogg, explain_http, opus_frame_samples_48k, parse_oai, rtp_seq, session_payload, Oai,
+        Recorder, SILENCE_FRAME,
     };
 
     #[test]
@@ -669,6 +784,15 @@ mod tests {
         // A hole longer than a second is a pause or a dead link, not loss: left as is.
         rec.push(960 * 4 + 960 * 100, &SILENCE_FRAME);
         assert_eq!(rec.frames.len(), 5);
+    }
+
+    #[test]
+    fn rtp_is_told_apart_from_rtcp_stun_and_dtls() {
+        let rtp = [0x80, 0x6f, 0x1c, 0x68, 0, 0, 0, 0, 0, 0, 0, 1]; // PT 111, seq 7272
+        assert_eq!(rtp_seq(&rtp), Some(7272));
+        assert_eq!(rtp_seq(&[0x81, 0xc9, 0, 7]), None); // RTCP receiver report (PT 201)
+        assert_eq!(rtp_seq(&[0x00, 0x01, 0, 0]), None); // STUN
+        assert_eq!(rtp_seq(&[0x16, 0xfe, 0xfd, 0]), None); // DTLS
     }
 
     #[test]
@@ -720,6 +844,10 @@ mod tests {
         use super::synthesize;
         use octo_openai_auth::SubscriptionAuth;
         use std::path::PathBuf;
+        use tracing_subscriber::{fmt, EnvFilter};
+
+        // RUST_LOG=octo_connector_speak=debug shows every received frame.
+        let _ = fmt().with_env_filter(EnvFilter::from_default_env()).with_test_writer().try_init();
 
         let text = std::env::var("SPEAK_TEXT")
             .unwrap_or_else(|_| "Hi! This is Albert, speaking straight through the subscription.".into());

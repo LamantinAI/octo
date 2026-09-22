@@ -28,3 +28,6 @@ str0m = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 # (OpusHead/OpusTags + data pages), no decode/encode.
 ogg = "0.9"
 
+[dev-dependencies]
+# The live test prints the per-frame trace (RUST_LOG=octo_connector_speak=debug).
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
