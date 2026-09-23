@@ -451,9 +451,10 @@ impl Connector for TelegramConnector {
                                         // should survive so it can be kept, forwarded, or
                                         // moved to storage. Save failure doesn't stop the
                                         // transcription turn.
-                                        let _ = self
+                                        let path = self
                                             .save_incoming(&inbox_name(&audio.filename), &bytes)
-                                            .map_err(|e| tracing::warn!(error = %e, "failed to save incoming voice"));
+                                            .map_err(|e| tracing::warn!(error = %e, "failed to save incoming voice"))
+                                            .ok();
                                         let blob = Blob::new(bytes, audio.mime)
                                             .with_filename(audio.filename);
                                         publish_flush(&self.id, &ctx, Flush {
@@ -463,6 +464,7 @@ impl Connector for TelegramConnector {
                                                 blob,
                                                 caption: with_reply(&reply, msg.caption().map(str::to_string)),
                                                 duration_secs: Some(audio.duration_secs),
+                                                path,
                                             },
                                         }).await;
                                     }
@@ -774,14 +776,17 @@ async fn publish_flush(id: &ConnectorId, ctx: &ConnectorContext, flush: Flush) {
         Emit::Image { blob, caption } => {
             chat_envelope(id, &chat, blob, caption.as_deref(), trust)
         }
-        Emit::Audio { blob, caption, duration_secs } => {
-            let env = chat_envelope(id, &chat, blob, caption.as_deref(), trust);
-            // Length is metadata, not content: it lets a cogitator decide whether
-            // to transcribe inline before it downloads a word of the transcript.
-            match duration_secs {
-                Some(secs) => env.with_tag("duration_secs", secs.to_string()),
-                None => env,
+        Emit::Audio { blob, caption, duration_secs, path } => {
+            let mut env = chat_envelope(id, &chat, blob, caption.as_deref(), trust);
+            // Length is metadata, not content; the workspace path lets a cogitator hand
+            // the recording to a tool (the transcribe organ) by reference.
+            if let Some(secs) = duration_secs {
+                env = env.with_tag("duration_secs", secs.to_string());
             }
+            if let Some(path) = path {
+                env = env.with_tag("workspace_path", path);
+            }
+            env
         }
         Emit::Multipart(msg) => chat_envelope(id, &chat, msg, None, trust),
     };
