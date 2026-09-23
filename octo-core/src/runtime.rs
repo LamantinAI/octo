@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     bus::{EventBus, Filter, InProcessBus, Subscription},
-    config::{self, ConfigError, ConnectorFactory},
+    config::{self, ConfigError, ConnectorFactory, Reloader},
     control, Cogitator, CogitatorContext, Connector, ConnectorContext, ConnectorInfo,
     EmptyCogitator, OctoResult, PayloadRegistry, RestartPolicy, Router, RouterContext,
     SubscribeOptions,
@@ -36,6 +36,8 @@ pub struct Octo {
     cogitator: Arc<dyn Cogitator>,
     router: Option<Arc<dyn Router>>,
     connectors: Vec<Arc<dyn Connector>>,
+    /// Manifest-declared connectors, by id: how to rebuild each from its file.
+    reloaders: HashMap<String, Reloader>,
     shutdown: CancellationToken,
 }
 
@@ -189,7 +191,8 @@ impl Octo {
                 .get(conn.id().as_str())
                 .cloned()
                 .unwrap_or_else(|| Arc::new(Notify::new()));
-            conn_handles.push(tokio::spawn(supervise(conn, shutdown, bus, restart)));
+            let reload = self.reloaders.get(conn.id().as_str()).cloned();
+            conn_handles.push(tokio::spawn(supervise(conn, shutdown, bus, restart, reload)));
         }
 
         // 4) Wait for connectors. They drive the lifecycle.
@@ -228,6 +231,8 @@ pub struct OctoBuilder {
     shutdown: Option<CancellationToken>,
     payload_registry: Option<Arc<PayloadRegistry>>,
     factories: HashMap<String, Arc<dyn ConnectorFactory>>,
+    /// How to rebuild each manifest-declared connector from its file, by id.
+    reloaders: HashMap<String, Reloader>,
 }
 
 impl OctoBuilder {
@@ -240,6 +245,7 @@ impl OctoBuilder {
             shutdown: None,
             payload_registry: None,
             factories: HashMap::new(),
+            reloaders: HashMap::new(),
         }
     }
 
@@ -300,6 +306,7 @@ impl OctoBuilder {
         }
 
         self.connectors.extend(loaded.connectors);
+        self.reloaders.extend(loaded.reloaders);
         Ok(self)
     }
 
@@ -362,6 +369,7 @@ impl OctoBuilder {
                 .unwrap_or_else(|| EmptyCogitator::new("empty")),
             router: self.router,
             connectors: self.connectors,
+            reloaders: self.reloaders,
             shutdown: self.shutdown.unwrap_or_else(CancellationToken::new),
         }
     }
@@ -380,14 +388,20 @@ impl Default for OctoBuilder {
 ///
 /// A clean `Ok(())` exit (e.g. on global shutdown) ends supervision. Global
 /// shutdown also ends it — no restart while the runtime is winding down.
+///
+/// A connector declared by a manifest (`reload` is `Some`) is rebuilt from that file on a
+/// control restart, so an edited manifest takes effect; a manifest that no longer loads
+/// is logged and the previous instance restarts instead. A failure restart keeps the
+/// instance as it is.
 async fn supervise(
-    conn: Arc<dyn Connector>,
+    mut conn: Arc<dyn Connector>,
     shutdown: CancellationToken,
     bus: Arc<InProcessBus>,
     restart: Arc<Notify>,
+    reload: Option<Reloader>,
 ) {
     let id = conn.id().clone();
-    let policy = conn.restart_policy();
+    let mut policy = conn.restart_policy();
     let mut attempt: u32 = 0;
 
     loop {
@@ -429,6 +443,20 @@ async fn supervise(
                     return;
                 }
                 attempt = 0; // not a failure — reset the backoff counter.
+                if let Some(reload) = &reload {
+                    match reload() {
+                        Ok(fresh) => {
+                            tracing::info!(connector = %id, "reloaded from its manifest");
+                            conn = fresh;
+                            policy = conn.restart_policy();
+                        }
+                        Err(e) => tracing::error!(
+                            connector = %id,
+                            error = %e,
+                            "manifest reload failed; restarting with the previous config"
+                        ),
+                    }
+                }
             }
         }
     }
