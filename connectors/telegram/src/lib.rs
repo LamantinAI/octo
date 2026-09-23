@@ -28,6 +28,7 @@
 mod acl;
 mod api;
 mod batch;
+mod commands;
 mod format;
 mod fs;
 mod live;
@@ -52,6 +53,7 @@ use teloxide::update_listeners::{polling_default, AsUpdateStream};
 
 use crate::api::{is_unsupported, send_rich_markdown};
 use crate::batch::{Batcher, Emit, Flush};
+use crate::commands::{set_commands, SET_COMMANDS};
 
 pub use acl::{Acl, AclEntry, Role};
 
@@ -183,6 +185,7 @@ impl TelegramConnector {
                 EventKind::from_static(ALLOW_CHAT),
                 EventKind::from_static(REMOVE_CHAT),
                 EventKind::from_static(LIST_CHATS),
+                EventKind::from_static(SET_COMMANDS),
             ])
             .with_description(CATALOG);
         Arc::new(Self {
@@ -234,6 +237,18 @@ impl Connector for TelegramConnector {
                             // an outbound message to send.
                             if matches!(env.kind.as_str(), ALLOW_CHAT | REMOVE_CHAT | LIST_CHATS) {
                                 handle_control(&out_acl, &out_id, &env, &out_ctx).await;
+                                continue;
+                            }
+                            // The bot's command menu (set by the assembly at startup).
+                            if env.kind.as_str() == SET_COMMANDS {
+                                let owners = owner_chats(&out_acl);
+                                let payload = env.payload_as::<Value>().cloned().unwrap_or(Value::Null);
+                                let result = set_commands(&out_bot, &owners, &payload).await;
+                                let resp = Envelope::new(out_id.clone(), EventKind::new(format!("{SET_COMMANDS}.result")), result)
+                                    .with_correlation(env.id);
+                                if let Err(e) = out_ctx.publish(resp).await {
+                                    tracing::warn!(error = %e, "telegram: failed to publish set_commands result");
+                                }
                                 continue;
                             }
                             // Send a file from the shared workspace (by reference).
@@ -1055,6 +1070,15 @@ async fn handle_control(
     if let Err(e) = ctx.publish(resp).await {
         tracing::warn!(error = %e, "telegram: failed to publish control result");
     }
+}
+
+/// The chats the ACL marks as owners (none without an ACL).
+fn owner_chats(acl: &Option<Arc<AclState>>) -> Vec<i64> {
+    acl.as_ref()
+        .map(|state| {
+            state.acl.read().unwrap().entries().into_iter().filter(|e| e.role == Role::Owner).map(|e| e.chat_id).collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Persist the ACL to its file if one is configured, logging (not failing) on error.
