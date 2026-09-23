@@ -73,6 +73,9 @@ pub enum ConfigError {
     #[error("connector file {path} has no [connector] section with id and type")]
     MissingConnectorHeader { path: PathBuf },
 
+    #[error("connector file {path}: its id changed from '{was}' to '{now}'; a reload keeps the id")]
+    ReloadChangedId { path: PathBuf, was: String, now: String },
+
     #[error("connector file {path}: unknown connector type '{type_name}'; registered types: {known}")]
     UnknownConnectorType {
         path: PathBuf,
@@ -147,7 +150,13 @@ pub(crate) struct LoadedConfig {
     pub bus_capacity: Option<usize>,
     pub connectors: Vec<Arc<dyn Connector>>,
     pub router: Option<Arc<dyn Router>>,
+    /// How to build each manifest-declared connector afresh, by id.
+    pub reloaders: HashMap<String, Reloader>,
 }
+
+/// Re-creates a manifest-declared connector from its file with its factory — what a
+/// control restart calls, so an edited manifest takes effect on `restart_connector`.
+pub(crate) type Reloader = Arc<dyn Fn() -> Result<Arc<dyn Connector>, ConfigError> + Send + Sync>;
 
 /// Build a [`RuleBasedRouter`] from a `[router]` section, if it declares any
 /// routes. Returns `None` for an absent or empty table.
@@ -187,6 +196,8 @@ pub(crate) fn load_config(
 
     let mut seen: HashSet<String> = existing_ids.clone();
     let mut connectors = Vec::new();
+    let mut reloaders: HashMap<String, Reloader> = HashMap::new();
+    let shared = Arc::new(factories.clone());
 
     for file in files {
         // A single malformed manifest must NOT take down the whole runtime: log it
@@ -195,7 +206,12 @@ pub(crate) fn load_config(
         // one bad connector config should degrade to that connector's absence, not an
         // outage of everything.)
         match instantiate(&file, factories, &mut seen) {
-            Ok(connector) => connectors.push(connector),
+            Ok(connector) => {
+                let id = connector.id().as_str().to_string();
+                let (path, factories, want) = (file.clone(), Arc::clone(&shared), id.clone());
+                reloaders.insert(id, Arc::new(move || reload(&path, &factories, &want)));
+                connectors.push(connector);
+            }
             Err(e) => tracing::error!(error = %e, "skipping connector: its manifest failed to load"),
         }
     }
@@ -204,7 +220,25 @@ pub(crate) fn load_config(
         bus_capacity: manifest.runtime.bus_capacity,
         connectors,
         router: build_router(manifest.router),
+        reloaders,
     })
+}
+
+/// Instantiate the connector at `path` again; it must keep the id it was loaded under.
+fn reload(
+    path: &Path,
+    factories: &HashMap<String, Arc<dyn ConnectorFactory>>,
+    id: &str,
+) -> Result<Arc<dyn Connector>, ConfigError> {
+    let connector = instantiate(path, factories, &mut HashSet::new())?;
+    if connector.id().as_str() != id {
+        return Err(ConfigError::ReloadChangedId {
+            path: path.to_path_buf(),
+            was: id.to_string(),
+            now: connector.id().as_str().to_string(),
+        });
+    }
+    Ok(connector)
 }
 
 /// Gather connector manifest paths from `dir` (scanned, non-recursive) and the
@@ -357,11 +391,20 @@ mod tests {
         fn create(
             &self,
             id: ConnectorId,
-            _config: &toml::Value,
+            config: &toml::Value,
             _ctx: FactoryContext<'_>,
         ) -> Result<Arc<dyn Connector>, Box<dyn std::error::Error + Send + Sync>> {
-            Ok(Arc::new(TestConnector { id, caps: ConnectorCapabilities::bidirectional() }))
+            // `[connector] value` becomes the description, so a test can tell a reloaded
+            // instance apart.
+            let value = config["connector"].get("value").and_then(|v| v.as_str()).unwrap_or("");
+            let caps = ConnectorCapabilities::bidirectional().with_description(value);
+            Ok(Arc::new(TestConnector { id, caps }))
         }
+    }
+
+    /// The `[connector] value` a TestConnector was built from.
+    fn value_of(c: &Arc<dyn Connector>) -> String {
+        c.capabilities().description.clone().unwrap_or_default()
     }
 
     /// A single malformed manifest (here: a `[connector]` with an id but no `type`, the
@@ -386,6 +429,32 @@ mod tests {
 
         assert_eq!(loaded.connectors.len(), 1, "the good connector loads; the bad one is skipped");
         assert_eq!(loaded.connectors[0].id(), &ConnectorId::new("good"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Editing a manifest and restarting its connector must apply the edit: the reloader
+    /// builds a fresh instance from the file as it is now. An id change is refused.
+    #[test]
+    fn a_reload_builds_the_connector_from_its_manifest_as_it_is_now() {
+        let dir = std::env::temp_dir().join(format!("octo-cfg-reload-{}", std::process::id()));
+        let conns = dir.join("connectors");
+        std::fs::create_dir_all(&conns).unwrap();
+        std::fs::write(dir.join("octo.toml"), "[connectors]\ndir = \"connectors\"\n").unwrap();
+        let manifest = conns.join("voice.toml");
+        std::fs::write(&manifest, "[connector]\nid = \"voice\"\ntype = \"test\"\nvalue = \"cove\"\n").unwrap();
+
+        let mut factories: HashMap<String, Arc<dyn ConnectorFactory>> = HashMap::new();
+        factories.insert("test".to_string(), Arc::new(TestFactory));
+        let loaded = load_config(&dir.join("octo.toml"), &factories, &HashSet::new()).unwrap();
+        assert_eq!(value_of(&loaded.connectors[0]), "cove");
+
+        std::fs::write(&manifest, "[connector]\nid = \"voice\"\ntype = \"test\"\nvalue = \"spruce\"\n").unwrap();
+        let reload = &loaded.reloaders["voice"];
+        assert_eq!(value_of(&reload().expect("the edited manifest loads")), "spruce");
+
+        std::fs::write(&manifest, "[connector]\nid = \"renamed\"\ntype = \"test\"\n").unwrap();
+        assert!(matches!(reload(), Err(ConfigError::ReloadChangedId { .. })));
 
         std::fs::remove_dir_all(&dir).ok();
     }
