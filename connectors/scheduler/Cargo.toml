@@ -16,6 +16,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+croner = "4"
+chrono-tz = "0.10"
 tracing = { workspace = true }
 
 [dev-dependencies]

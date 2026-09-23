@@ -29,6 +29,8 @@ pub enum DavError {
     Xml(String),
     #[error("missing field `{0}`")]
     MissingField(&'static str),
+    #[error("bad recurrence rule: {0} (an RFC 5545 RRULE, e.g. FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR)")]
+    BadRecurrence(String),
     #[error("caldav discovery: {0}")]
     Discovery(String),
 }
@@ -90,8 +92,9 @@ pub async fn create_event(
     params: &Value,
     uid: &str,
     default_reminder: Option<i64>,
+    tz: chrono_tz::Tz,
 ) -> Result<Value, DavError> {
-    let ics = build_event_ics(params, uid, default_reminder)?;
+    let ics = build_event_ics(params, uid, default_reminder, tz)?;
 
     let url = event_url(collection, uid);
     let req = client
@@ -120,17 +123,39 @@ pub async fn create_event(
 /// the standard way every CalDAV server (Google, Yandex, Fastmail, Nextcloud,
 /// iCloud) raises a notification. A negative value (or no lead time at all) creates
 /// a plain event with no alarm.
-fn build_event_ics(params: &Value, uid: &str, default_reminder: Option<i64>) -> Result<String, DavError> {
+///
+/// An optional `recurrence` (an RFC 5545 RRULE value, e.g. `FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR`)
+/// makes it a recurring series; the alarm then fires before every occurrence. A recurring
+/// event's start/end are written in the connector's timezone (`DTSTART;TZID=…`), not UTC —
+/// a series anchored in UTC would slide by an hour across daylight-saving changes.
+fn build_event_ics(
+    params: &Value,
+    uid: &str,
+    default_reminder: Option<i64>,
+    tz: chrono_tz::Tz,
+) -> Result<String, DavError> {
     let title = str_field(params, "title")?;
     let start = to_utc(str_field(params, "start")?)?;
     let end = to_utc(str_field(params, "end")?)?;
+    let rule = recurrence(params, start, tz)?;
 
     let mut event = Event::new();
-    event
-        .uid(uid)
-        .summary(title)
-        .starts(CalendarDateTime::from(start))
-        .ends(CalendarDateTime::from(end));
+    event.uid(uid).summary(title);
+    match &rule {
+        Some(rule) if tz != chrono_tz::UTC => {
+            let local = |t: DateTime<Utc>| CalendarDateTime::WithTimezone {
+                date_time: t.with_timezone(&tz).naive_local(),
+                tzid: tz.name().to_string(),
+            };
+            event.starts(local(start)).ends(local(end)).add_property("RRULE", rule);
+        }
+        _ => {
+            event.starts(CalendarDateTime::from(start)).ends(CalendarDateTime::from(end));
+            if let Some(rule) = &rule {
+                event.add_property("RRULE", rule);
+            }
+        }
+    }
     if let Some(d) = params.get("description").and_then(Value::as_str) {
         event.description(d);
     }
@@ -146,6 +171,22 @@ fn build_event_ics(params: &Value, uid: &str, default_reminder: Option<i64>) -> 
     }
 
     Ok(Calendar::new().push(event.done()).done().to_string())
+}
+
+/// The event's `recurrence` rule (an optional `RRULE:` prefix dropped), checked by the
+/// `rrule` engine against the start so a bad rule is refused before anything is written.
+fn recurrence(params: &Value, start: DateTime<Utc>, tz: chrono_tz::Tz) -> Result<Option<String>, DavError> {
+    let Some(raw) = params.get("recurrence").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let rule = raw.trim().trim_start_matches("RRULE:").trim().to_string();
+    if rule.is_empty() {
+        return Ok(None);
+    }
+    let local = start.with_timezone(&tz).format("%Y%m%dT%H%M%S");
+    let spec = format!("DTSTART;TZID={}:{local}\nRRULE:{rule}", tz.name());
+    spec.parse::<RRuleSet>().map_err(|e| DavError::BadRecurrence(e.to_string()))?;
+    Ok(Some(rule))
 }
 
 /// `DELETE <collection>/<uid>.ics`. Returns `{ deleted: bool }`.
@@ -852,8 +893,33 @@ mod tests {
     }
 
     #[test]
+    fn a_recurring_event_carries_its_rule_in_local_time() {
+        let mut e = event(Some(10));
+        e["start"] = json!("2026-09-28T06:00:00Z"); // Monday 09:00 in Moscow
+        e["end"] = json!("2026-09-28T06:15:00Z");
+        e["recurrence"] = json!("RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR");
+        let ics = build_event_ics(&e, "uid-r1", None, chrono_tz::Europe::Moscow).unwrap();
+        assert!(ics.contains("RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR"), "{ics}");
+        assert!(ics.contains("DTSTART;TZID=Europe/Moscow:20260928T090000"), "{ics}");
+        assert!(ics.contains("BEGIN:VALARM"), "the alarm rides on every occurrence");
+    }
+
+    #[test]
+    fn a_recurring_event_in_utc_stays_in_utc_and_bad_rules_are_refused() {
+        let mut e = event(None);
+        e["recurrence"] = json!("FREQ=DAILY;COUNT=5");
+        let ics = build_event_ics(&e, "uid-r2", None, chrono_tz::UTC).unwrap();
+        assert!(ics.contains("RRULE:FREQ=DAILY;COUNT=5") && ics.contains("DTSTART:20260715T140000Z"), "{ics}");
+        e["recurrence"] = json!("FREQ=SOMETIMES");
+        assert!(matches!(
+            build_event_ics(&e, "uid-r3", None, chrono_tz::UTC),
+            Err(DavError::BadRecurrence(_))
+        ));
+    }
+
+    #[test]
     fn reminder_attaches_a_display_valarm_before_start() {
-        let ics = build_event_ics(&event(Some(10)), "uid-1", None).unwrap();
+        let ics = build_event_ics(&event(Some(10)), "uid-1", None, chrono_tz::UTC).unwrap();
         assert!(ics.contains("BEGIN:VALARM"), "a reminder should add a VALARM:\n{ics}");
         assert!(ics.contains("ACTION:DISPLAY"), "the alarm should be a display popup:\n{ics}");
         assert!(ics.contains(&trigger_value(10)), "trigger should fire 10 min before:\n{ics}");
@@ -862,28 +928,28 @@ mod tests {
     #[test]
     fn per_event_reminder_overrides_the_connector_default() {
         // Per-event 5 min must win over the connector's 30 min default.
-        let ics = build_event_ics(&event(Some(5)), "uid-2", Some(30)).unwrap();
+        let ics = build_event_ics(&event(Some(5)), "uid-2", Some(30), chrono_tz::UTC).unwrap();
         assert!(ics.contains(&trigger_value(5)), "per-event 5 min should win:\n{ics}");
         assert!(!ics.contains(&trigger_value(30)), "the 30 min default must not leak in:\n{ics}");
     }
 
     #[test]
     fn connector_default_reminder_applies_when_event_omits_it() {
-        let ics = build_event_ics(&event(None), "uid-3", Some(10)).unwrap();
+        let ics = build_event_ics(&event(None), "uid-3", Some(10), chrono_tz::UTC).unwrap();
         assert!(ics.contains("BEGIN:VALARM"), "the connector default should add an alarm:\n{ics}");
         assert!(ics.contains(&trigger_value(10)), "default 10 min lead time:\n{ics}");
     }
 
     #[test]
     fn no_reminder_yields_a_plain_event() {
-        let ics = build_event_ics(&event(None), "uid-4", None).unwrap();
+        let ics = build_event_ics(&event(None), "uid-4", None, chrono_tz::UTC).unwrap();
         assert!(!ics.contains("VALARM"), "no lead time -> no alarm:\n{ics}");
     }
 
     #[test]
     fn negative_reminder_suppresses_the_default() {
         // An explicit -1 opts out even though the connector has a default.
-        let ics = build_event_ics(&event(Some(-1)), "uid-5", Some(10)).unwrap();
+        let ics = build_event_ics(&event(Some(-1)), "uid-5", Some(10), chrono_tz::UTC).unwrap();
         assert!(!ics.contains("VALARM"), "-1 opts out of the default:\n{ics}");
     }
 
@@ -1038,7 +1104,7 @@ END:VCALENDAR&#13;
             "reminder_minutes": 15
         });
 
-        let created = create_event(&client, &collection, &auth, &params, uid, Some(10)).await.expect("create");
+        let created = create_event(&client, &collection, &auth, &params, uid, Some(10), chrono_tz::UTC).await.expect("create");
         println!("created -> {created}");
 
         let listed = list_events(
