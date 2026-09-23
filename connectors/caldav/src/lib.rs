@@ -14,7 +14,7 @@
 //!
 //! Commands (each replies with a correlated `<kind>.result`):
 //! - `calendar.list_events { from, to }` → `{ events: [...] }`
-//! - `calendar.create_event { title, start, end, description?, location?, reminder_minutes? }` → `{ uid }`
+//! - `calendar.create_event { title, start, end, description?, location?, reminder_minutes?, recurrence? }` → `{ uid }`
 //! - `calendar.delete_event { uid }` → `{ deleted }`
 //!
 //! A created event carries a popup reminder (VALARM) when a lead time resolves:
@@ -42,9 +42,10 @@ const DELETE: &str = "calendar.delete_event";
 
 const CATALOG: &str = "A calendar (CalDAV). Dispatch a command envelope to this connector's id:
 - calendar.list_events { from: <RFC3339>, to: <RFC3339> } -> { events: [{ uid, title, start, end, location? }] }
-- calendar.create_event { title, start: <RFC3339>, end: <RFC3339>, description?, location?, reminder_minutes? } -> { uid }
+- calendar.create_event { title, start: <RFC3339>, end: <RFC3339>, description?, location?, reminder_minutes?, recurrence? } -> { uid }
 - calendar.delete_event { uid } -> { deleted: bool }
-reminder_minutes on create_event sets a popup this many minutes before the start (a VALARM); omit it to use the calendar's configured default, or pass -1 for no reminder.";
+reminder_minutes on create_event sets a popup this many minutes before the start (a VALARM); omit it to use the calendar's configured default, or pass -1 for no reminder.
+recurrence on create_event makes it a repeating series: an RFC 5545 RRULE, e.g. \"FREQ=DAILY\", \"FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR\" (weekdays), \"FREQ=WEEKLY;BYDAY=MO\", \"FREQ=MONTHLY;BYMONTHDAY=1\"; add ;COUNT=n or ;UNTIL=<YYYYMMDDTHHMMSSZ> to end it. `start`/`end` are the first occurrence; the reminder fires before every one.";
 
 /// Where the calendar collection URL comes from.
 ///
@@ -231,6 +232,7 @@ impl CaldavConnector {
                         &params,
                         &uid,
                         self.default_reminder,
+                        self.display_tz,
                     )
                     .await
                 }

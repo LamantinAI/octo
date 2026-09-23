@@ -15,6 +15,12 @@
 //!
 //! Replies are correlated by the command's id, so a dispatcher using
 //! `publish_and_await_response` gets the result back.
+//!
+//! Triggers: `oneshot` (an absolute time), `interval` (every N seconds from creation) and
+//! `cron` (a calendar schedule in an IANA timezone — "weekdays at 09:00", "Mondays",
+//! "the 1st of the month"; see [`cron`]).
+
+mod cron;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -39,6 +45,8 @@ pub enum AlarmTrigger {
     OneShot,
     /// Fire every `period_secs`, starting `period_secs` after creation, until cancelled.
     Interval { period_secs: u64 },
+    /// Fire whenever the cron expression `expr` matches in timezone `tz`, until cancelled.
+    Cron { expr: String, tz: String },
 }
 
 /// A scheduled alarm. `next_fire` is the absolute time of its next emission.
@@ -86,6 +94,13 @@ pub enum TriggerSpec {
     Oneshot { at: String },
     /// Recurring every `period_secs`, until cancelled.
     Interval { period_secs: u64 },
+    /// Recurring on a calendar: a 5-field cron `expr` in `tz` (IANA; omitted -> the
+    /// scheduler's default timezone), until cancelled.
+    Cron {
+        expr: String,
+        #[serde(default)]
+        tz: Option<String>,
+    },
 }
 
 /// Payload of an `octo.scheduler.add_alarm` command.
@@ -114,11 +129,16 @@ pub struct Scheduler {
     alarms: Mutex<Vec<Alarm>>,
     persistence_path: PathBuf,
     tick: Duration,
+    /// Timezone a `cron` trigger uses when the command names none.
+    timezone: String,
 }
 
 const CATALOG: &str = "Schedule reminders / alarms. Command kinds:\n\
- - kind \"octo.scheduler.add_alarm\", payload { trigger: { type: \"interval\", period_secs: <u64> } \
-   OR { type: \"oneshot\", at: \"<RFC3339 UTC>\" }, payload: <object carried into alarm.fired>, \
+ - kind \"octo.scheduler.add_alarm\", payload { trigger: { type: \"oneshot\", at: \"<RFC3339 UTC>\" } \
+   OR { type: \"interval\", period_secs: <u64> } (every N seconds from now) \
+   OR { type: \"cron\", expr: \"<min hour day-of-month month day-of-week>\", tz?: \"<IANA zone>\" } \
+   (a calendar schedule in local time: \"0 9 * * 1-5\" weekdays at 09:00, \"30 18 * * 5\" Fridays 18:30, \
+   \"0 10 1 * *\" the 1st of each month; tz omitted -> the default zone), payload: <object carried into alarm.fired>, \
    tags?: {..}, target?: \"<connector>\" } → returns { alarm_id }. \
    Put what you'll need when it fires (e.g. the memory task name and the channel to remind on) into `payload`.\n\
  - kind \"octo.scheduler.cancel_alarm\", payload { alarm_id: \"<id>\" } → stops a recurring reminder.\n\
@@ -126,6 +146,16 @@ const CATALOG: &str = "Schedule reminders / alarms. Command kinds:\n\
 
 impl Scheduler {
     pub fn new(id: impl Into<String>, persistence_path: impl Into<PathBuf>) -> Arc<Self> {
+        Self::with_timezone(id, persistence_path, "UTC")
+    }
+
+    /// Like [`new`](Self::new), with the timezone a `cron` trigger falls back to (an IANA
+    /// name, e.g. the owner's zone).
+    pub fn with_timezone(
+        id: impl Into<String>,
+        persistence_path: impl Into<PathBuf>,
+        timezone: impl Into<String>,
+    ) -> Arc<Self> {
         let capabilities = ConnectorCapabilities::bidirectional()
             .with_emit_kinds([EventKind::from_static(DEFAULT_EMIT_KIND)])
             .with_accept_kinds([
@@ -140,6 +170,7 @@ impl Scheduler {
             alarms: Mutex::new(Vec::new()),
             persistence_path: persistence_path.into(),
             tick: Duration::from_secs(1),
+            timezone: timezone.into(),
         })
     }
 
@@ -190,6 +221,13 @@ impl Scheduler {
                     AlarmTrigger::Interval { period_secs } => {
                         a.next_fire = now + chrono::Duration::seconds(period_secs as i64);
                     }
+                    AlarmTrigger::Cron { ref expr, ref tz } => match cron::next_after(expr, tz, now) {
+                        Ok(next) => a.next_fire = next,
+                        Err(e) => {
+                            tracing::warn!(alarm_id = %a.id, error = %e, "scheduler: cron has no next time; dropping");
+                            drop_ids.push(a.id.clone());
+                        }
+                    },
                 }
             }
             if !drop_ids.is_empty() {
@@ -255,6 +293,13 @@ impl Scheduler {
                     AlarmTrigger::Interval { period_secs },
                     now + chrono::Duration::seconds(period_secs as i64),
                 )
+            }
+            TriggerSpec::Cron { expr, tz } => {
+                let tz = tz.unwrap_or_else(|| self.timezone.clone());
+                match cron::next_after(&expr, &tz, now) {
+                    Ok(next) => (AlarmTrigger::Cron { expr, tz }, next),
+                    Err(e) => return json!({ "error": format!("add_alarm: {e}") }),
+                }
             }
         };
         let id = uuid::Uuid::now_v7().to_string();
