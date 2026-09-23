@@ -47,7 +47,8 @@ pub(crate) enum Emit {
     /// A voice message or audio file. Never coalesced (Telegram doesn't group
     /// these), so it has no `Part` counterpart. `duration_secs` rides along as a
     /// tag so a cogitator can judge the cost of transcribing before it starts.
-    Audio { blob: Blob, caption: Option<String>, duration_secs: Option<u32> },
+    /// A voice note / audio file; `path` is its copy in the workspace inbox, when saved.
+    Audio { blob: Blob, caption: Option<String>, duration_secs: Option<u32>, path: Option<String> },
     /// A coalesced burst mixing text and/or multiple images.
     Multipart(InboundMessage),
 }
