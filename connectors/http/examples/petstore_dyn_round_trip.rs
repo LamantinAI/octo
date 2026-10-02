@@ -14,8 +14,7 @@
 //! path (`petstore.event.error`) is a realistic, expected outcome — that's the
 //! point of the retry policy in the manifest.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use octo_connector_http::HttpConnector;
@@ -23,7 +22,7 @@ use octo_core::{
     Connector, ConnectorCapabilities, ConnectorContext, ConnectorId, Envelope, EventKind, Octo,
     OctoResult, PayloadRegistry,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const PETSTORE_ID: &str = "petstore";
 const CALL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -69,7 +68,10 @@ impl Connector for Agent {
         println!("[agent] → find_pets_by_status(available)");
         let resp = ctx
             .publish_and_await_response(
-                self.cmd("petstore.cmd.find_pets_by_status", json!({ "status": "available" })),
+                self.cmd(
+                    "petstore.cmd.find_pets_by_status",
+                    json!({ "status": "available" }),
+                ),
                 CALL_TIMEOUT,
             )
             .await?;

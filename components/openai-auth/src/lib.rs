@@ -13,19 +13,22 @@
 //! the only way in: it serialises every refresh behind a lock, so the refresh stays
 //! single-owner when one `Arc` is shared across the LLM path and the voice connectors.
 
+mod storage;
 use std::{
     fs::read_to_string,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
-use serde_json::{from_slice, from_str, json, to_string_pretty, Map, Value};
+use serde_json::{Map, Value, from_slice, from_str, json, to_string_pretty};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
+
+use self::storage::write_private;
 
 /// The crate's error — a human-readable message. A token store either yields a usable
 /// [`Subscription`] or an error a person can act on (usually: run the login flow).
@@ -85,12 +88,16 @@ pub struct Tokens {
 impl AuthDotJson {
     /// A fresh store from a just-completed login (no `extra`, stamped `last_refresh`).
     pub fn new(tokens: Tokens) -> Self {
-        Self { tokens, last_refresh: Some(now_rfc3339()), extra: Map::new() }
+        Self {
+            tokens,
+            last_refresh: Some(now_rfc3339()),
+            extra: Map::new(),
+        }
     }
 
     fn load(path: &Path) -> Result<Self> {
-        let text = read_to_string(path)
-            .map_err(|e| AuthError(format!("read {}: {e}", path.display())))?;
+        let text =
+            read_to_string(path).map_err(|e| AuthError(format!("read {}: {e}", path.display())))?;
         from_str(&text).map_err(|e| AuthError(format!("parse {}: {e}", path.display())))
     }
 
@@ -191,7 +198,11 @@ pub struct SubscriptionAuth {
 impl SubscriptionAuth {
     /// A handle over the codex-style `auth.json` at `path`.
     pub fn new(path: PathBuf) -> Self {
-        Self { path, login_hint: DEFAULT_LOGIN_HINT.into(), last_forced: Mutex::new(None) }
+        Self {
+            path,
+            login_hint: DEFAULT_LOGIN_HINT.into(),
+            last_forced: Mutex::new(None),
+        }
     }
 
     /// Name the sign-in command errors point at (default: `codex login`).
@@ -229,7 +240,11 @@ impl SubscriptionAuth {
 /// has). If `exp` can't be read we do NOT force a refresh — a live 401 will surface
 /// the real problem rather than us guessing.
 fn needs_refresh(access_token: &str) -> bool {
-    match jwt_claims(access_token).as_ref().and_then(|c| c.get("exp")).and_then(Value::as_i64) {
+    match jwt_claims(access_token)
+        .as_ref()
+        .and_then(|c| c.get("exp"))
+        .and_then(Value::as_i64)
+    {
         Some(exp) => exp - Utc::now().timestamp() <= REFRESH_WINDOW_SECS,
         None => false,
     }
@@ -257,7 +272,11 @@ fn subscription_from(tokens: &Tokens) -> Result<Subscription> {
     } else {
         tokens.account_id.clone()
     };
-    Ok(Subscription { access_token: tokens.access_token.clone(), account_id, plan: plan_from_jwt(&tokens.access_token) })
+    Ok(Subscription {
+        access_token: tokens.access_token.clone(),
+        account_id,
+        plan: plan_from_jwt(&tokens.access_token),
+    })
 }
 
 /// The refresh-token grant (`grant_type=refresh_token`), sent as JSON — matching the
@@ -339,54 +358,15 @@ fn now_rfc3339() -> String {
     Utc::now().to_rfc3339()
 }
 
-/// Write `bytes` to `path` atomically at `0600`: into a sibling temp file created at
-/// `0600` (no world-readable window), flushed, then renamed over the store. A crash
-/// mid-write leaves the old store intact — which matters, because a refresh can rotate the
-/// single-use refresh token: a torn write would lose the new one after spending the old.
-#[cfg(unix)]
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::{
-        fs::{rename, set_permissions, OpenOptions},
-        io::Write,
-        os::unix::fs::{OpenOptionsExt, PermissionsExt},
-    };
-    let tmp = temp_sibling(path);
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    // A stale temp from an earlier crash keeps its old mode; tighten before writing.
-    set_permissions(&tmp, PermissionsExt::from_mode(0o600))?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    rename(&tmp, path)
-}
-
-#[cfg(not(unix))]
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = temp_sibling(path);
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
-}
-
-/// `auth.json` -> `auth.json.tmp`, in the same directory (so the rename stays atomic).
-fn temp_sibling(path: &Path) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".tmp");
-    path.with_file_name(name)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        account_id_from_jwt, apply_refresh, jwt_claims, plan_from_jwt, AuthDotJson,
-        RefreshResponse, SubscriptionAuth, Tokens,
+        AuthDotJson, RefreshResponse, SubscriptionAuth, Tokens, account_id_from_jwt, apply_refresh,
+        jwt_claims, plan_from_jwt,
     };
 
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-    use serde_json::{json, Value};
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use serde_json::{Value, json};
 
     /// Assemble a `header.payload.sig` JWT with the given payload (signature is a
     /// throwaway — `jwt_claims` never verifies it).
@@ -405,7 +385,10 @@ mod tests {
             },
         }));
         let claims = jwt_claims(&token).expect("decodable payload");
-        assert_eq!(claims.get("exp").and_then(Value::as_i64), Some(9_999_999_999));
+        assert_eq!(
+            claims.get("exp").and_then(Value::as_i64),
+            Some(9_999_999_999)
+        );
         assert_eq!(plan_from_jwt(&token).as_deref(), Some("plus"));
         assert_eq!(account_id_from_jwt(&token).as_deref(), Some("acc-123"));
     }
@@ -493,7 +476,10 @@ mod tests {
         };
         let _ = remove_file(&path);
         let msg = err.to_string();
-        assert!(msg.contains("albert login"), "must point at `albert login`, got: {msg}");
+        assert!(
+            msg.contains("albert login"),
+            "must point at `albert login`, got: {msg}"
+        );
     }
 
     /// The token store lands at `0600`, even when overwriting a pre-existing
@@ -519,10 +505,13 @@ mod tests {
         store.save(&path).expect("save");
 
         let mode = metadata(&path).unwrap().permissions().mode() & 0o777;
-        let tmp_left = super::temp_sibling(&path).exists();
+        let tmp_left = super::storage::temp_sibling(&path).exists();
         let _ = remove_file(&path);
         assert_eq!(mode, 0o600, "auth.json must be 0600, got {mode:o}");
-        assert!(!tmp_left, "the atomic write must not leave its temp file behind");
+        assert!(
+            !tmp_left,
+            "the atomic write must not leave its temp file behind"
+        );
     }
 
     /// The shared provider delegates to the store and is Send + Sync, so one `Arc` can
@@ -547,7 +536,10 @@ mod tests {
         .expect("save");
 
         let auth = SubscriptionAuth::new(path.clone());
-        let sub = auth.fresh().await.expect("a non-expiring token needs no refresh");
+        let sub = auth
+            .fresh()
+            .await
+            .expect("a non-expiring token needs no refresh");
         assert_eq!(sub.account_id, "acc-1");
         let _ = remove_file(&path);
 
@@ -566,6 +558,9 @@ mod tests {
         println!("refresh(bogus) -> {result:?}");
         assert!(result.is_err(), "a bogus refresh token must be rejected");
         let msg = format!("{:?}", result.unwrap_err());
-        assert!(msg.contains("rejected"), "expected a clean HTTP rejection, got: {msg}");
+        assert!(
+            msg.contains("rejected"),
+            "expected a clean HTTP rejection, got: {msg}"
+        );
     }
 }

@@ -23,16 +23,15 @@
 
 mod backend;
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use octo_core::{
     Connector, ConnectorCapabilities, ConnectorContext, ConnectorFactory, ConnectorId, Envelope,
     EventKind, FactoryContext, Filter, OctoResult, SubscribeOptions,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub use backend::{LocalStorage, StorageBackend, StorageError};
 
@@ -92,7 +91,12 @@ impl StorageConnector {
                 EventKind::from_static(CHECKOUT),
             ])
             .with_description(CATALOG);
-        Arc::new(Self { id: ConnectorId::new(id), capabilities, backend, workspace })
+        Arc::new(Self {
+            id: ConnectorId::new(id),
+            capabilities,
+            backend,
+            workspace,
+        })
     }
 }
 
@@ -108,7 +112,10 @@ impl Connector for StorageConnector {
 
     async fn run(self: Arc<Self>, ctx: ConnectorContext) -> OctoResult<()> {
         let mut cmds = ctx
-            .subscribe(Filter::by_target(self.id.clone()), SubscribeOptions::default())
+            .subscribe(
+                Filter::by_target(self.id.clone()),
+                SubscribeOptions::default(),
+            )
             .await?;
         tracing::info!(connector = %self.id, "storage ready");
         loop {
@@ -137,8 +144,12 @@ impl StorageConnector {
             _ => return, // not one of ours
         };
         let payload = outcome.unwrap_or_else(|e| json!({ "error": e }));
-        let resp = Envelope::new(self.id.clone(), EventKind::new(format!("{kind}.result")), payload)
-            .with_correlation(env.id);
+        let resp = Envelope::new(
+            self.id.clone(),
+            EventKind::new(format!("{kind}.result")),
+            payload,
+        )
+        .with_correlation(env.id);
         if let Err(e) = ctx.publish(resp).await {
             tracing::warn!(error = %e, "storage failed to publish result");
         }
@@ -149,11 +160,16 @@ impl StorageConnector {
         let bytes = if let Some(text) = params.get("content").and_then(Value::as_str) {
             text.as_bytes().to_vec()
         } else if let Some(b64) = params.get("content_base64").and_then(Value::as_str) {
-            BASE64.decode(b64).map_err(|e| format!("bad content_base64: {e}"))?
+            BASE64
+                .decode(b64)
+                .map_err(|e| format!("bad content_base64: {e}"))?
         } else {
             return Err("provide `content` (text) or `content_base64` (binary)".into());
         };
-        self.backend.put(key, &bytes).await.map_err(|e| e.to_string())?;
+        self.backend
+            .put(key, &bytes)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(json!({ "key": key, "bytes": bytes.len() }))
     }
 
@@ -161,7 +177,9 @@ impl StorageConnector {
         let key = str_field(params, "key")?;
         let bytes = self.backend.get(key).await.map_err(|e| e.to_string())?;
         let out = match String::from_utf8(bytes) {
-            Ok(text) => json!({ "key": key, "content": text, "encoding": "utf8", "bytes": text.len() }),
+            Ok(text) => {
+                json!({ "key": key, "content": text, "encoding": "utf8", "bytes": text.len() })
+            }
             Err(e) => {
                 let raw = e.into_bytes();
                 json!({
@@ -202,7 +220,10 @@ impl StorageConnector {
             }
             Err(e) => return Err(e.to_string()),
         };
-        self.backend.put(key, &bytes).await.map_err(|e| e.to_string())?;
+        self.backend
+            .put(key, &bytes)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(json!({ "key": key, "workspace_path": workspace_path, "bytes": bytes.len() }))
     }
 
@@ -270,7 +291,10 @@ impl ConnectorFactory for StorageConnectorFactory {
         let table = config
             .get("connector")
             .ok_or("storage: manifest has no [connector] table")?;
-        let backend_kind = table.get("backend").and_then(|v| v.as_str()).unwrap_or("local");
+        let backend_kind = table
+            .get("backend")
+            .and_then(|v| v.as_str())
+            .unwrap_or("local");
         let backend: Arc<dyn StorageBackend> = match backend_kind {
             "local" => {
                 let root = table
@@ -286,9 +310,11 @@ impl ConnectorFactory for StorageConnectorFactory {
         // Optional workspace root for promote/checkout; relative to the manifest.
         // When absent, the connector falls back to $OCTO_CODE_WORKSPACE at runtime.
         match table.get("workspace").and_then(|v| v.as_str()) {
-            Some(ws) => {
-                Ok(StorageConnector::with_workspace(id.as_str(), backend, ctx.base_dir.join(ws)))
-            }
+            Some(ws) => Ok(StorageConnector::with_workspace(
+                id.as_str(),
+                backend,
+                ctx.base_dir.join(ws),
+            )),
             None => Ok(StorageConnector::new(id.as_str(), backend)),
         }
     }
@@ -309,8 +335,12 @@ mod tests {
     use super::*;
 
     fn cmd(kind: &str, payload: Value) -> Envelope {
-        Envelope::new(ConnectorId::new("test-driver"), EventKind::new(kind), payload)
-            .with_target(ConnectorId::new("storage"))
+        Envelope::new(
+            ConnectorId::new("test-driver"),
+            EventKind::new(kind),
+            payload,
+        )
+        .with_target(ConnectorId::new("storage"))
     }
 
     #[tokio::test]
@@ -334,20 +364,29 @@ mod tests {
         assert_eq!(put.payload_as::<Value>().unwrap()["bytes"], 5);
 
         let got = bus
-            .publish_and_await_response(cmd(GET, json!({ "key": "reports/x.md" })), Duration::from_secs(5))
+            .publish_and_await_response(
+                cmd(GET, json!({ "key": "reports/x.md" })),
+                Duration::from_secs(5),
+            )
             .await
             .unwrap();
         assert_eq!(got.payload_as::<Value>().unwrap()["content"], "hello");
 
         let listed = bus
-            .publish_and_await_response(cmd(LIST, json!({ "prefix": "reports/" })), Duration::from_secs(5))
+            .publish_and_await_response(
+                cmd(LIST, json!({ "prefix": "reports/" })),
+                Duration::from_secs(5),
+            )
             .await
             .unwrap();
         let keys = listed.payload_as::<Value>().unwrap()["keys"].clone();
         assert_eq!(keys, json!(["reports/x.md"]));
 
         let deleted = bus
-            .publish_and_await_response(cmd(DELETE, json!({ "key": "reports/x.md" })), Duration::from_secs(5))
+            .publish_and_await_response(
+                cmd(DELETE, json!({ "key": "reports/x.md" })),
+                Duration::from_secs(5),
+            )
             .await
             .unwrap();
         assert_eq!(deleted.payload_as::<Value>().unwrap()["deleted"], true);
@@ -391,7 +430,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(p["bytes"], 16);
-        assert_eq!(connector.backend.get("reports/draft.md").await.unwrap(), b"work in progress");
+        assert_eq!(
+            connector.backend.get("reports/draft.md").await.unwrap(),
+            b"work in progress"
+        );
 
         // checkout: durable storage -> a fresh workspace path.
         let c = connector

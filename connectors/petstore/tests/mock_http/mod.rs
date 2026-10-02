@@ -10,8 +10,10 @@
 
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+};
 
 type Handler = Box<dyn Fn(&str) -> String + Send + Sync>;
 
@@ -76,10 +78,7 @@ async fn serve_one(mut socket: TcpStream, routes: &[Route]) -> std::io::Result<(
     let (method, target, body) = read_request(&mut socket).await?;
     let path = target.split('?').next().unwrap_or(&target);
 
-    let (status, resp_body) = match routes
-        .iter()
-        .find(|r| r.method == method && r.path == path)
-    {
+    let (status, resp_body) = match routes.iter().find(|r| r.method == method && r.path == path) {
         Some(route) => (route.status, (route.handler)(&body)),
         None => (404, format!("no mock route for {method} {path}")),
     };
@@ -147,7 +146,5 @@ async fn read_request(socket: &mut TcpStream) -> std::io::Result<(String, String
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }

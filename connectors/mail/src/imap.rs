@@ -10,12 +10,14 @@ use std::sync::{Arc, Once};
 
 use async_imap::Session;
 use futures::TryStreamExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::net::TcpStream;
-use tokio_rustls::{rustls, TlsConnector};
+use tokio_rustls::{TlsConnector, rustls};
 
-use crate::config::MailConfig;
-use crate::error::{MailError, Result};
+use crate::{
+    config::MailConfig,
+    error::{MailError, Result},
+};
 
 /// The concrete session type. With async-imap's `runtime-tokio` feature the
 /// stream bounds are tokio's own `AsyncRead`/`AsyncWrite`, so a tokio-rustls TLS
@@ -30,7 +32,9 @@ pub(crate) async fn open(cfg: &MailConfig) -> Result<MailSession> {
 
     let tcp = TcpStream::connect((cfg.imap_host.as_str(), cfg.imap_port))
         .await
-        .map_err(|e| MailError::Imap(format!("connect {}:{}: {e}", cfg.imap_host, cfg.imap_port)))?;
+        .map_err(|e| {
+            MailError::Imap(format!("connect {}:{}: {e}", cfg.imap_host, cfg.imap_port))
+        })?;
     let tls_stream = tls
         .connect(server_name, tcp)
         .await
@@ -158,7 +162,12 @@ pub(crate) async fn list(
 }
 
 /// Read one message by UID: fetch its raw source and parse the full MIME tree.
-pub(crate) async fn read(cfg: &MailConfig, uid: u32, max: usize, folder: Option<&str>) -> Result<Value> {
+pub(crate) async fn read(
+    cfg: &MailConfig,
+    uid: u32,
+    max: usize,
+    folder: Option<&str>,
+) -> Result<Value> {
     let mut session = open(cfg).await?;
     let mailbox_name = folder.unwrap_or(&cfg.mailbox);
     session
@@ -190,12 +199,18 @@ pub(crate) async fn read(cfg: &MailConfig, uid: u32, max: usize, folder: Option<
 /// Render an IMAP envelope address (`Address`) as `Name <local@host>` / `local@host`.
 fn format_addr(a: &async_imap::imap_proto::Address) -> String {
     let utf8 = |o: &Option<std::borrow::Cow<[u8]>>| {
-        o.as_ref().map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default()
+        o.as_ref()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_default()
     };
     let name = a.name.as_ref().map(|b| decode_words(b)).unwrap_or_default();
     let mailbox = utf8(&a.mailbox);
     let host = utf8(&a.host);
-    let email = if host.is_empty() { mailbox } else { format!("{mailbox}@{host}") };
+    let email = if host.is_empty() {
+        mailbox
+    } else {
+        format!("{mailbox}@{host}")
+    };
     if name.is_empty() {
         email
     } else {

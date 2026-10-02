@@ -20,17 +20,15 @@
 //! cargo run --example incident_to_telegram
 //! ```
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use octo_core::{
-    bus::KindPattern, Connector, ConnectorCapabilities, ConnectorContext, ConnectorId, Envelope,
-    EventKind, Filter, Octo, OctoResult, Priority, Route, RouteAction, RoutePredicate,
-    RouteStrategy, RuleBasedRouter, SubscribeOptions, TrailAction, TrailActor, TrailEntry,
+    Connector, ConnectorCapabilities, ConnectorContext, ConnectorId, Envelope, EventKind, Filter,
+    Octo, OctoResult, Priority, Route, RouteAction, RoutePredicate, RouteStrategy, RuleBasedRouter,
+    SubscribeOptions, TrailAction, TrailActor, TrailEntry, bus::KindPattern,
 };
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::time::{MissedTickBehavior, interval};
 
 /// Application-level payload — what the smart sensor emits.
 #[derive(Debug, Clone)]
@@ -257,7 +255,7 @@ fn build_router(telegram_id: ConnectorId) -> Arc<RuleBasedRouter> {
             },
             then: RouteAction {
                 target: telegram_id,
-                override_kind: None,    // keep incident kind; sink knows how to read Incident
+                override_kind: None, // keep incident kind; sink knows how to read Incident
                 add_tags: HashMap::new(),
                 copy_payload: true,
                 static_payload: None,
@@ -280,7 +278,7 @@ async fn main() -> OctoResult<()> {
 
     let octo = Octo::builder()
         .bus_capacity(64)
-        .router(build_router(telegram_id.clone()))   // ← router decides routing
+        .router(build_router(telegram_id.clone())) // ← router decides routing
         .add_connector(IncidentSensor::new(
             "fluxion",
             Duration::from_millis(700),

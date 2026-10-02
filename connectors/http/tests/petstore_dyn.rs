@@ -12,18 +12,19 @@
 
 mod mock_http;
 
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use async_trait::async_trait;
+use mock_http::{MockServer, Route};
 use octo_connector_http::HttpConnector;
 use octo_core::{
     Connector, ConnectorCapabilities, ConnectorContext, ConnectorId, Envelope, EventKind, Octo,
-    OctoResult, PayloadRegistry,
+    OctoResult, PayloadRegistry, control::RESTART_PROCESS,
 };
-use serde_json::{json, Value};
-
-use mock_http::{MockServer, Route};
+use serde_json::{Value, json};
 
 const PETSTORE_ID: &str = "petstore";
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -89,7 +90,12 @@ impl Connector for Agent {
         let result = self.scenario(&ctx).await;
         // Always signal shutdown so a mid-scenario error surfaces as a failed
         // assertion below rather than hanging the runtime.
-        ctx.shutdown.cancel();
+        ctx.publish(Envelope::new(
+            self.id.clone(),
+            EventKind::from_static(RESTART_PROCESS),
+            String::new(),
+        ))
+        .await?;
         result
     }
 }
@@ -99,7 +105,10 @@ impl Agent {
         // 1. find_pets_by_status(available) — GET with a query param.
         let resp = ctx
             .publish_and_await_response(
-                self.cmd("petstore.cmd.find_pets_by_status", json!({ "status": "available" })),
+                self.cmd(
+                    "petstore.cmd.find_pets_by_status",
+                    json!({ "status": "available" }),
+                ),
                 CALL_TIMEOUT,
             )
             .await?;
@@ -199,7 +208,8 @@ fn petstore_routes() -> Vec<Route> {
             .to_string()
         }),
         Route::new("GET", "/pet/10", 200, |_| {
-            json!({ "id": 10, "name": "doggie", "photoUrls": [], "status": "available" }).to_string()
+            json!({ "id": 10, "name": "doggie", "photoUrls": [], "status": "available" })
+                .to_string()
         }),
         Route::new("GET", "/pet/999", 500, |_| "boom".to_string()),
         Route::new("POST", "/pet", 200, |body| {
@@ -217,8 +227,8 @@ async fn petstore_dyn_round_trip_through_bus() {
     let server = MockServer::start(petstore_routes()).await;
 
     // Load the real manifest, then point base_url at the mock server.
-    let mut spec = octo_connector_http::HttpSpec::from_toml_file(manifest_path())
-        .expect("manifest parses");
+    let mut spec =
+        octo_connector_http::HttpSpec::from_toml_file(manifest_path()).expect("manifest parses");
     spec.base_url = server.base_url();
 
     // The sandbox sets HTTP_PROXY; bypass it so requests reach the local mock.
@@ -236,19 +246,36 @@ async fn petstore_dyn_round_trip_through_bus() {
         .add_connector(Agent::new(Arc::clone(&out)))
         .build();
 
-    octo.run().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(15), octo.run())
+        .await
+        .expect("runtime must stop")
+        .unwrap();
 
     let out = out.lock().unwrap();
     assert_eq!(out.find_kind.as_deref(), Some("petstore.event.pets_found"));
     assert_eq!(out.found_count, Some(2), "two available pets");
-    assert_eq!(out.fetch_kind.as_deref(), Some("petstore.event.pet_fetched"));
+    assert_eq!(
+        out.fetch_kind.as_deref(),
+        Some("petstore.event.pet_fetched")
+    );
     assert_eq!(out.fetched_name.as_deref(), Some("doggie"));
     assert_eq!(out.add_kind.as_deref(), Some("petstore.event.pet_added"));
     assert_eq!(out.added_id, Some(777), "server-assigned id round-trips");
-    assert_eq!(out.delete_kind.as_deref(), Some("petstore.event.pet_deleted"));
-    assert_eq!(out.deleted_payload_is_null, Some(true), "DELETE → null payload");
+    assert_eq!(
+        out.delete_kind.as_deref(),
+        Some("petstore.event.pet_deleted")
+    );
+    assert_eq!(
+        out.deleted_payload_is_null,
+        Some(true),
+        "DELETE → null payload"
+    );
     assert_eq!(out.error_kind.as_deref(), Some("petstore.event.error"));
-    assert_eq!(out.error_status, Some(500), "missing pet → 500 in event.error");
+    assert_eq!(
+        out.error_status,
+        Some(500),
+        "missing pet → 500 in event.error"
+    );
 }
 
 /// Model schemas register against `serde_json::Value`, and that registry also
@@ -267,14 +294,21 @@ fn registry_mixes_dyn_value_with_static_types() {
 
     // Dyn model schema present and carries its JSON schema.
     let pet_schema = registry.lookup(&EventKind::from_static("petstore.pet"));
-    assert!(pet_schema.is_some(), "model schema registered as petstore.pet");
+    assert!(
+        pet_schema.is_some(),
+        "model schema registered as petstore.pet"
+    );
     assert!(pet_schema.unwrap().schema().is_some(), "schema retained");
 
     // Dyn command kind present as Value; static kind present as String. Both coexist.
-    assert!(registry
-        .lookup(&EventKind::from_static("petstore.cmd.add_pet"))
-        .is_some());
-    assert!(registry
-        .lookup(&EventKind::from_static("telegram.cmd.send_message"))
-        .is_some());
+    assert!(
+        registry
+            .lookup(&EventKind::from_static("petstore.cmd.add_pet"))
+            .is_some()
+    );
+    assert!(
+        registry
+            .lookup(&EventKind::from_static("telegram.cmd.send_message"))
+            .is_some()
+    );
 }

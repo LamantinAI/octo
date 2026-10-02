@@ -30,8 +30,8 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    bus::{EventBus, Filter, InProcessBus, Subscription},
     Envelope, OctoResult,
+    bus::{EventBus, Filter, InProcessBus, Subscription},
 };
 
 #[async_trait]
@@ -47,11 +47,8 @@ pub trait Router: Send + Sync + 'static {
     /// Main loop. Receives a pre-built subscription (synchronously registered
     /// by the runtime, same pattern as the cogitator) so no early envelopes
     /// are missed.
-    async fn run(
-        self: Arc<Self>,
-        ctx: RouterContext,
-        subscription: Subscription,
-    ) -> OctoResult<()>;
+    async fn run(self: Arc<Self>, ctx: RouterContext, subscription: Subscription)
+    -> OctoResult<()>;
 }
 
 /// Runtime-provided context for the router. Carries shutdown signal and a
@@ -71,4 +68,3 @@ impl RouterContext {
         self.bus.publish(envelope).await
     }
 }
-

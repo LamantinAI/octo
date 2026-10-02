@@ -44,8 +44,7 @@ impl SubscribeOptions {
     /// shim is needed for any non-drop-oldest strategy, or a per-subscriber
     /// buffer deeper than the bus's broadcast ring.
     pub fn needs_shim(&self, bus_capacity: usize) -> bool {
-        !matches!(self.backpressure, BackpressureStrategy::DropOldest)
-            || self.buffer > bus_capacity
+        !matches!(self.backpressure, BackpressureStrategy::DropOldest) || self.buffer > bus_capacity
     }
 
     pub fn with_backpressure(mut self, b: BackpressureStrategy) -> Self {

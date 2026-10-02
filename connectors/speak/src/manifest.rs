@@ -5,7 +5,7 @@ use std::sync::Arc;
 use octo_core::{Connector, ConnectorFactory, ConnectorId, FactoryContext};
 use octo_openai_auth::SubscriptionAuth;
 
-use crate::{SpeakConnector, DEFAULT_VOICE, VOICES};
+use crate::{DEFAULT_VOICE, SpeakConnector, VOICES};
 
 /// The `speak` connector type: `[connector] type = "speak"`, with an optional default
 /// `voice`. Holds the assembly's shared [`SubscriptionAuth`]; without a token store on disk
@@ -25,7 +25,9 @@ impl ConnectorFactory for SpeakFactory {
         config: &toml::Value,
         _ctx: FactoryContext<'_>,
     ) -> Result<Arc<dyn Connector>, Box<dyn std::error::Error + Send + Sync>> {
-        let table = config.get("connector").ok_or("speak: manifest has no [connector] table")?;
+        let table = config
+            .get("connector")
+            .ok_or("speak: manifest has no [connector] table")?;
         if !self.auth.path().exists() {
             return Err(format!(
                 "speak: no subscription token at {} — sign in, or remove this manifest",
@@ -33,11 +35,19 @@ impl ConnectorFactory for SpeakFactory {
             )
             .into());
         }
-        let voice = table.get("voice").and_then(|v| v.as_str()).unwrap_or(DEFAULT_VOICE);
+        let voice = table
+            .get("voice")
+            .and_then(|v| v.as_str())
+            .unwrap_or(DEFAULT_VOICE);
         if !VOICES.contains(&voice) {
             return Err(format!("speak: unknown voice {voice:?}; use one of {VOICES:?}").into());
         }
-        Ok(SpeakConnector::with_voice(id.as_str(), self.auth.clone(), None, voice))
+        Ok(SpeakConnector::with_voice(
+            id.as_str(),
+            self.auth.clone(),
+            None,
+            voice,
+        ))
     }
 }
 

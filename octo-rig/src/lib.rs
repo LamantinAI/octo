@@ -13,17 +13,18 @@
 //! let answer = agent.prompt(user).multi_turn(5).send().await?;
 //! ```
 
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use octo_core::{
-    control::{CANCEL, CANCEL_SCOPE_TAG, RESTART_CONNECTOR, RESTART_PROCESS},
     ChannelId, ConnectorId, Envelope, EventBus, EventKind, InProcessBus,
+    control::{CANCEL, CANCEL_SCOPE_TAG, RESTART_CONNECTOR, RESTART_PROCESS},
 };
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::{completion::ToolDefinition, tool::Tool};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// The octo-code file tools (`read`/`write`/`edit`/`list`/`glob`/`grep`),
 /// available behind the `code` feature. Add them to a rig agent alongside
@@ -161,7 +162,12 @@ impl SendFileTool {
         target: ConnectorId,
         channel: impl Into<String>,
     ) -> Self {
-        Self { bus, source, target, channel: channel.into() }
+        Self {
+            bus,
+            source,
+            target,
+            channel: channel.into(),
+        }
     }
 }
 
@@ -205,9 +211,13 @@ impl Tool for SendFileTool {
         if let Some(f) = &args.filename {
             payload["filename"] = json!(f);
         }
-        let env = Envelope::new(self.source.clone(), EventKind::from_static("chat.send_file"), payload)
-            .with_target(self.target.clone())
-            .with_channel(ChannelId::new(self.channel.clone()));
+        let env = Envelope::new(
+            self.source.clone(),
+            EventKind::from_static("chat.send_file"),
+            payload,
+        )
+        .with_target(self.target.clone())
+        .with_channel(ChannelId::new(self.channel.clone()));
 
         tracing::info!(path = %args.path, target = %self.target, "rig tool → send_file");
         match self.bus.publish(env).await {
@@ -323,7 +333,11 @@ pub async fn carry_out_cancel(
     source: &ConnectorId,
     scope: &str,
 ) -> Result<(), String> {
-    let env = Envelope::new(source.clone(), EventKind::from_static(CANCEL), scope.to_string());
+    let env = Envelope::new(
+        source.clone(),
+        EventKind::from_static(CANCEL),
+        scope.to_string(),
+    );
     tracing::info!(scope = %scope, "carrying out cancel");
     bus.publish(env).await.map_err(|e| e.to_string())
 }

@@ -9,9 +9,7 @@
 //! on any model library. Converting a `Turn` into a particular chat-message type
 //! (e.g. `rig::completion::Message`) belongs in the binding layer, not here.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::{collections::HashMap, path::PathBuf, sync::Mutex};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -55,10 +53,16 @@ pub enum Role {
 
 impl Turn {
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: Role::User, content: content.into() }
+        Self {
+            role: Role::User,
+            content: content.into(),
+        }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: Role::Assistant, content: content.into() }
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+        }
     }
 }
 
@@ -79,14 +83,22 @@ pub struct InMemoryHistory {
 
 impl InMemoryHistory {
     pub fn new(max: usize) -> Self {
-        Self { inner: Mutex::new(HashMap::new()), max }
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            max,
+        }
     }
 }
 
 #[async_trait]
 impl HistoryStore for InMemoryHistory {
     async fn load(&self, channel: &str) -> Vec<Turn> {
-        self.inner.lock().unwrap().get(channel).cloned().unwrap_or_default()
+        self.inner
+            .lock()
+            .unwrap()
+            .get(channel)
+            .cloned()
+            .unwrap_or_default()
     }
 
     async fn append(&self, channel: &str, turns: &[Turn]) -> Result<()> {
@@ -114,7 +126,13 @@ impl FileHistory {
     fn path(&self, channel: &str) -> PathBuf {
         let safe: String = channel
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         self.dir.join(format!("{safe}.json"))
     }
@@ -153,9 +171,12 @@ mod tests {
     #[tokio::test]
     async fn in_memory_appends_and_trims_per_channel() {
         let h = InMemoryHistory::new(2);
-        h.append("a", &[Turn::user("1"), Turn::assistant("2"), Turn::user("3")])
-            .await
-            .unwrap();
+        h.append(
+            "a",
+            &[Turn::user("1"), Turn::assistant("2"), Turn::user("3")],
+        )
+        .await
+        .unwrap();
         h.append("b", &[Turn::user("x")]).await.unwrap();
         let a = h.load("a").await;
         assert_eq!(a.len(), 2, "trimmed to cap");

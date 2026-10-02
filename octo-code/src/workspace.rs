@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-pub use octo_workspace::{resolve_in_root, WorkspaceError, TMP_PREFIX, WORKSPACE_ENV};
+pub use octo_workspace::{TMP_PREFIX, WORKSPACE_ENV, WorkspaceError, resolve_in_root};
 
 /// The workspace root from the environment (octo-code never pins it).
 pub fn workspace_root() -> Result<PathBuf, WorkspaceError> {

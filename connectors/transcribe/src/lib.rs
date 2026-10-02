@@ -25,9 +25,7 @@
 mod chunk;
 mod manifest;
 
-pub use crate::manifest::{factory, Settings};
-
-use crate::chunk::{is_video, merge, upload_chunks, Scratch};
+pub use crate::manifest::{Settings, factory};
 
 use std::{
     fmt,
@@ -41,12 +39,15 @@ use chrono::Utc;
 use octo_core::{
     Connector, ConnectorCapabilities, ConnectorContext, ConnectorId, Envelope, EventKind, Filter,
     OctoResult, SubscribeOptions,
+    control::{CANCEL, CANCEL_SCOPE_TAG, ScopedTasks},
 };
 use octo_openai_auth::{Subscription, SubscriptionAuth};
 use octo_workspace::{read_in_root, resolve_file_in_root, workspace_root};
 use reqwest::{Client as HttpClient, StatusCode};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::{info, warn};
+
+use crate::chunk::{Scratch, is_video, merge, upload_chunks};
 
 /// Command kind this connector accepts.
 const RUN: &str = "transcribe.run";
@@ -58,7 +59,8 @@ const ORIGINATOR: &str = "Codex Desktop";
 /// inside this; generous because a slow link, not the ASR, is the risk.
 const TIMEOUT: Duration = Duration::from_secs(300);
 
-const CATALOG: &str = "Transcribe a recording to text on the ChatGPT subscription. Dispatch to this connector's id:
+const CATALOG: &str =
+    "Transcribe a recording to text on the ChatGPT subscription. Dispatch to this connector's id:
 - transcribe.run { path, language? } -> { text }
   `path` is a workspace-relative audio/video file (e.g. a recording sent to the chat and saved to
   the inbox); `language` is an optional hint like \"ru\" (omitted -> auto-detected). Any length: a
@@ -96,7 +98,13 @@ impl TranscribeConnector {
         let capabilities = ConnectorCapabilities::bidirectional()
             .with_accept_kinds([EventKind::from_static(RUN)])
             .with_description(CATALOG);
-        Arc::new(Self { id: ConnectorId::new(id), capabilities, auth, workspace, settings })
+        Arc::new(Self {
+            id: ConnectorId::new(id),
+            capabilities,
+            auth,
+            workspace,
+            settings,
+        })
     }
 
     async fn handle(&self, env: &Envelope, ctx: &ConnectorContext) {
@@ -104,9 +112,16 @@ impl TranscribeConnector {
             return;
         }
         let params = env.payload_as::<Value>().cloned().unwrap_or(Value::Null);
-        let payload = self.run(&params).await.unwrap_or_else(|e| json!({ "error": e }));
-        let resp = Envelope::new(self.id.clone(), EventKind::new(format!("{RUN}.result")), payload)
-            .with_correlation(env.id);
+        let payload = self
+            .run(&params)
+            .await
+            .unwrap_or_else(|e| json!({ "error": e }));
+        let resp = Envelope::new(
+            self.id.clone(),
+            EventKind::new(format!("{RUN}.result")),
+            payload,
+        )
+        .with_correlation(env.id);
         if let Err(e) = ctx.publish(resp).await {
             warn!(error = %e, "transcribe: failed to publish result");
         }
@@ -117,10 +132,16 @@ impl TranscribeConnector {
             .get("path")
             .and_then(Value::as_str)
             .ok_or("provide `path` (a workspace-relative audio/video file)")?;
-        let language = params.get("language").and_then(Value::as_str).or(self.settings.language.as_deref());
+        let language = params
+            .get("language")
+            .and_then(Value::as_str)
+            .or(self.settings.language.as_deref());
 
         let root = workspace_root(self.workspace.as_deref()).map_err(|e| e.to_string())?;
-        let filename = Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or("audio");
+        let filename = Path::new(path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("audio");
 
         // Measure first: a long recording or a video is split on its pauses. Without
         // ffmpeg on the host the file goes up whole, as it always did.
@@ -130,7 +151,9 @@ impl TranscribeConnector {
                 return self.run_chunked(&file, total, language).await;
             }
             Ok(_) => {}
-            Err(e) => warn!(error = %e, "transcribe: cannot measure the recording; uploading it whole"),
+            Err(e) => {
+                warn!(error = %e, "transcribe: cannot measure the recording; uploading it whole")
+            }
         }
 
         let audio = read_in_root(&root, path).map_err(|e| e.to_string())?;
@@ -153,7 +176,12 @@ impl TranscribeConnector {
     /// Cut the recording on its pauses, upload the chunks in parallel, and merge the text
     /// with a timecode per chunk. A refused token is refreshed once and the refused chunks
     /// retried; any other failure is marked in place.
-    async fn run_chunked(&self, file: &Path, total: f64, language: Option<&str>) -> Result<Value, String> {
+    async fn run_chunked(
+        &self,
+        file: &Path,
+        total: f64,
+        language: Option<&str>,
+    ) -> Result<Value, String> {
         let pauses = chunk::pauses(file).await?;
         let spans = chunk::plan(total, &pauses, self.settings.chunk_secs);
         let scratch = Scratch::new()?;
@@ -161,14 +189,28 @@ impl TranscribeConnector {
         for (i, span) in spans.iter().enumerate() {
             chunks.push(chunk::cut(file, *span, scratch.path(), i).await?);
         }
-        info!(secs = total as u64, pauses = pauses.len(), chunks = chunks.len(), "transcribe: split on pauses");
+        info!(
+            secs = total as u64,
+            pauses = pauses.len(),
+            chunks = chunks.len(),
+            "transcribe: split on pauses"
+        );
 
         let mut sub = self.auth.fresh().await.map_err(|e| e.to_string())?;
-        let mut texts: Vec<Option<Result<String, TranscribeError>>> = chunks.iter().map(|_| None).collect();
+        let mut texts: Vec<Option<Result<String, TranscribeError>>> =
+            chunks.iter().map(|_| None).collect();
         let mut pending: Vec<usize> = (0..chunks.len()).collect();
         for pass in 0..2 {
             let mut refused = Vec::new();
-            for (i, result) in upload_chunks(&chunks, &pending, language, &sub, self.settings.parallel_uploads).await {
+            for (i, result) in upload_chunks(
+                &chunks,
+                &pending,
+                language,
+                &sub,
+                self.settings.parallel_uploads,
+            )
+            .await
+            {
                 if matches!(result, Err(TranscribeError::Unauthorized(_))) {
                     refused.push(i);
                 }
@@ -178,14 +220,16 @@ impl TranscribeConnector {
                 break;
             }
             // The server can revoke a token ahead of its `exp`: refresh once and retry.
-            warn!(chunks = refused.len(), "transcribe: token refused; forcing a refresh and retrying");
+            warn!(
+                chunks = refused.len(),
+                "transcribe: token refused; forcing a refresh and retrying"
+            );
             sub = self.auth.force_refresh().await.map_err(|e| e.to_string())?;
             pending = refused;
         }
         merge(&spans, texts, total)
     }
 }
-
 
 #[async_trait]
 impl Connector for TranscribeConnector {
@@ -198,19 +242,48 @@ impl Connector for TranscribeConnector {
     }
 
     async fn run(self: Arc<Self>, ctx: ConnectorContext) -> OctoResult<()> {
-        let mut cmds = ctx
-            .subscribe(Filter::by_target(self.id.clone()), SubscribeOptions::default())
+        // One ordered subscription for commands and cancellations: a cancel cannot
+        // overtake a queued command through a separate subscription.
+        let mut events = ctx
+            .subscribe(
+                Filter::by_kind(RUN).with_kind(CANCEL),
+                SubscribeOptions::default(),
+            )
             .await?;
+        let mut jobs = ScopedTasks::default();
         info!(connector = %self.id, "transcribe ready");
         loop {
             tokio::select! {
-                next = cmds.next() => match next {
-                    Some(env) => self.handle(&env, &ctx).await,
-                    None => return Ok(()),
+                next = events.next() => match next {
+                    Some(env) if env.kind.as_str() == CANCEL => {
+                        if let Some(scope) = env.payload_as::<String>() { jobs.cancel(scope); }
+                    }
+                    Some(env) if env.target.as_ref() == Some(&self.id) => {
+                        let scope = env.tags.get(CANCEL_SCOPE_TAG).cloned();
+                        let me = self.clone();
+                        let ctx = ctx.clone();
+                        jobs.spawn(scope, move |cancel| async move {
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => {
+                                    let payload = json!({"error": "operation cancelled; external outcome may be unknown", "cancelled": true});
+                                    let response = Envelope::new(me.id.clone(), EventKind::new(format!("{RUN}.result")), payload).with_correlation(env.id);
+                                    let _ = ctx.publish(response).await;
+                                }
+                                _ = me.handle(&env, &ctx) => {}
+                            }
+                        });
+                    }
+                    Some(_) => {},
+                    None => break,
                 },
-                _ = ctx.shutdown.cancelled() => return Ok(()),
+                _ = jobs.join_next(), if !jobs.is_empty() => {},
+                _ = ctx.shutdown.cancelled() => break,
             }
         }
+        jobs.cancel_all();
+        while jobs.join_next().await.is_some() {}
+        Ok(())
     }
 }
 
@@ -267,7 +340,10 @@ pub async fn transcribe(
     let resp = HttpClient::new()
         .post(URL)
         .timeout(TIMEOUT)
-        .header("Content-Type", format!("multipart/form-data; boundary={boundary}"))
+        .header(
+            "Content-Type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
         .header("Authorization", format!("Bearer {}", sub.access_token))
         .header("chatgpt-account-id", sub.account_id.as_str())
         .header("originator", ORIGINATOR)
@@ -297,19 +373,27 @@ pub async fn transcribe(
     let transcript = parsed
         .get("text")
         .and_then(Value::as_str)
-        .ok_or_else(|| TranscribeError::Failed(format!("no `text` in response: {}", snippet(&text))))?
+        .ok_or_else(|| {
+            TranscribeError::Failed(format!("no `text` in response: {}", snippet(&text)))
+        })?
         .trim()
         .to_string();
 
     if looks_truncated(&transcript) {
-        warn!(chars = transcript.len(), "transcript may be truncated (no terminal punctuation)");
+        warn!(
+            chars = transcript.len(),
+            "transcript may be truncated (no terminal punctuation)"
+        );
     }
     Ok(transcript)
 }
 
 /// A unique multipart boundary, shaped like the desktop client's.
 fn boundary() -> String {
-    format!("----codex-transcribe-{}", Utc::now().timestamp_nanos_opt().unwrap_or_default())
+    format!(
+        "----codex-transcribe-{}",
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    )
 }
 
 /// Assemble the `multipart/form-data` body by hand — one file part plus an optional
@@ -356,7 +440,6 @@ fn snippet(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{content_type_for, looks_truncated, multipart_body};
-
 
     #[test]
     fn content_type_is_guessed_from_the_extension() {
@@ -405,17 +488,29 @@ mod tests {
         });
         let auth = Arc::new(SubscriptionAuth::new(PathBuf::from(auth_path)));
         let root = file.parent().expect("a parent dir").to_path_buf();
-        let name = file.file_name().and_then(|s| s.to_str()).expect("a file name");
+        let name = file
+            .file_name()
+            .and_then(|s| s.to_str())
+            .expect("a file name");
 
         let connector = TranscribeConnector::new("transcribe", auth, Some(root));
         let started = std::time::Instant::now();
-        let out = connector.run(&json!({ "path": name, "language": "ru" })).await.expect("transcribed");
+        let out = connector
+            .run(&json!({ "path": name, "language": "ru" }))
+            .await
+            .expect("transcribed");
         let text = out["text"].as_str().unwrap_or_default();
         println!(
             "\n=== {} chunks, failed {}, truncated {}, {:.0}s wall ===\n{text}\n=== end ===",
-            out["chunks"], out["failed"], out["truncated_chunks"], started.elapsed().as_secs_f64()
+            out["chunks"],
+            out["failed"],
+            out["truncated_chunks"],
+            started.elapsed().as_secs_f64()
         );
-        assert!(out["chunks"].as_u64().unwrap_or(1) > 1, "a long recording should be split");
+        assert!(
+            out["chunks"].as_u64().unwrap_or(1) > 1,
+            "a long recording should be split"
+        );
         assert_eq!(out["failed"], 0);
     }
 
@@ -439,12 +534,18 @@ mod tests {
         let auth = SubscriptionAuth::new(PathBuf::from(auth_path));
         let sub = auth.fresh().await.expect("a fresh subscription token");
         let bytes = std::fs::read(&file).expect("read the audio file");
-        let name = Path::new(&file).file_name().and_then(|s| s.to_str()).unwrap_or("audio");
+        let name = Path::new(&file)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("audio");
 
         let text = transcribe(&bytes, name, content_type_for(name), Some("ru"), &sub)
             .await
             .expect("the endpoint transcribes the recording");
-        println!("\n=== TRANSCRIPT ({} chars) ===\n{text}\n=== end ===\n", text.len());
+        println!(
+            "\n=== TRANSCRIPT ({} chars) ===\n{text}\n=== end ===\n",
+            text.len()
+        );
         assert!(!text.trim().is_empty(), "transcript should not be empty");
     }
 }

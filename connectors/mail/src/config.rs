@@ -52,7 +52,11 @@ impl MailConfig {
     /// vendor defaults); ports default to implicit-TLS 993/465, mailbox to INBOX.
     pub(crate) fn from_table(table: &Toml) -> Result<Self> {
         let lit = |key: &str, default: &str| -> String {
-            table.get(key).and_then(Toml::as_str).unwrap_or(default).to_string()
+            table
+                .get(key)
+                .and_then(Toml::as_str)
+                .unwrap_or(default)
+                .to_string()
         };
         let required = |key: &str| -> Result<String> {
             table
@@ -78,7 +82,9 @@ impl MailConfig {
                 .and_then(Toml::as_str)
                 .ok_or_else(|| MailError::Config(format!("manifest missing `{key}`")))?;
             std::env::var(var)
-                .map_err(|_| MailError::Config(format!("env var {var} (named by {key}) is not set")))
+                .map_err(|_| {
+                    MailError::Config(format!("env var {var} (named by {key}) is not set"))
+                })
                 .and_then(|s| {
                     if s.trim().is_empty() {
                         Err(MailError::Config(format!("env var {var} is empty")))
@@ -91,9 +97,9 @@ impl MailConfig {
         let opt_secret = |key: &str| -> Result<Option<String>> {
             match table.get(key).and_then(Toml::as_str) {
                 None => Ok(None),
-                Some(var) => std::env::var(var)
-                    .map(Some)
-                    .map_err(|_| MailError::Config(format!("env var {var} (named by {key}) is not set"))),
+                Some(var) => std::env::var(var).map(Some).map_err(|_| {
+                    MailError::Config(format!("env var {var} (named by {key}) is not set"))
+                }),
             }
         };
 
@@ -125,5 +131,9 @@ impl MailConfig {
 
 /// Read an optional usize from a command payload.
 pub(crate) fn opt_usize(params: &Value, key: &str, default: usize) -> usize {
-    params.get(key).and_then(Value::as_u64).map(|n| n as usize).unwrap_or(default)
+    params
+        .get(key)
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or(default)
 }

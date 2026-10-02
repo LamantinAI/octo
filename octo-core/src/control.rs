@@ -13,9 +13,13 @@
 //!   (systemd `Restart=always`) brings it back with fresh config.
 //! - [`CANCEL`] — abort in-flight work carrying a matching [`CANCEL_SCOPE_TAG`].
 //!   Unlike the restarts (executed by the runtime's control listener), a CANCEL is
-//!   honoured by the *long-running connectors themselves* (forkd): each aborts the
+//!   honoured by the *long-running connectors themselves* (forkd, speak, transcribe, imagegen): each aborts the
 //!   run whose scope matches and kills its process group. The runtime does not act
 //!   on it — it is a connector-directed control signal that rides the same plane.
+
+mod tasks;
+pub use tasks::ScopedTasks;
+pub use tokio_util::sync::CancellationToken;
 
 /// Restart a single connector. Payload: its id as a `String`.
 pub const RESTART_CONNECTOR: &str = "octo.control.restart_connector";
@@ -38,3 +42,7 @@ pub const CANCEL_SCOPE_TAG: &str = "cancel_scope";
 
 /// Glob matching every control kind — for the runtime's listener subscription.
 pub const CONTROL_GLOB: &str = "octo.control.**";
+
+// ScopedTasks is optional bookkeeping, not an interrupt policy. Only a cogitator
+// or another explicit controller decides when to emit CANCEL. The operation may
+// cooperate with its token to finish a safe stop instead of dropping its future.

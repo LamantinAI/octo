@@ -29,8 +29,8 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    bus::{EventBus, Filter, InProcessBus, Subscription},
     ConnectorId, Envelope, EventKind, OctoResult,
+    bus::{EventBus, Filter, InProcessBus, Subscription},
 };
 
 /// A long-lived I/O actor wrapping a single protocol/transport.

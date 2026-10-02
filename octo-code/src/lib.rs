@@ -21,7 +21,7 @@ mod workspace;
 pub use search::{GlobTool, GrepTool};
 pub use tools::{EditTool, ListTool, ReadTool, WriteTool};
 pub use workspace::{
-    read_within, resolve_in_root, workspace_root, write_atomic, WorkspaceError, WORKSPACE_ENV,
+    WORKSPACE_ENV, WorkspaceError, read_within, resolve_in_root, workspace_root, write_atomic,
 };
 
 /// Crate-wide lock for tests that set the process-global `OCTO_CODE_WORKSPACE`.

@@ -39,10 +39,11 @@ use chrono::Utc;
 use octo_core::{
     Connector, ConnectorCapabilities, ConnectorContext, ConnectorId, Envelope, EventKind, Filter,
     OctoResult, SubscribeOptions,
+    control::{CANCEL, CANCEL_SCOPE_TAG, CancellationToken, ScopedTasks},
 };
 use octo_openai_auth::SubscriptionAuth;
 use octo_workspace::{workspace_root, write_in_root};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use crate::{call::synthesize, signal::CallError};
@@ -53,8 +54,9 @@ pub use crate::manifest::factory;
 pub(crate) const RUN: &str = "speak.run";
 
 /// The voices the endpoint accepts.
-pub(crate) const VOICES: [&str; 9] =
-    ["cove", "juniper", "maple", "spruce", "ember", "vale", "breeze", "arbor", "sol"];
+pub(crate) const VOICES: [&str; 9] = [
+    "cove", "juniper", "maple", "spruce", "ember", "vale", "breeze", "arbor", "sol",
+];
 
 /// Default voice when the caller does not name one.
 pub(crate) const DEFAULT_VOICE: &str = "cove";
@@ -100,23 +102,36 @@ impl SpeakConnector {
         let capabilities = ConnectorCapabilities::bidirectional()
             .with_accept_kinds([EventKind::from_static(RUN)])
             .with_description(CATALOG);
-        Arc::new(Self { id: ConnectorId::new(id), capabilities, auth, workspace, voice: voice.to_string() })
+        Arc::new(Self {
+            id: ConnectorId::new(id),
+            capabilities,
+            auth,
+            workspace,
+            voice: voice.to_string(),
+        })
     }
 
-    async fn handle(&self, env: &Envelope, ctx: &ConnectorContext) {
+    async fn handle(&self, env: &Envelope, ctx: &ConnectorContext, cancel: &CancellationToken) {
         if env.kind.as_str() != RUN {
             return;
         }
         let params = env.payload_as::<Value>().cloned().unwrap_or(Value::Null);
-        let payload = self.run(&params).await.unwrap_or_else(|e| json!({ "error": e }));
-        let resp = Envelope::new(self.id.clone(), EventKind::new(format!("{RUN}.result")), payload)
-            .with_correlation(env.id);
+        let payload = self
+            .run(&params, cancel)
+            .await
+            .unwrap_or_else(|e| json!({ "error": e }));
+        let resp = Envelope::new(
+            self.id.clone(),
+            EventKind::new(format!("{RUN}.result")),
+            payload,
+        )
+        .with_correlation(env.id);
         if let Err(e) = ctx.publish(resp).await {
             warn!(error = %e, "speak: failed to publish result");
         }
     }
 
-    async fn run(&self, params: &Value) -> Result<Value, String> {
+    async fn run(&self, params: &Value, cancel: &CancellationToken) -> Result<Value, String> {
         let text = params
             .get("text")
             .and_then(Value::as_str)
@@ -129,7 +144,10 @@ impl SpeakConnector {
                 text.chars().count()
             ));
         }
-        let voice = params.get("voice").and_then(Value::as_str).unwrap_or(&self.voice);
+        let voice = params
+            .get("voice")
+            .and_then(Value::as_str)
+            .unwrap_or(&self.voice);
         if !VOICES.contains(&voice) {
             return Err(format!("unknown voice {voice}; use one of {VOICES:?}"));
         }
@@ -138,18 +156,21 @@ impl SpeakConnector {
         let sub = self.auth.fresh().await.map_err(|e| e.to_string())?;
 
         info!(chars = text.chars().count(), %voice, "speak: run");
-        let (ogg, transcript) = match synthesize(text, voice, &sub).await {
+        let (ogg, transcript) = match synthesize(text, voice, &sub, cancel.clone()).await {
             // The server can revoke a token ahead of its `exp`: refresh once and retry.
             Err(CallError::Unauthorized(_)) => {
                 warn!("speak: token refused; forcing a refresh and retrying once");
                 let sub = self.auth.force_refresh().await.map_err(|e| e.to_string())?;
-                synthesize(text, voice, &sub).await
+                synthesize(text, voice, &sub, cancel.clone()).await
             }
             other => other,
         }
         .map_err(CallError::into_message)?;
 
-        let rel = format!("speech-{}.ogg", Utc::now().timestamp_nanos_opt().unwrap_or_default());
+        let rel = format!(
+            "speech-{}.ogg",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
         write_in_root(&root, &rel, &ogg).map_err(|e| e.to_string())?;
         info!(path = %rel, bytes = ogg.len(), "speak: wrote voice note");
 
@@ -172,18 +193,47 @@ impl Connector for SpeakConnector {
     }
 
     async fn run(self: Arc<Self>, ctx: ConnectorContext) -> OctoResult<()> {
-        let mut cmds = ctx
-            .subscribe(Filter::by_target(self.id.clone()), SubscribeOptions::default())
+        // One ordered subscription for commands and cancellations: a cancel cannot
+        // overtake a queued command through a separate subscription.
+        let mut events = ctx
+            .subscribe(
+                Filter::by_kind(RUN).with_kind(CANCEL),
+                SubscribeOptions::default(),
+            )
             .await?;
+        let mut jobs = ScopedTasks::default();
         info!(connector = %self.id, "speak ready");
         loop {
             tokio::select! {
-                next = cmds.next() => match next {
-                    Some(env) => self.handle(&env, &ctx).await,
-                    None => return Ok(()),
+                next = events.next() => match next {
+                    Some(env) if env.kind.as_str() == CANCEL => {
+                        if let Some(scope) = env.payload_as::<String>() { jobs.cancel(scope); }
+                    }
+                    Some(env) if env.target.as_ref() == Some(&self.id) => {
+                        let scope = env.tags.get(CANCEL_SCOPE_TAG).cloned();
+                        let me = self.clone();
+                        let ctx = ctx.clone();
+                        jobs.spawn(scope, move |cancel| async move {
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => {
+                                    let payload = json!({"error": "operation cancelled; external outcome may be unknown", "cancelled": true});
+                                    let response = Envelope::new(me.id.clone(), EventKind::new(format!("{RUN}.result")), payload).with_correlation(env.id);
+                                    let _ = ctx.publish(response).await;
+                                }
+                                _ = me.handle(&env, &ctx, &cancel) => {}
+                            }
+                        });
+                    }
+                    Some(_) => {},
+                    None => break,
                 },
-                _ = ctx.shutdown.cancelled() => return Ok(()),
+                _ = jobs.join_next(), if !jobs.is_empty() => {},
+                _ = ctx.shutdown.cancelled() => break,
             }
         }
+        jobs.cancel_all();
+        while jobs.join_next().await.is_some() {}
+        Ok(())
     }
 }

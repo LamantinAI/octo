@@ -22,27 +22,23 @@
 //! ro-bind the interpreter and skills) with per-skill capabilities gating it.
 
 use std::{
-    collections::HashMap,
     path::{Component, Path, PathBuf},
-    process::Stdio,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
-    },
+    sync::{Arc, atomic::AtomicU64},
     time::Duration,
 };
 
 use async_trait::async_trait;
 use octo_core::{
-    control::{CANCEL, CANCEL_SCOPE_TAG},
     Connector, ConnectorCapabilities, ConnectorContext, ConnectorFactory, ConnectorId, Envelope,
     EventKind, FactoryContext, Filter, OctoResult, SubscribeOptions,
+    control::{CANCEL, CANCEL_SCOPE_TAG, ScopedTasks},
 };
-use octo_workspace::workspace_root;
-use serde_json::{json, Value};
-use tokio::{io::AsyncWriteExt, process::Command, time::timeout};
-use tokio_util::sync::CancellationToken;
+use serde_json::{Value, json};
 use tracing::{info, warn};
+
+mod identity;
+mod process;
+use self::identity::{can_drop_uid, resolve_group, resolve_user};
 
 const RUN: &str = "forkd.run";
 
@@ -87,11 +83,6 @@ pub struct ForkdConnector {
     /// CLI on the host's login. Only these names pass; everything else stays cleared.
     env_passthrough: Vec<String>,
     seq: AtomicU64,
-    /// In-flight runs, keyed by a monotonic run id, holding each run's cancellation
-    /// scope (the `cancel_scope` tag off its request) and its token. An
-    /// `octo.control.cancel { scope }` fires every token whose scope matches; a run
-    /// removes its own entry when it finishes. Empty when nothing is running.
-    inflight: Mutex<HashMap<u64, (String, CancellationToken)>>,
 }
 
 impl ForkdConnector {
@@ -121,7 +112,6 @@ impl ForkdConnector {
             limits,
             env_passthrough,
             seq: AtomicU64::new(0),
-            inflight: Mutex::new(HashMap::new()),
         })
     }
 
@@ -148,208 +138,38 @@ impl Connector for ForkdConnector {
     }
 
     async fn run(self: Arc<Self>, ctx: ConnectorContext) -> OctoResult<()> {
-        let mut cmds = ctx
-            .subscribe(Filter::by_target(self.id.clone()), SubscribeOptions::default())
+        let mut events = ctx
+            .subscribe(
+                Filter::by_kind(RUN).with_kind(CANCEL),
+                SubscribeOptions::default(),
+            )
             .await?;
-        // A second subscription for the cancel control signal — it is broadcast by kind,
-        // not targeted at us, so `by_target` above would never see it (Filter is AND).
-        let mut cancels =
-            ctx.subscribe(Filter::by_kind(CANCEL), SubscribeOptions::default()).await?;
-        info!(connector = %self.id, drop_uid = ?self.drop_to.map(|(u, _)| u), "forkd ready");
+        let mut jobs = ScopedTasks::default();
+        info!(connector = %self.id, "forkd ready");
         loop {
             tokio::select! {
-                next = cmds.next() => match next {
-                    // Each run is spawned so the loop stays free to receive the next
-                    // command AND a cancel while a long script is still running.
-                    Some(env) => self.clone().spawn_run(env, &ctx),
-                    None => return Ok(()),
-                },
-                next = cancels.next() => match next {
-                    Some(env) => self.cancel_scope(&env),
-                    None => return Ok(()),
-                },
-                _ = ctx.shutdown.cancelled() => return Ok(()),
-            }
-        }
-    }
-}
-
-impl ForkdConnector {
-    /// Spawn one `forkd.run` as its own task and return immediately. The task runs the
-    /// script (cancellable), publishes the correlated result, and clears its in-flight
-    /// entry. Non-`RUN` envelopes are ignored.
-    fn spawn_run(self: Arc<Self>, env: Arc<Envelope>, ctx: &ConnectorContext) {
-        if env.kind.as_str() != RUN {
-            return;
-        }
-        let ctx = ctx.clone();
-        tokio::spawn(async move {
-            let params = env.payload_as::<Value>().cloned().unwrap_or(Value::Null);
-            let scope = env.tags.get(CANCEL_SCOPE_TAG).cloned().unwrap_or_default();
-            let run_id = self.seq.fetch_add(1, Ordering::Relaxed);
-            let cancel = CancellationToken::new();
-            self.inflight.lock().unwrap().insert(run_id, (scope, cancel.clone()));
-
-            let payload =
-                self.run_script(&params, &cancel).await.unwrap_or_else(|e| json!({ "error": e }));
-
-            self.inflight.lock().unwrap().remove(&run_id);
-
-            let resp =
-                Envelope::new(self.id.clone(), EventKind::new(format!("{RUN}.result")), payload)
-                    .with_correlation(env.id);
-            if let Err(e) = ctx.publish(resp).await {
-                warn!(error = %e, "forkd failed to publish result");
-            }
-        });
-    }
-
-    /// Honour `octo.control.cancel { scope }`: fire every in-flight run whose scope
-    /// matches, so each kills its process group and returns a cancelled result. An empty
-    /// or unknown scope is a no-op.
-    fn cancel_scope(&self, env: &Envelope) {
-        let Some(scope) = env.payload_as::<String>().filter(|s| !s.is_empty()) else {
-            return;
-        };
-        let map = self.inflight.lock().unwrap();
-        let mut n = 0;
-        for (s, tok) in map.values() {
-            if s == scope {
-                tok.cancel();
-                n += 1;
-            }
-        }
-        if n > 0 {
-            info!(scope = %scope, runs = n, "forkd: cancelling in-flight runs");
-        }
-    }
-
-    async fn run_script(&self, params: &Value, cancel: &CancellationToken) -> Result<Value, String> {
-        let workspace = workspace_root(self.workspace.as_deref()).map_err(|e| e.to_string())?;
-        let interpreter = params.get("interpreter").and_then(Value::as_str);
-        let inline = params.get("script").and_then(Value::as_str);
-        let user_args: Vec<String> = params
-            .get("args")
-            .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-            .unwrap_or_default();
-        let stdin = params.get("stdin").and_then(Value::as_str).map(String::from);
-        let dur = params
-            .get("timeout_secs")
-            .and_then(Value::as_u64)
-            .map(Duration::from_secs)
-            .unwrap_or(self.default_timeout)
-            .min(self.max_timeout);
-
-        // Resolve the file to run: a skill's bundled script (run IN PLACE from the
-        // skills root — never copied), an inline script (written into the workspace),
-        // or a workspace-relative path. All jailed against `..`/absolute escapes;
-        // cwd stays the workspace either way, so outputs land there.
-        let target = if let Some(rel) = params.get("skill_path").and_then(Value::as_str) {
-            let root = self.skills_root()?;
-            jailed(&root, rel)?
-        } else if let Some(body) = inline {
-            let n = self.seq.fetch_add(1, Ordering::Relaxed);
-            let file = workspace.join(format!(".forkd/run-{n}.{}", ext_of(interpreter)));
-            if let Some(parent) = file.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            }
-            std::fs::write(&file, body).map_err(|e| e.to_string())?;
-            file
-        } else if let Some(rel) = params.get("path").and_then(Value::as_str) {
-            jailed(&workspace, rel)?
-        } else {
-            return Err(
-                "provide `skill_path` (a skill's bundled script), `path` (a workspace script) or `script` (inline body)"
-                    .into(),
-            );
-        };
-        let target = target.to_string_lossy().into_owned();
-
-        // program + args: `interpreter target args…`, else run the target directly
-        // (an inline script with no interpreter defaults to bash).
-        let (program, full_args) = match (interpreter, inline.is_some()) {
-            (Some(it), _) => (it.to_string(), prepend(&target, user_args)),
-            (None, true) => ("bash".to_string(), prepend(&target, user_args)),
-            (None, false) => (target.clone(), user_args),
-        };
-
-        let mut cmd = Command::new(&program);
-        cmd.args(&full_args)
-            .current_dir(&workspace)
-            .env_clear()
-            .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-            .env("HOME", &workspace)
-            .env("TMPDIR", &workspace)
-            .env("LANG", "C.UTF-8")
-            .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
-            ;
-        // Forward the manifest's allowlisted env vars (by name) from our own process.
-        for name in &self.env_passthrough {
-            if let Some(val) = std::env::var_os(name) {
-                cmd.env(name, val);
-            }
-        }
-        cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .process_group(0);
-        if let Some((uid, gid)) = self.drop_to {
-            cmd.uid(uid).gid(gid);
-        }
-        let limits = self.limits;
-        // SAFETY: only async-signal-safe libc calls (setrlimit) run between fork and exec.
-        unsafe {
-            cmd.pre_exec(move || {
-                apply_limits(limits);
-                Ok(())
-            });
-        }
-
-        let mut child = cmd.spawn().map_err(|e| format!("spawn {program}: {e}"))?;
-        let pid = child.id();
-        if let (Some(input), Some(mut sink)) = (stdin, child.stdin.take()) {
-            let _ = sink.write_all(input.as_bytes()).await;
-        }
-        info!(program = %program, timeout_s = dur.as_secs(), "forkd: run");
-        // The run ends on whichever comes first: the script finishing, the wall-clock
-        // timeout, or an external cancel (octo.control.cancel for this run's scope).
-        // Both the timeout and the cancel kill the whole process group.
-        tokio::select! {
-            res = timeout(dur, child.wait_with_output()) => match res {
-                Ok(Ok(out)) => Ok(json!({
-                    "exit_code": out.status.code(),
-                    "stdout": cap(&out.stdout, self.max_output),
-                    "stderr": cap(&out.stderr, self.max_output),
-                    "timed_out": false,
-                })),
-                Ok(Err(e)) => Err(format!("run {program}: {e}")),
-                Err(_) => {
-                    if let Some(p) = pid {
-                        kill_group(p);
+                next = events.next() => match next {
+                    Some(env) if env.kind.as_str() == CANCEL => {
+                        if let Some(scope) = env.payload_as::<String>() { jobs.cancel(scope); }
                     }
-                    Ok(json!({
-                        "exit_code": Value::Null,
-                        "stdout": "",
-                        "stderr": format!("(killed: exceeded {}s wall-clock)", dur.as_secs()),
-                        "timed_out": true,
-                    }))
-                }
-            },
-            _ = cancel.cancelled() => {
-                if let Some(p) = pid {
-                    kill_group(p);
-                }
-                Ok(json!({
-                    "exit_code": Value::Null,
-                    "stdout": "",
-                    "stderr": "(cancelled)",
-                    "timed_out": false,
-                    "cancelled": true,
-                }))
+                    Some(env) if env.target.as_ref() == Some(&self.id) => {
+                        let me = self.clone(); let ctx = ctx.clone();
+                        jobs.spawn(env.tags.get(CANCEL_SCOPE_TAG).cloned(), move |cancel| async move {
+                            let params = env.payload_as::<Value>().cloned().unwrap_or(Value::Null);
+                            let payload = me.run_script(&params, &cancel).await.unwrap_or_else(|error| json!({"error":error}));
+                            let response = Envelope::new(me.id.clone(), EventKind::new(format!("{RUN}.result")), payload).with_correlation(env.id);
+                            if let Err(error) = ctx.publish(response).await { warn!(%error, "forkd result publish failed"); }
+                        });
+                    }
+                    Some(_) => {}, None => break,
+                },
+                _ = jobs.join_next(), if !jobs.is_empty() => {},
+                _ = ctx.shutdown.cancelled() => break,
             }
         }
+        jobs.cancel_all();
+        while jobs.join_next().await.is_some() {}
+        Ok(())
     }
 }
 
@@ -381,7 +201,11 @@ fn cap(bytes: &[u8], max: usize) -> String {
     if bytes.len() <= max {
         String::from_utf8_lossy(bytes).into_owned()
     } else {
-        format!("{}\n…(truncated, {} bytes total)", String::from_utf8_lossy(&bytes[..max]), bytes.len())
+        format!(
+            "{}\n…(truncated, {} bytes total)",
+            String::from_utf8_lossy(&bytes[..max]),
+            bytes.len()
+        )
     }
 }
 
@@ -397,7 +221,10 @@ fn apply_limits(l: Limits) {
         if val == 0 {
             return;
         }
-        let lim = libc::rlimit { rlim_cur: val as libc::rlim_t, rlim_max: val as libc::rlim_t };
+        let lim = libc::rlimit {
+            rlim_cur: val as libc::rlim_t,
+            rlim_max: val as libc::rlim_t,
+        };
         unsafe {
             libc::setrlimit(res, &lim);
         }
@@ -435,8 +262,16 @@ impl ConnectorFactory for ForkdConnectorFactory {
         config: &toml::Value,
         ctx: FactoryContext<'_>,
     ) -> Result<Arc<dyn Connector>, Box<dyn std::error::Error + Send + Sync>> {
-        let table = config.get("connector").ok_or("forkd: manifest has no [connector] table")?;
-        let u64_or = |k: &str, d: u64| table.get(k).and_then(toml::Value::as_integer).map(|v| v as u64).unwrap_or(d);
+        let table = config
+            .get("connector")
+            .ok_or("forkd: manifest has no [connector] table")?;
+        let u64_or = |k: &str, d: u64| {
+            table
+                .get(k)
+                .and_then(toml::Value::as_integer)
+                .map(|v| v as u64)
+                .unwrap_or(d)
+        };
 
         let workspace = table
             .get("workspace")
@@ -464,7 +299,10 @@ impl ConnectorFactory for ForkdConnectorFactory {
                     // open a setgid 2770 workspace — chdir would fail EACCES.
                     let gid = match run_group {
                         Some(g) => resolve_group(g).unwrap_or_else(|| {
-                            warn!(group = g, "forkd: run_group not found; using the run_as user's own group");
+                            warn!(
+                                group = g,
+                                "forkd: run_group not found; using the run_as user's own group"
+                            );
                             pw_gid
                         }),
                         None => pw_gid,
@@ -473,17 +311,25 @@ impl ConnectorFactory for ForkdConnectorFactory {
                     Some((uid, gid))
                 }
                 Some(_) => {
-                    warn!(user, "forkd: no setuid capability, cannot drop to run_as; scripts run as the current user");
+                    warn!(
+                        user,
+                        "forkd: no setuid capability, cannot drop to run_as; scripts run as the current user"
+                    );
                     None
                 }
                 None => {
-                    warn!(user, "forkd: run_as user not found; scripts run as the current user");
+                    warn!(
+                        user,
+                        "forkd: run_as user not found; scripts run as the current user"
+                    );
                     None
                 }
             },
             None => {
                 if unsafe { libc::geteuid() } == 0 {
-                    warn!("forkd: no run_as configured and running as ROOT — scripts run AS ROOT; set run_as to a dedicated unprivileged user");
+                    warn!(
+                        "forkd: no run_as configured and running as ROOT — scripts run AS ROOT; set run_as to a dedicated unprivileged user"
+                    );
                 }
                 None
             }
@@ -499,7 +345,11 @@ impl ConnectorFactory for ForkdConnectorFactory {
         let env_passthrough: Vec<String> = table
             .get("env_passthrough")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
 
         Ok(ForkdConnector::build(
@@ -519,208 +369,4 @@ impl ConnectorFactory for ForkdConnectorFactory {
 /// Convenience factory handle for registration.
 pub fn factory() -> Arc<dyn ConnectorFactory> {
     Arc::new(ForkdConnectorFactory::new())
-}
-
-/// Whether this process can setuid/setgid children: root, or a non-root service
-/// holding CAP_SETUID + CAP_SETGID in its effective set (systemd
-/// `AmbientCapabilities=CAP_SETUID CAP_SETGID` under a hardened `User=` unit).
-fn can_drop_uid() -> bool {
-    if unsafe { libc::geteuid() } == 0 {
-        return true;
-    }
-    // CapEff is a hex bitmask in /proc/self/status; CAP_SETGID = bit 6, CAP_SETUID = bit 7.
-    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
-        return false;
-    };
-    const NEEDED: u64 = (1 << 6) | (1 << 7);
-    status
-        .lines()
-        .find_map(|l| l.strip_prefix("CapEff:"))
-        .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
-        .is_some_and(|caps| caps & NEEDED == NEEDED)
-}
-
-/// Resolve a group name to its gid via `getgrnam` (called once, at config time).
-fn resolve_group(name: &str) -> Option<u32> {
-    let cname = std::ffi::CString::new(name).ok()?;
-    // SAFETY: as with getpwnam — read the static buffer immediately, copy out.
-    unsafe {
-        let gr = libc::getgrnam(cname.as_ptr());
-        if gr.is_null() {
-            None
-        } else {
-            Some((*gr).gr_gid)
-        }
-    }
-}
-
-/// Resolve a username to `(uid, gid)` via `getpwnam` (called once, at config time).
-fn resolve_user(name: &str) -> Option<(u32, u32)> {
-    let cname = std::ffi::CString::new(name).ok()?;
-    // SAFETY: getpwnam returns a pointer into a static buffer; we read it immediately
-    // and copy the two fields out before any other libc call can clobber it.
-    unsafe {
-        let pw = libc::getpwnam(cname.as_ptr());
-        if pw.is_null() {
-            None
-        } else {
-            Some(((*pw).pw_uid, (*pw).pw_gid))
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn forkd(ws: &Path) -> Arc<ForkdConnector> {
-        forkd_with_skills(ws, None)
-    }
-
-    fn forkd_with_skills(ws: &Path, skills: Option<&Path>) -> Arc<ForkdConnector> {
-        ForkdConnector::build(
-            "forkd",
-            Some(ws.to_path_buf()),
-            skills.map(Path::to_path_buf),
-            None,
-            Duration::from_secs(5),
-            Duration::from_secs(10),
-            8192,
-            Limits { cpu_secs: 5, fsize_bytes: 0, mem_bytes: 0 },
-            Vec::new(),
-        )
-    }
-
-    #[tokio::test]
-    async fn env_passthrough_forwards_only_allowlisted_names() {
-        let ws = std::env::temp_dir().join("forkd-test-env-ws");
-        std::fs::create_dir_all(&ws).unwrap();
-        // SAFETY: unique var names, set before this test spawns the child.
-        unsafe {
-            std::env::set_var("FORKD_PASS_ME", "kept");
-            std::env::set_var("FORKD_DROP_ME", "gone");
-        }
-        let conn = ForkdConnector::build(
-            "forkd",
-            Some(ws.clone()),
-            None,
-            None,
-            Duration::from_secs(5),
-            Duration::from_secs(10),
-            8192,
-            Limits { cpu_secs: 5, fsize_bytes: 0, mem_bytes: 0 },
-            vec!["FORKD_PASS_ME".to_string()],
-        );
-        let out = conn
-            .run_script(
-                &json!({
-                    "script": "echo \"pass=[${FORKD_PASS_ME:-}] drop=[${FORKD_DROP_ME:-}]\"",
-                    "interpreter": "bash",
-                }),
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        let stdout = out["stdout"].as_str().unwrap_or("");
-        assert!(stdout.contains("pass=[kept]"), "allowlisted var should pass: {stdout}");
-        assert!(stdout.contains("drop=[]"), "non-allowlisted var must stay cleared: {stdout}");
-    }
-
-    #[tokio::test]
-    async fn a_skill_script_runs_in_place_with_workspace_cwd() {
-        let ws = std::env::temp_dir().join("forkd-test-skill-ws");
-        let skills = std::env::temp_dir().join("forkd-test-skills/demo/scripts");
-        std::fs::create_dir_all(&ws).unwrap();
-        std::fs::create_dir_all(&skills).unwrap();
-        // The script proves in-place exec (its own path) and workspace cwd (pwd).
-        std::fs::write(skills.join("hello.sh"), "echo \"skill says $1 from $(pwd)\"\n").unwrap();
-        let out = forkd_with_skills(&ws, Some(skills.parent().unwrap().parent().unwrap()))
-            .run_script(
-                &json!({
-                    "skill_path": "demo/scripts/hello.sh",
-                    "interpreter": "bash",
-                    "args": ["hi"]
-                }),
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(out["exit_code"], 0);
-        let stdout = out["stdout"].as_str().unwrap();
-        assert!(stdout.contains("skill says hi"));
-        assert!(stdout.contains(ws.file_name().unwrap().to_str().unwrap()));
-    }
-
-    #[tokio::test]
-    async fn a_skill_path_escape_is_rejected() {
-        let ws = std::env::temp_dir().join("forkd-test-skill-jail");
-        std::fs::create_dir_all(&ws).unwrap();
-        let out = forkd_with_skills(&ws, Some(&ws))
-            .run_script(&json!({ "skill_path": "../../etc/passwd" }), &CancellationToken::new())
-            .await;
-        assert!(out.is_err());
-    }
-
-    #[tokio::test]
-    async fn runs_inline_bash_and_captures_output() {
-        let ws = std::env::temp_dir().join("forkd-test-bash");
-        std::fs::create_dir_all(&ws).unwrap();
-        let out = forkd(&ws)
-            .run_script(
-                &json!({ "script": "echo hi from forkd; exit 3", "interpreter": "bash" }),
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(out["exit_code"], 3);
-        assert!(out["stdout"].as_str().unwrap().contains("hi from forkd"));
-        assert_eq!(out["timed_out"], false);
-    }
-
-    #[tokio::test]
-    async fn a_hang_is_killed_by_the_timeout() {
-        let ws = std::env::temp_dir().join("forkd-test-hang");
-        std::fs::create_dir_all(&ws).unwrap();
-        let out = forkd(&ws)
-            .run_script(
-                &json!({ "script": "sleep 30", "interpreter": "bash", "timeout_secs": 1 }),
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(out["timed_out"], true);
-    }
-
-    #[tokio::test]
-    async fn a_cancel_token_stops_a_running_script() {
-        let ws = std::env::temp_dir().join("forkd-test-cancel");
-        std::fs::create_dir_all(&ws).unwrap();
-        let conn = forkd(&ws);
-        let token = CancellationToken::new();
-        // A script that would otherwise run for 30s; fire the token shortly after start.
-        let fire = token.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            fire.cancel();
-        });
-        let out = conn
-            .run_script(
-                &json!({ "script": "sleep 30", "interpreter": "bash", "timeout_secs": 30 }),
-                &token,
-            )
-            .await
-            .unwrap();
-        assert_eq!(out["cancelled"], true, "got: {out}");
-        assert_eq!(out["timed_out"], false);
-    }
-
-    #[tokio::test]
-    async fn a_path_escape_is_rejected() {
-        let ws = std::env::temp_dir().join("forkd-test-jail");
-        std::fs::create_dir_all(&ws).unwrap();
-        let out = forkd(&ws)
-            .run_script(&json!({ "path": "../../etc/passwd" }), &CancellationToken::new())
-            .await;
-        assert!(out.is_err());
-    }
 }
