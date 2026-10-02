@@ -153,7 +153,7 @@ pub(super) fn outgoing_allowed(
     });
     let Some(chat) = chat else { return false };
     let acl = state.acl.read().unwrap();
-    if acl.role(chat).is_some() {
+    if acl.role(chat).is_some() || (chat > 0 && settings.admins.contains(&chat)) {
         return true;
     }
     // Narrow bootstrap/deny acknowledgement, never a model-generated delivery.
