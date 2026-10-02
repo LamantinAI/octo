@@ -1,22 +1,26 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use futures::StreamExt;
 use octo_core::{
     Blob, Connector, ConnectorCapabilities, ConnectorContext, ConnectorId, Envelope, EventKind,
-    Filter, OctoResult, SubscribeOptions,
+    Filter, OctoError, OctoResult, SubscribeOptions,
 };
 use serde_json::Value;
 use teloxide::{
     Bot,
     requests::Requester,
-    types::{ChatId, InputFile, UpdateKind},
-    update_listeners::{AsUpdateStream, polling_default},
+    types::{AllowedUpdate, ChatId, InputFile, UpdateKind},
+    update_listeners::{AsUpdateStream, Polling},
 };
 
 use super::{
-    ALLOW_CHAT, FLUSH_TICK, LIST_CHATS, REMOVE_CHAT, SEND_FILE, STATUS, TYPING, TelegramConnector,
-    config::{handle_control, owner_chats},
+    ALLOW_CHAT, FLUSH_TICK, GROUP_MODE, LIST_CHATS, REMOVE_CHAT, SEND_FILE, STATUS, TYPING,
+    TelegramConnector,
+    control::{handle_control, migrate, outgoing_allowed, owner_chats, register_add},
     inbound::{
         caption_with_saved, coalesce_key, download_bytes, hms, image_document, inbox_name,
         publish_flush, reply_context, video_caption, video_media, voice_media, with_reply,
@@ -28,6 +32,7 @@ use crate::{
     commands::{SET_COMMANDS, set_commands},
     fs::{save_incoming, workspace_root},
     live::Live,
+    source::perceive,
 };
 
 #[async_trait]
@@ -42,6 +47,14 @@ impl Connector for TelegramConnector {
 
     async fn run(self: Arc<Self>, ctx: ConnectorContext) -> OctoResult<()> {
         let bot = Bot::new(self.token.clone());
+        let me = bot
+            .get_me()
+            .await
+            .map_err(|error| OctoError::Connector(error.to_string()))?;
+        let mut groups = self.groups.clone();
+        groups.address_names.push(me.user.first_name.clone());
+        let username = me.username().to_string();
+        let bot_id = me.user.id;
 
         // ── Outbound: chat.reply → Telegram message ──────────────────────────
         let mut replies = ctx
@@ -56,6 +69,8 @@ impl Connector for TelegramConnector {
         let out_acl = self.acl.clone();
         let out_id = self.id.clone();
         let out_workspace = self.workspace.clone();
+        let out_groups = groups.clone();
+        let commands = self.commands.clone();
         let live = Live::new();
         tokio::spawn(async move {
             // Latched off the first time the server says it has no rich messages
@@ -68,20 +83,26 @@ impl Connector for TelegramConnector {
                         Some(env) => {
                             // Control commands mutate the ACL; everything else is
                             // an outbound message to send.
-                            if matches!(env.kind.as_str(), ALLOW_CHAT | REMOVE_CHAT | LIST_CHATS) {
-                                handle_control(&out_acl, &out_id, &env, &out_ctx).await;
+                            if matches!(env.kind.as_str(), ALLOW_CHAT | REMOVE_CHAT | LIST_CHATS | GROUP_MODE) {
+                                handle_control(&out_acl, &out_groups, &out_id, &env, &out_ctx).await;
                                 continue;
                             }
                             // The bot's command menu (set by the assembly at startup).
                             if env.kind.as_str() == SET_COMMANDS {
+                                if env.tags.get("control_plane").map(String::as_str) != Some("true") { continue; }
                                 let owners = owner_chats(&out_acl);
                                 let payload = env.payload_as::<Value>().cloned().unwrap_or(Value::Null);
+                                commands.write().unwrap().update(&payload);
                                 let result = set_commands(&out_bot, &owners, &payload).await;
                                 let resp = Envelope::new(out_id.clone(), EventKind::new(format!("{SET_COMMANDS}.result")), result)
                                     .with_correlation(env.id);
                                 if let Err(e) = out_ctx.publish(resp).await {
                                     tracing::warn!(error = %e, "telegram: failed to publish set_commands result");
                                 }
+                                continue;
+                            }
+                            if !outgoing_allowed(&out_acl, &out_groups, &env) {
+                                tracing::warn!("telegram: outbound destination is not allowed");
                                 continue;
                             }
                             // Send a file from the shared workspace (by reference).
@@ -147,7 +168,12 @@ impl Connector for TelegramConnector {
         let mut batcher = Batcher::new(self.debounce, self.max_wait);
         let mut flush_tick = tokio::time::interval(FLUSH_TICK);
         flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut listener = polling_default(bot.clone()).await;
+        let mut listener = Polling::builder(bot.clone())
+            .timeout(Duration::from_secs(10))
+            .allowed_updates(vec![AllowedUpdate::Message, AllowedUpdate::MyChatMember])
+            .delete_webhook()
+            .await
+            .build();
         let stream = listener.as_stream();
         // PollingStream is !Unpin; pin it on the stack to poll in select!.
         tokio::pin!(stream);
@@ -161,21 +187,19 @@ impl Connector for TelegramConnector {
                 }
                 update = stream.next() => match update {
                     Some(Ok(update)) => {
+                        if let UpdateKind::MyChatMember(change) = &update.kind {
+                            register_add(&self.acl, &groups, change);
+                        }
                         if let UpdateKind::Message(msg) = update.kind {
+                            if migrate(&self.acl, &msg) { continue; }
                             let chat = msg.chat.id.0.to_string();
-                            // Authorization at the edge: a chat not on the ACL is
-                            // dropped here, before the bus — untrusted input never
-                            // reaches cognition. `None` ACL = allow all; otherwise
-                            // the chat's role/trust is stamped onto the envelope.
-                            let trust = match &self.acl {
-                                Some(state) => match state.acl.read().unwrap().role(msg.chat.id.0) {
-                                    Some(role) => Some((role, role.trust())),
-                                    None => {
-                                        tracing::warn!(%chat, "telegram: message from unlisted chat — dropped");
-                                        continue;
-                                    }
-                                },
-                                None => None,
+                            let perception = {
+                                let acl = self.acl.as_ref().map(|state| state.acl.read().unwrap());
+                                perceive(&msg, acl.as_deref(), &groups, bot_id, &username, &self.commands.read().unwrap())
+                            };
+                            let Some((trust, source)) = perception else {
+                                tracing::warn!(%chat, "telegram: chat or sender denied");
+                                continue;
                             };
                             let now = Instant::now();
                             // Coalesce only what Telegram groups: an album shares a
@@ -194,10 +218,12 @@ impl Connector for TelegramConnector {
                                     with_reply(&reply, Some(text.to_string())).unwrap_or_default();
                                 if buffer {
                                     batcher.push_text(
-                                        coalesce_key.unwrap(), &chat, body, trust, now,
+                                        coalesce_key.clone().unwrap(), &chat, body, trust, now,
                                     );
+                                    batcher.annotate(coalesce_key.as_ref().unwrap(), source.clone());
                                 } else {
                                     publish_flush(&self.id, &ctx, Flush {
+                                        source: Some(source.clone()),
                                         chat: chat.clone(),
                                         trust,
                                         emit: Emit::Text { text: body, caption: None },
@@ -226,10 +252,12 @@ impl Connector for TelegramConnector {
                                         );
                                         if buffer {
                                             batcher.push_image(
-                                                coalesce_key.unwrap(), &chat, blob, caption, trust, now,
+                                                coalesce_key.clone().unwrap(), &chat, blob, caption, trust, now,
                                             );
+                                            batcher.annotate(coalesce_key.as_ref().unwrap(), source.clone());
                                         } else {
                                             publish_flush(&self.id, &ctx, Flush {
+                                        source: Some(source.clone()),
                                                 chat: chat.clone(),
                                                 trust,
                                                 emit: Emit::Image { blob, caption },
@@ -258,6 +286,7 @@ impl Connector for TelegramConnector {
                                             saved.as_deref(),
                                         );
                                         publish_flush(&self.id, &ctx, Flush {
+                                        source: Some(source.clone()),
                                             chat: chat.clone(),
                                             trust,
                                             emit: Emit::Image { blob, caption },
@@ -291,6 +320,7 @@ impl Connector for TelegramConnector {
                                         let blob = Blob::new(bytes, audio.mime)
                                             .with_filename(audio.filename);
                                         publish_flush(&self.id, &ctx, Flush {
+                                        source: Some(source.clone()),
                                             chat: chat.clone(),
                                             trust,
                                             emit: Emit::Audio {
@@ -343,6 +373,7 @@ impl Connector for TelegramConnector {
                                             None => Emit::Text { text: caption, caption: None },
                                         };
                                         publish_flush(&self.id, &ctx, Flush {
+                                        source: Some(source.clone()),
                                             chat: chat.clone(),
                                             trust,
                                             emit,
@@ -354,6 +385,7 @@ impl Connector for TelegramConnector {
                                         // reads as the bot ignoring the message.
                                         tracing::warn!(error = %e, "telegram video download failed");
                                         publish_flush(&self.id, &ctx, Flush {
+                                        source: Some(source.clone()),
                                             chat: chat.clone(),
                                             trust,
                                             emit: Emit::Text {
@@ -381,6 +413,7 @@ impl Connector for TelegramConnector {
                                                 "[received file `{name}` — saved to workspace path `{rel}`]"
                                             );
                                             publish_flush(&self.id, &ctx, Flush {
+                                        source: Some(source.clone()),
                                                 chat: chat.clone(),
                                                 trust,
                                                 emit: Emit::Text { text, caption: None },

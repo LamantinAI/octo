@@ -16,17 +16,32 @@ use crate::{
 /// (the common case) returns `None` and is published with zero added latency.
 pub(super) fn coalesce_key(msg: &teloxide::types::Message, chat: &str) -> Option<String> {
     if let Some(group) = msg.media_group_id() {
-        Some(format!("mg:{}", group.0))
+        Some(format!("mg:{chat}:{}:{}", sender_key(msg), group.0))
     } else if msg.forward_origin().is_some() {
-        Some(format!("fwd:{chat}"))
+        Some(format!("fwd:{chat}:{}", sender_key(msg)))
     } else {
         None
     }
 }
 
+fn sender_key(msg: &teloxide::types::Message) -> String {
+    if let Some(chat) = &msg.sender_chat {
+        return format!("chat-{}", chat.id);
+    }
+    msg.from
+        .as_ref()
+        .map(|u| u.id.to_string())
+        .unwrap_or_else(|| "unknown".into())
+}
+
 /// Publish a flushed batch as one `chat.message` envelope.
 pub(super) async fn publish_flush(id: &ConnectorId, ctx: &ConnectorContext, flush: Flush) {
-    let Flush { chat, trust, emit } = flush;
+    let Flush {
+        chat,
+        trust,
+        emit,
+        source,
+    } = flush;
     let env = match emit {
         Emit::Text { text, caption } => chat_envelope(id, &chat, text, caption.as_deref(), trust),
         Emit::Image { blob, caption } => chat_envelope(id, &chat, blob, caption.as_deref(), trust),
@@ -48,6 +63,10 @@ pub(super) async fn publish_flush(id: &ConnectorId, ctx: &ConnectorContext, flus
             env
         }
         Emit::Multipart(msg) => chat_envelope(id, &chat, msg, None, trust),
+    };
+    let env = match source {
+        Some(source) => source.apply(env),
+        None => env,
     };
     if let Err(e) = ctx.publish(env).await {
         tracing::warn!(error = %e, "failed to publish chat.message");

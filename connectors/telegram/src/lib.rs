@@ -43,11 +43,14 @@ use octo_core::{ConnectorCapabilities, ConnectorId, EventKind};
 
 use crate::commands::SET_COMMANDS;
 
-pub use acl::{Acl, AclEntry, Role};
+use self::source::{CommandCatalog, GroupSettings};
+pub use acl::{Acl, AclEntry, GroupMode, Role};
 mod config;
+mod control;
 mod inbound;
 mod outbound;
 mod runtime;
+mod source;
 #[cfg(test)]
 use self::{
     inbound::{
@@ -74,6 +77,7 @@ const FLUSH_TICK: Duration = Duration::from_millis(100);
 const ALLOW_CHAT: &str = "octo.telegram.allow_chat";
 const REMOVE_CHAT: &str = "octo.telegram.remove_chat";
 const LIST_CHATS: &str = "octo.telegram.list_chats";
+const GROUP_MODE: &str = "octo.telegram.group_mode";
 
 /// Outbound command: send a file from the shared workspace. Images go as a photo
 /// (inline preview), everything else as a document; an optional `caption` rides along.
@@ -145,6 +149,8 @@ pub struct TelegramConnector {
     /// `chat.send_file` reads from here). `None` → resolved from the environment
     /// at use, matching octo-code. See [`fs`].
     workspace: Option<PathBuf>,
+    groups: GroupSettings,
+    commands: Arc<RwLock<CommandCatalog>>,
 }
 
 impl TelegramConnector {
@@ -196,6 +202,7 @@ impl TelegramConnector {
                 EventKind::from_static(ALLOW_CHAT),
                 EventKind::from_static(REMOVE_CHAT),
                 EventKind::from_static(LIST_CHATS),
+                EventKind::from_static(GROUP_MODE),
                 EventKind::from_static(SET_COMMANDS),
             ])
             .with_description(CATALOG);
@@ -207,6 +214,8 @@ impl TelegramConnector {
             debounce,
             max_wait,
             workspace,
+            groups: GroupSettings::default(),
+            commands: Arc::new(RwLock::new(CommandCatalog::default())),
         })
     }
 }
