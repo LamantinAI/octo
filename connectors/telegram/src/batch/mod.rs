@@ -24,7 +24,7 @@ use std::{
 
 use octo_core::{Blob, InboundMessage, TrustLevel};
 
-use crate::acl::Role;
+use crate::{acl::Role, source::MessageSource};
 
 /// One buffered inbound part from a chat, in arrival order.
 enum Part {
@@ -36,6 +36,7 @@ struct Pending {
     chat: String,
     parts: Vec<Part>,
     trust: Option<(Role, TrustLevel)>,
+    source: Option<MessageSource>,
     first: Instant,
     last: Instant,
 }
@@ -68,6 +69,7 @@ pub(crate) struct Flush {
     pub chat: String,
     pub trust: Option<(Role, TrustLevel)>,
     pub emit: Emit,
+    pub source: Option<MessageSource>,
 }
 
 /// Buffers coalescing bursts keyed by an opaque key and flushes them together.
@@ -130,14 +132,26 @@ impl Batcher {
             chat: chat.to_string(),
             parts: Vec::new(),
             trust,
+            source: None,
             first: now,
             last: now,
         });
         pending.last = now;
         if pending.trust.is_none() {
             pending.trust = trust;
+        } else if pending.trust != trust {
+            pending.trust = Some((Role::Guest, TrustLevel::Low));
         }
         pending
+    }
+
+    pub fn annotate(&mut self, key: &str, source: MessageSource) {
+        if let Some(pending) = self.pending.get_mut(key) {
+            match &mut pending.source {
+                Some(previous) => previous.merge(source),
+                None => pending.source = Some(source),
+            }
+        }
     }
 
     /// Flush every buffer whose debounce window has elapsed, or that has been
@@ -205,7 +219,12 @@ fn finish(mut pending: Pending) -> Flush {
             Emit::Multipart(InboundMessage::new(text, images))
         }
     };
-    Flush { chat, trust, emit }
+    Flush {
+        chat,
+        trust,
+        emit,
+        source: pending.source,
+    }
 }
 
 #[cfg(test)]
@@ -343,5 +362,24 @@ mod tests {
         let due = b.drain_due(t0 + DEBOUNCE);
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].chat, "a");
+    }
+    #[test]
+    fn album_keeps_addressing_from_the_captioned_part() {
+        let mut b = batcher();
+        for called in ["true", "false"] {
+            b.push_text("album".into(), "-42", "part".into(), None, Instant::now());
+            b.annotate(
+                "album",
+                MessageSource {
+                    tags: HashMap::from([
+                        ("sender_id".into(), "7".into()),
+                        ("addressed".into(), called.into()),
+                    ]),
+                },
+            );
+        }
+        let source = b.drain_all().pop().unwrap().source.unwrap();
+        assert_eq!(source.tags["addressed"], "true");
+        assert_eq!(source.tags["sender_id"], "7");
     }
 }

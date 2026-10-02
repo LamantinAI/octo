@@ -4,109 +4,12 @@ use std::{
     time::Duration,
 };
 
-use octo_core::{
-    Connector, ConnectorContext, ConnectorFactory, ConnectorId, Envelope, EventKind, FactoryContext,
-};
+use octo_core::{Connector, ConnectorFactory, ConnectorId, FactoryContext};
 use serde::Deserialize;
-use serde_json::{Value, json};
 
-use super::{
-    ALLOW_CHAT, AclState, DEFAULT_DEBOUNCE, DEFAULT_MAX_WAIT, LIST_CHATS, REMOVE_CHAT,
-    TelegramConnector,
-};
+use super::{AclState, DEFAULT_DEBOUNCE, DEFAULT_MAX_WAIT, TelegramConnector};
+use crate::source::GroupSettings;
 use crate::{Acl, Role};
-
-/// Handle an `octo.telegram.*` control command: mutate the ACL, persist it, and
-/// publish a correlated `<kind>.result` reply. Authorization (only the owner may
-/// run these) is enforced *upstream* by the dispatching cogitator — the command
-/// reaching here is already vouched for; the connector just applies it.
-pub(super) async fn handle_control(
-    acl: &Option<Arc<AclState>>,
-    id: &ConnectorId,
-    env: &Envelope,
-    ctx: &ConnectorContext,
-) {
-    let Some(state) = acl else {
-        tracing::warn!(kind = %env.kind, "telegram: control command but no ACL configured; ignored");
-        return;
-    };
-    let payload = env.payload_as::<Value>().cloned().unwrap_or(Value::Null);
-    let chat_id = payload.get("chat_id").and_then(Value::as_i64);
-
-    let result = match env.kind.as_str() {
-        ALLOW_CHAT => match chat_id {
-            Some(chat_id) => {
-                let role = match payload.get("role").and_then(Value::as_str) {
-                    Some("owner") => Role::Owner,
-                    _ => Role::Trusted,
-                };
-                let added = {
-                    let mut acl = state.acl.write().unwrap();
-                    let added = acl.insert(chat_id, role);
-                    persist(&acl, &state.path);
-                    added
-                };
-                tracing::info!(chat_id, role = role.as_str(), added, "telegram: allow_chat");
-                json!({ "ok": true, "chat_id": chat_id, "role": role.as_str(), "added": added })
-            }
-            None => json!({ "ok": false, "error": "missing or non-integer chat_id" }),
-        },
-        REMOVE_CHAT => match chat_id {
-            Some(chat_id) => {
-                let removed = {
-                    let mut acl = state.acl.write().unwrap();
-                    let removed = acl.remove(chat_id);
-                    persist(&acl, &state.path);
-                    removed
-                };
-                tracing::info!(chat_id, removed, "telegram: remove_chat");
-                json!({ "ok": true, "chat_id": chat_id, "removed": removed })
-            }
-            None => json!({ "ok": false, "error": "missing or non-integer chat_id" }),
-        },
-        LIST_CHATS => {
-            let chats = state.acl.read().unwrap().entries();
-            json!({ "ok": true, "chats": chats })
-        }
-        _ => json!({ "ok": false, "error": "unknown command" }),
-    };
-
-    let resp = Envelope::new(
-        id.clone(),
-        EventKind::new(format!("{}.result", env.kind.as_str())),
-        result,
-    )
-    .with_correlation(env.id);
-    if let Err(e) = ctx.publish(resp).await {
-        tracing::warn!(error = %e, "telegram: failed to publish control result");
-    }
-}
-
-/// The chats the ACL marks as owners (none without an ACL).
-pub(super) fn owner_chats(acl: &Option<Arc<AclState>>) -> Vec<i64> {
-    acl.as_ref()
-        .map(|state| {
-            state
-                .acl
-                .read()
-                .unwrap()
-                .entries()
-                .into_iter()
-                .filter(|e| e.role == Role::Owner)
-                .map(|e| e.chat_id)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Persist the ACL to its file if one is configured, logging (not failing) on error.
-pub(super) fn persist(acl: &Acl, path: &Option<PathBuf>) {
-    if let Some(p) = path {
-        if let Err(e) = acl.save(p) {
-            tracing::warn!(error = %e, path = %p.display(), "telegram: failed to persist ACL");
-        }
-    }
-}
 
 // ── Config-driven construction (`type = "telegram"` manifest) ────────────────
 
@@ -128,6 +31,10 @@ struct TelegramConfig {
     /// Seed owner chat id — inserted into the ACL at `owner`, so the bot is
     /// reachable on first run even with an empty/absent ACL file.
     owner_chat: Option<i64>,
+    #[serde(default)]
+    admins: Vec<i64>,
+    #[serde(default)]
+    address_names: Vec<String>,
     /// Coalescing quiet window in ms (default 500; `0` disables coalescing).
     batch_debounce_ms: Option<u64>,
     /// Cap in ms on how long a chat's buffer stays open (default 3000).
@@ -192,14 +99,14 @@ impl ConnectorFactory for TelegramConnectorFactory {
                 path: acl_path,
             }))
         };
-        Ok(TelegramConnector::build(
-            id.as_str(),
-            token,
-            acl_state,
-            debounce,
-            max_wait,
-            workspace,
-        ))
+        let mut connector =
+            TelegramConnector::build(id.as_str(), token, acl_state, debounce, max_wait, workspace);
+        let instance = Arc::get_mut(&mut connector).expect("new connector is uniquely owned");
+        instance.groups = GroupSettings {
+            admins: cfg.admins,
+            address_names: cfg.address_names,
+        };
+        Ok(connector)
     }
 }
 
