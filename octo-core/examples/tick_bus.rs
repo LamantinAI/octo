@@ -17,15 +17,14 @@
 //! cargo run --example tick_bus
 //! ```
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use octo_core::{
-    Connector, ConnectorCapabilities, ConnectorContext, ConnectorId, Envelope, EventKind,
-    Filter, Octo, OctoResult, SubscribeOptions, TrailAction, TrailActor, TrailEntry,
+    Connector, ConnectorCapabilities, ConnectorContext, ConnectorId, Envelope, EventKind, Filter,
+    Octo, OctoResult, SubscribeOptions, TrailAction, TrailActor, TrailEntry,
 };
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::time::{MissedTickBehavior, interval};
 
 /// Application-level payload. Octo doesn't know about it; subscribers downcast.
 #[derive(Debug, Clone)]

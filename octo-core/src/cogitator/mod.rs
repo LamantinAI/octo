@@ -22,8 +22,8 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    bus::{EventBus, Filter, InProcessBus, Subscription},
     ConnectorCapabilities, ConnectorId, Envelope, OctoResult, SubscribeOptions,
+    bus::{EventBus, Filter, InProcessBus, Subscription},
 };
 
 /// A runtime snapshot of one registered connector, handed to the cogitator so

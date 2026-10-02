@@ -18,17 +18,16 @@
 //! The free Petstore instance is occasionally flaky (502/503). Re-run on
 //! transient errors — that's also a realistic test of the error path.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
+use octo_connector_petstore::{
+    ApiError, FindByStatusRequest, Pet, PetIdRequest, PetStatus, PetstoreConnector, kinds,
+    register_payloads,
+};
 use octo_core::{
     Connector, ConnectorCapabilities, ConnectorContext, ConnectorId, Envelope, EventKind, Octo,
     OctoResult, PayloadRegistry,
-};
-use octo_connector_petstore::{
-    kinds, register_payloads, ApiError, FindByStatusRequest, Pet, PetIdRequest, PetStatus,
-    PetstoreConnector,
 };
 
 const PETSTORE_ID: &str = "petstore";
@@ -111,7 +110,10 @@ impl AgentConnector {
                 pets.iter().find_map(|p| p.id)
             }
             kinds::EVT_ERROR => {
-                eprintln!("[agent]   find_by_status failed: {}", api_summary(&response));
+                eprintln!(
+                    "[agent]   find_by_status failed: {}",
+                    api_summary(&response)
+                );
                 None
             }
             other => panic!("unexpected reply kind: {other}"),

@@ -22,10 +22,12 @@
 
 mod cron;
 
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -34,7 +36,7 @@ use octo_core::{
     OctoResult, SubscribeOptions,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const DEFAULT_EMIT_KIND: &str = "alarm.fired";
 
@@ -182,9 +184,13 @@ impl Scheduler {
                     *self.alarms.lock().unwrap() = v;
                     tracing::info!(connector = %self.id, alarms = n, "scheduler: loaded state");
                 }
-                Err(e) => tracing::warn!(error = %e, "scheduler: corrupt state file; starting empty"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "scheduler: corrupt state file; starting empty")
+                }
             },
-            Err(_) => tracing::info!(connector = %self.id, "scheduler: no state file; starting empty"),
+            Err(_) => {
+                tracing::info!(connector = %self.id, "scheduler: no state file; starting empty")
+            }
         }
     }
 
@@ -200,7 +206,9 @@ impl Scheduler {
             let _ = std::fs::create_dir_all(dir);
         }
         let tmp = self.persistence_path.with_extension("json.tmp");
-        if let Err(e) = std::fs::write(&tmp, snapshot).and_then(|_| std::fs::rename(&tmp, &self.persistence_path)) {
+        if let Err(e) = std::fs::write(&tmp, snapshot)
+            .and_then(|_| std::fs::rename(&tmp, &self.persistence_path))
+        {
             tracing::warn!(error = %e, "scheduler: failed to persist state");
         }
     }
@@ -221,13 +229,15 @@ impl Scheduler {
                     AlarmTrigger::Interval { period_secs } => {
                         a.next_fire = now + chrono::Duration::seconds(period_secs as i64);
                     }
-                    AlarmTrigger::Cron { ref expr, ref tz } => match cron::next_after(expr, tz, now) {
-                        Ok(next) => a.next_fire = next,
-                        Err(e) => {
-                            tracing::warn!(alarm_id = %a.id, error = %e, "scheduler: cron has no next time; dropping");
-                            drop_ids.push(a.id.clone());
+                    AlarmTrigger::Cron { ref expr, ref tz } => {
+                        match cron::next_after(expr, tz, now) {
+                            Ok(next) => a.next_fire = next,
+                            Err(e) => {
+                                tracing::warn!(alarm_id = %a.id, error = %e, "scheduler: cron has no next time; dropping");
+                                drop_ids.push(a.id.clone());
+                            }
                         }
-                    },
+                    }
                 }
             }
             if !drop_ids.is_empty() {
@@ -254,10 +264,13 @@ impl Scheduler {
     async fn on_control(self: &Arc<Self>, cmd: Arc<Envelope>, ctx: &ConnectorContext) {
         let (result_kind, body) = match cmd.kind.as_str() {
             "octo.scheduler.add_alarm" => ("octo.scheduler.add_alarm.result", self.add_alarm(&cmd)),
-            "octo.scheduler.cancel_alarm" => {
-                ("octo.scheduler.cancel_alarm.result", self.cancel_alarm(&cmd))
+            "octo.scheduler.cancel_alarm" => (
+                "octo.scheduler.cancel_alarm.result",
+                self.cancel_alarm(&cmd),
+            ),
+            "octo.scheduler.list_alarms" => {
+                ("octo.scheduler.list_alarms.result", self.list_alarms())
             }
-            "octo.scheduler.list_alarms" => ("octo.scheduler.list_alarms.result", self.list_alarms()),
             other => {
                 tracing::warn!(kind = %other, "scheduler: unknown control kind");
                 return;
@@ -283,7 +296,9 @@ impl Scheduler {
         let (trigger, next_fire) = match parsed.trigger {
             TriggerSpec::Oneshot { at } => match DateTime::parse_from_rfc3339(&at) {
                 Ok(t) => (AlarmTrigger::OneShot, t.with_timezone(&Utc)),
-                Err(e) => return json!({ "error": format!("add_alarm: bad `at` time (need RFC3339): {e}") }),
+                Err(e) => {
+                    return json!({ "error": format!("add_alarm: bad `at` time (need RFC3339): {e}") });
+                }
             },
             TriggerSpec::Interval { period_secs } => {
                 if period_secs == 0 {
@@ -320,9 +335,11 @@ impl Scheduler {
     }
 
     fn cancel_alarm(&self, cmd: &Envelope) -> Value {
-        let id = cmd
-            .payload_as::<Value>()
-            .and_then(|v| v.get("alarm_id").and_then(|x| x.as_str()).map(str::to_owned));
+        let id = cmd.payload_as::<Value>().and_then(|v| {
+            v.get("alarm_id")
+                .and_then(|x| x.as_str())
+                .map(str::to_owned)
+        });
         let Some(id) = id else {
             return json!({ "error": "cancel_alarm: expected { alarm_id }" });
         };
@@ -400,7 +417,8 @@ mod tests {
     /// configured payload → cancel it → it stops.
     #[tokio::test]
     async fn interval_alarm_fires_and_cancels() {
-        let path = std::env::temp_dir().join(format!("octo-sched-test-{}.json", uuid::Uuid::now_v7()));
+        let path =
+            std::env::temp_dir().join(format!("octo-sched-test-{}.json", uuid::Uuid::now_v7()));
         let bus = Arc::new(InProcessBus::new(64));
         let shutdown = CancellationToken::new();
         let sched = Scheduler::new("sched", path.clone());
@@ -441,7 +459,10 @@ mod tests {
         assert_eq!(fired.kind.as_str(), "alarm.fired");
         let p = fired.payload_as::<Value>().expect("payload");
         assert_eq!(p["task"], "drink water");
-        assert_eq!(fired.tags.get("alarm_id").map(String::as_str), Some(alarm_id.as_str()));
+        assert_eq!(
+            fired.tags.get("alarm_id").map(String::as_str),
+            Some(alarm_id.as_str())
+        );
 
         // Cancel it.
         let cancel = Envelope::new(

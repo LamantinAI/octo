@@ -12,8 +12,8 @@ use std::{
 
 use async_trait::async_trait;
 use octo_core::{
-    control::RESTART_CONNECTOR, Connector, ConnectorCapabilities, ConnectorContext,
-    ConnectorFactory, ConnectorId, Envelope, EventKind, FactoryContext, Octo, OctoResult,
+    Connector, ConnectorCapabilities, ConnectorContext, ConnectorFactory, ConnectorId, Envelope,
+    EventKind, FactoryContext, Octo, OctoResult, control::RESTART_CONNECTOR,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -56,8 +56,17 @@ impl ConnectorFactory for ProbeFactory {
         config: &toml::Value,
         _ctx: FactoryContext<'_>,
     ) -> Result<Arc<dyn Connector>, Box<dyn std::error::Error + Send + Sync>> {
-        let value = config["connector"].get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        Ok(Arc::new(Probe { id, caps: ConnectorCapabilities::bidirectional(), value, log: self.log.clone() }))
+        let value = config["connector"]
+            .get("value")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        Ok(Arc::new(Probe {
+            id,
+            caps: ConnectorCapabilities::bidirectional(),
+            value,
+            log: self.log.clone(),
+        }))
     }
 }
 
@@ -95,7 +104,11 @@ impl Connector for Driver {
     }
     async fn run(self: Arc<Self>, ctx: ConnectorContext) -> OctoResult<()> {
         if self.wait_for("cove").await {
-            write(&self.manifest, "[connector]\nid = \"probe\"\ntype = \"probe\"\nvalue = \"spruce\"\n").unwrap();
+            write(
+                &self.manifest,
+                "[connector]\nid = \"probe\"\ntype = \"probe\"\nvalue = \"spruce\"\n",
+            )
+            .unwrap();
             let restart = Envelope::new(
                 self.id.clone(),
                 EventKind::from_static(RESTART_CONNECTOR),
@@ -114,9 +127,17 @@ async fn restart_connector_applies_an_edited_manifest() {
     let dir = std::env::temp_dir().join(format!("octo-restart-reload-{}", std::process::id()));
     let connectors = dir.join("connectors");
     create_dir_all(&connectors).unwrap();
-    write(dir.join("octo.toml"), "[connectors]\ndir = \"connectors\"\n").unwrap();
+    write(
+        dir.join("octo.toml"),
+        "[connectors]\ndir = \"connectors\"\n",
+    )
+    .unwrap();
     let manifest = connectors.join("probe.toml");
-    write(&manifest, "[connector]\nid = \"probe\"\ntype = \"probe\"\nvalue = \"cove\"\n").unwrap();
+    write(
+        &manifest,
+        "[connector]\nid = \"probe\"\ntype = \"probe\"\nvalue = \"cove\"\n",
+    )
+    .unwrap();
 
     let log: Log = Arc::default();
     let stop = CancellationToken::new();
@@ -141,5 +162,8 @@ async fn restart_connector_applies_an_edited_manifest() {
         .expect("the runtime runs cleanly");
     remove_dir_all(&dir).ok();
 
-    assert_eq!(*log.lock().unwrap(), vec!["cove".to_string(), "spruce".to_string()]);
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec!["cove".to_string(), "spruce".to_string()]
+    );
 }

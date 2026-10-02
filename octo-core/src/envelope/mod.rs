@@ -30,8 +30,7 @@ pub use registry::{PayloadRegistry, RegistryEntry, RegistryError};
 pub use stream::StreamFrame;
 pub use trail::{TrailAction, TrailActor, TrailEntry};
 
-use std::any::Any;
-use std::collections::HashMap;
+use std::{any::Any, collections::HashMap};
 
 use chrono::{DateTime, Utc};
 

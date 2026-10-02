@@ -19,9 +19,7 @@
 //! cargo run --example streaming_response
 //! ```
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use octo_core::{
@@ -217,7 +215,16 @@ async fn main() -> OctoResult<()> {
         .add_connector(StreamingResponder::new(
             "llm",
             sink_id.clone(),
-            vec!["The ", "incident ", "looks ", "routine ", "— ", "no ", "alert ", "needed."],
+            vec![
+                "The ",
+                "incident ",
+                "looks ",
+                "routine ",
+                "— ",
+                "no ",
+                "alert ",
+                "needed.",
+            ],
             Duration::from_millis(200),
         ))
         .add_connector(ProgressiveSink::new("telegram"))

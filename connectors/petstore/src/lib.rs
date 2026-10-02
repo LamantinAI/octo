@@ -131,9 +131,7 @@ pub fn register_payloads(registry: PayloadRegistry) -> PayloadRegistry {
         // Commands.
         .register_type::<Pet>(EventKind::from_static(kinds::CMD_ADD_PET))
         .register_type::<PetIdRequest>(EventKind::from_static(kinds::CMD_FETCH_PET))
-        .register_type::<FindByStatusRequest>(EventKind::from_static(
-            kinds::CMD_FIND_BY_STATUS,
-        ))
+        .register_type::<FindByStatusRequest>(EventKind::from_static(kinds::CMD_FIND_BY_STATUS))
         .register_type::<PetIdRequest>(EventKind::from_static(kinds::CMD_DELETE_PET))
         .register_type::<Pet>(EventKind::from_static(kinds::CMD_UPDATE_PET))
         // Events.
@@ -303,7 +301,12 @@ impl PetstoreConnector {
     async fn handle_fetch_pet(&self, envelope: &Envelope) -> Result<Envelope, ApiError> {
         let req = expect_payload::<PetIdRequest>(envelope, kinds::CMD_FETCH_PET)?;
         let url = format!("{}/pet/{}", self.base_url, req.id);
-        let resp = self.client.get(&url).send().await.map_err(transport_error)?;
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(transport_error)?;
         let pet: Pet = parse_response(resp).await?;
         Ok(Envelope::new(
             self.id.clone(),
@@ -414,4 +417,3 @@ async fn http_error(resp: reqwest::Response) -> ApiError {
         message: format!("http {status}: {body}"),
     }
 }
-

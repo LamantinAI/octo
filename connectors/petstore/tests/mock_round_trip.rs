@@ -8,20 +8,21 @@
 
 mod mock_http;
 
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use async_trait::async_trait;
+use mock_http::{MockServer, Route};
 use octo_connector_petstore::{
-    kinds, register_payloads, ApiError, FindByStatusRequest, Pet, PetIdRequest, PetStatus,
-    PetstoreConnector,
+    ApiError, FindByStatusRequest, Pet, PetIdRequest, PetStatus, PetstoreConnector, kinds,
+    register_payloads,
 };
 use octo_core::{
     Connector, ConnectorCapabilities, ConnectorContext, ConnectorId, Envelope, EventKind, Octo,
-    OctoResult, PayloadRegistry,
+    OctoResult, PayloadRegistry, control::RESTART_PROCESS,
 };
-
-use mock_http::{MockServer, Route};
 
 const PETSTORE_ID: &str = "petstore";
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -73,7 +74,12 @@ impl Connector for Agent {
         // Warmup: let the petstore connector subscribe before we publish.
         tokio::time::sleep(Duration::from_millis(150)).await;
         let result = self.scenario(&ctx).await;
-        ctx.shutdown.cancel();
+        ctx.publish(Envelope::new(
+            self.id.clone(),
+            EventKind::from_static(RESTART_PROCESS),
+            String::new(),
+        ))
+        .await?;
         result
     }
 }
@@ -81,7 +87,10 @@ impl Connector for Agent {
 impl Agent {
     async fn scenario(&self, ctx: &ConnectorContext) -> OctoResult<()> {
         let record_kind = |resp: &Envelope, out: &Arc<Mutex<Outcomes>>| {
-            out.lock().unwrap().kinds.push(resp.kind.as_str().to_string());
+            out.lock()
+                .unwrap()
+                .kinds
+                .push(resp.kind.as_str().to_string());
         };
 
         // find_pets_by_status
@@ -89,7 +98,9 @@ impl Agent {
             .publish_and_await_response(
                 self.cmd(
                     kinds::CMD_FIND_BY_STATUS,
-                    FindByStatusRequest { status: PetStatus::Available },
+                    FindByStatusRequest {
+                        status: PetStatus::Available,
+                    },
                 ),
                 CALL_TIMEOUT,
             )
@@ -101,7 +112,10 @@ impl Agent {
 
         // fetch_pet
         let resp = ctx
-            .publish_and_await_response(self.cmd(kinds::CMD_FETCH_PET, PetIdRequest { id: 10 }), CALL_TIMEOUT)
+            .publish_and_await_response(
+                self.cmd(kinds::CMD_FETCH_PET, PetIdRequest { id: 10 }),
+                CALL_TIMEOUT,
+            )
             .await?;
         record_kind(&resp, &self.out);
         self.out.lock().unwrap().fetched = resp
@@ -121,7 +135,10 @@ impl Agent {
             .publish_and_await_response(self.cmd(kinds::CMD_ADD_PET, new_pet), CALL_TIMEOUT)
             .await?;
         record_kind(&resp, &self.out);
-        let added_id = resp.payload_as::<Pet>().and_then(|p| p.id).unwrap_or_default();
+        let added_id = resp
+            .payload_as::<Pet>()
+            .and_then(|p| p.id)
+            .unwrap_or_default();
         self.out.lock().unwrap().added_id = Some(added_id);
 
         // update_pet
@@ -142,14 +159,20 @@ impl Agent {
 
         // delete_pet
         let resp = ctx
-            .publish_and_await_response(self.cmd(kinds::CMD_DELETE_PET, PetIdRequest { id: added_id }), CALL_TIMEOUT)
+            .publish_and_await_response(
+                self.cmd(kinds::CMD_DELETE_PET, PetIdRequest { id: added_id }),
+                CALL_TIMEOUT,
+            )
             .await?;
         record_kind(&resp, &self.out);
         self.out.lock().unwrap().deleted_id = resp.payload_as::<PetIdRequest>().map(|r| r.id);
 
         // error path: fetch missing → 500
         let resp = ctx
-            .publish_and_await_response(self.cmd(kinds::CMD_FETCH_PET, PetIdRequest { id: 999 }), CALL_TIMEOUT)
+            .publish_and_await_response(
+                self.cmd(kinds::CMD_FETCH_PET, PetIdRequest { id: 999 }),
+                CALL_TIMEOUT,
+            )
             .await?;
         record_kind(&resp, &self.out);
         self.out.lock().unwrap().error_status =
@@ -203,7 +226,10 @@ async fn binary_petstore_round_trip_through_bus() {
         .add_connector(Agent::new(Arc::clone(&out)))
         .build();
 
-    octo.run().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(15), octo.run())
+        .await
+        .expect("runtime must stop")
+        .unwrap();
 
     let out = out.lock().unwrap();
     assert_eq!(

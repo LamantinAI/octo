@@ -31,9 +31,7 @@
 //! systemd `ProtectHome`) makes Chrome crash on startup with `SIGTRAP`. Point the
 //! service's `HOME` at a writable dir (the deploy sets `Environment=HOME=…`).
 
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use octo_core::{
@@ -41,7 +39,7 @@ use octo_core::{
     EventKind, FactoryContext, Filter, OctoResult, SubscribeOptions,
 };
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use zendriver::{Browser, Fetcher};
 
@@ -192,8 +190,12 @@ impl BrowserConnector {
             let error = out.get("error").and_then(|v| v.as_str()).unwrap_or("");
             tracing::warn!(url, status, error, "browser fetch failed");
         }
-        let resp = Envelope::new(self.id.clone(), EventKind::new(format!("{FETCH}.result")), out)
-            .with_correlation(env.id);
+        let resp = Envelope::new(
+            self.id.clone(),
+            EventKind::new(format!("{FETCH}.result")),
+            out,
+        )
+        .with_correlation(env.id);
         if let Err(e) = ctx.publish(resp).await {
             tracing::warn!(error = %e, "browser failed to publish result");
         }
@@ -212,7 +214,10 @@ struct FetchArgs {
 /// Render one page in a fresh tab and pull out title / visible text / (optional) HTML.
 /// The tab is always closed, even on error.
 async fn fetch_page(browser: &Browser, url: &str, want_html: bool) -> Result<Value, String> {
-    let tab = browser.new_tab().await.map_err(|e| format!("open tab: {e}"))?;
+    let tab = browser
+        .new_tab()
+        .await
+        .map_err(|e| format!("open tab: {e}"))?;
     let extracted = async {
         tab.goto(url).await.map_err(|e| format!("navigate: {e}"))?;
         let title: String = tab.evaluate("document.title").await.unwrap_or_default();
@@ -220,9 +225,15 @@ async fn fetch_page(browser: &Browser, url: &str, want_html: bool) -> Result<Val
             .evaluate("document.body ? document.body.innerText : ''")
             .await
             .unwrap_or_default();
-        let final_url: String =
-            tab.evaluate("location.href").await.unwrap_or_else(|_| url.to_string());
-        let html = if want_html { tab.content().await.ok() } else { None };
+        let final_url: String = tab
+            .evaluate("location.href")
+            .await
+            .unwrap_or_else(|_| url.to_string());
+        let html = if want_html {
+            tab.content().await.ok()
+        } else {
+            None
+        };
         Ok::<_, String>((title, text, final_url, html))
     }
     .await;
@@ -257,7 +268,10 @@ impl Connector for BrowserConnector {
 
     async fn run(self: Arc<Self>, ctx: ConnectorContext) -> OctoResult<()> {
         let mut cmds = ctx
-            .subscribe(Filter::by_target(self.id.clone()), SubscribeOptions::default())
+            .subscribe(
+                Filter::by_target(self.id.clone()),
+                SubscribeOptions::default(),
+            )
             .await?;
         // Chrome is launched lazily on the first fetch (the download, if any, happens
         // then), so startup stays fast and a browser is only paid for when used.
@@ -310,17 +324,37 @@ impl ConnectorFactory for BrowserConnectorFactory {
             .get("connector")
             .ok_or("browser: manifest has no [connector] table")?;
         // Writable dir for the Chrome download + profile, relative to the manifest.
-        let data_dir = ctx
-            .base_dir
-            .join(table.get("data_dir").and_then(|v| v.as_str()).unwrap_or("browser-data"));
-        let executable = table.get("executable").and_then(|v| v.as_str()).map(PathBuf::from);
-        let headless = table.get("headless").and_then(|v| v.as_bool()).unwrap_or(true);
-        let sandbox = table.get("sandbox").and_then(|v| v.as_bool()).unwrap_or(false);
+        let data_dir = ctx.base_dir.join(
+            table
+                .get("data_dir")
+                .and_then(|v| v.as_str())
+                .unwrap_or("browser-data"),
+        );
+        let executable = table
+            .get("executable")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from);
+        let headless = table
+            .get("headless")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let sandbox = table
+            .get("sandbox")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let default_timeout = Duration::from_secs(
-            table.get("timeout_secs").and_then(|v| v.as_integer()).unwrap_or(30).max(1) as u64,
+            table
+                .get("timeout_secs")
+                .and_then(|v| v.as_integer())
+                .unwrap_or(30)
+                .max(1) as u64,
         );
         let max_timeout = Duration::from_secs(
-            table.get("max_timeout_secs").and_then(|v| v.as_integer()).unwrap_or(90).max(1) as u64,
+            table
+                .get("max_timeout_secs")
+                .and_then(|v| v.as_integer())
+                .unwrap_or(90)
+                .max(1) as u64,
         );
         Ok(BrowserConnector::new(
             id.as_str(),
@@ -359,12 +393,20 @@ mod tests {
             Duration::from_secs(45),
             Duration::from_secs(90),
         );
-        let out = conn.run_fetch(json!({ "url": "https://example.com" })).await;
+        let out = conn
+            .run_fetch(json!({ "url": "https://example.com" }))
+            .await;
         println!("{}", serde_json::to_string_pretty(&out).unwrap());
         assert_eq!(out["status"], "ok", "fetch should succeed");
-        assert!(out["title"].as_str().unwrap_or("").contains("Example"), "title: {out}");
         assert!(
-            out["text"].as_str().unwrap_or("").contains("Example Domain"),
+            out["title"].as_str().unwrap_or("").contains("Example"),
+            "title: {out}"
+        );
+        assert!(
+            out["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Example Domain"),
             "text should carry the page body"
         );
     }

@@ -20,11 +20,13 @@
 //! `O_NOFOLLOW` / `openat2(RESOLVE_BENEATH)` hardening is deferred to where real
 //! isolation lives (forkd).
 
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    fs::OpenOptions,
+    io::Write,
+    os::unix::fs::OpenOptionsExt,
+    path::{Component, Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use thiserror::Error;
 
@@ -179,9 +181,18 @@ mod tests {
     #[test]
     fn rejects_absolute_and_escape() {
         let (_g, root) = root();
-        assert!(matches!(resolve_in_root(&root, "/etc/passwd"), Err(WorkspaceError::Absolute(_))));
-        assert!(matches!(resolve_in_root(&root, "../secret"), Err(WorkspaceError::Escape(_))));
-        assert!(matches!(resolve_in_root(&root, "a/../../secret"), Err(WorkspaceError::Escape(_))));
+        assert!(matches!(
+            resolve_in_root(&root, "/etc/passwd"),
+            Err(WorkspaceError::Absolute(_))
+        ));
+        assert!(matches!(
+            resolve_in_root(&root, "../secret"),
+            Err(WorkspaceError::Escape(_))
+        ));
+        assert!(matches!(
+            resolve_in_root(&root, "a/../../secret"),
+            Err(WorkspaceError::Escape(_))
+        ));
     }
 
     #[test]
@@ -190,14 +201,23 @@ mod tests {
         // Directory scoping: empty resolves to the root itself.
         assert_eq!(resolve_in_root(&root, "").unwrap(), root);
         // A file target must have a name.
-        assert!(matches!(resolve_file_in_root(&root, ""), Err(WorkspaceError::Empty)));
+        assert!(matches!(
+            resolve_file_in_root(&root, ""),
+            Err(WorkspaceError::Empty)
+        ));
     }
 
     #[test]
     fn allows_interior_paths() {
         let (_g, root) = root();
-        assert_eq!(resolve_in_root(&root, "a/b.txt").unwrap(), root.join("a/b.txt"));
-        assert_eq!(resolve_in_root(&root, "./a/../b.txt").unwrap(), root.join("b.txt"));
+        assert_eq!(
+            resolve_in_root(&root, "a/b.txt").unwrap(),
+            root.join("a/b.txt")
+        );
+        assert_eq!(
+            resolve_in_root(&root, "./a/../b.txt").unwrap(),
+            root.join("b.txt")
+        );
     }
 
     #[test]
@@ -223,7 +243,10 @@ mod tests {
     #[test]
     fn read_missing_is_not_found() {
         let (_g, root) = root();
-        assert!(matches!(read_in_root(&root, "nope.txt"), Err(WorkspaceError::NotFound(_))));
+        assert!(matches!(
+            read_in_root(&root, "nope.txt"),
+            Err(WorkspaceError::NotFound(_))
+        ));
     }
 
     #[test]
@@ -242,7 +265,12 @@ mod tests {
         write_in_root(&root, "link.txt", b"safe").unwrap();
 
         assert_eq!(std::fs::read(&link).unwrap(), b"safe");
-        assert!(!std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(
+            !std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(std::fs::read(outside.path()).unwrap(), b"");
     }
 }

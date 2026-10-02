@@ -31,7 +31,7 @@ use octo_core::{
     Connector, ConnectorCapabilities, ConnectorContext, ConnectorFactory, ConnectorId, Envelope,
     EventKind, FactoryContext, Filter, OctoResult, SubscribeOptions,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub use config::MailConfig;
 /// Install the rustls CryptoProvider (ring) process-wide. Call once at process
@@ -74,7 +74,11 @@ impl MailConnector {
                 EventKind::new(format!("{REPLY}.result")),
             ])
             .with_description(CATALOG);
-        Arc::new(Self { id: ConnectorId::new(id), capabilities, cfg })
+        Arc::new(Self {
+            id: ConnectorId::new(id),
+            capabilities,
+            cfg,
+        })
     }
 }
 
@@ -93,7 +97,10 @@ impl Connector for MailConnector {
         // SMTP) — with two providers in the tree the lazy default panics.
         imap::ensure_crypto_provider();
         let mut cmds = ctx
-            .subscribe(Filter::by_target(self.id.clone()), SubscribeOptions::default())
+            .subscribe(
+                Filter::by_target(self.id.clone()),
+                SubscribeOptions::default(),
+            )
             .await?;
         tracing::info!(connector = %self.id, host = %self.cfg.imap_host, "mail ready");
         loop {
@@ -129,7 +136,9 @@ impl MailConnector {
                     let folder = params.get("folder").and_then(Value::as_str);
                     imap::read(&self.cfg, uid as u32, max, folder).await
                 }
-                None => Err(error::MailError::Config("read needs a numeric `uid`".into())),
+                None => Err(error::MailError::Config(
+                    "read needs a numeric `uid`".into(),
+                )),
             },
             SEND => smtp::send(&self.cfg, &params).await,
             REPLY => smtp::reply(&self.cfg, &params).await,
@@ -143,8 +152,12 @@ impl MailConnector {
                 json!({ "error": e.to_string() })
             }
         };
-        let resp = Envelope::new(self.id.clone(), EventKind::new(format!("{kind}.result")), payload)
-            .with_correlation(env.id);
+        let resp = Envelope::new(
+            self.id.clone(),
+            EventKind::new(format!("{kind}.result")),
+            payload,
+        )
+        .with_correlation(env.id);
         if let Err(e) = ctx.publish(resp).await {
             tracing::warn!(error = %e, "mail failed to publish result");
         }

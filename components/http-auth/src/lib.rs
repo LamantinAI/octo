@@ -13,8 +13,10 @@
 //! `Authorization` header, an SMTP client into `AUTH`/`XOAUTH2` — so it's shared
 //! by the CalDAV / SMTP / HTTP connectors, and a new provider is a config preset.
 
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::{
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -78,7 +80,10 @@ pub enum AuthConfig {
 pub enum Credential {
     None,
     /// Login + secret (app password): HTTP Basic, or SMTP `AUTH LOGIN`/`PLAIN`.
-    Basic { login: String, secret: String },
+    Basic {
+        login: String,
+        secret: String,
+    },
     /// A bearer access token: HTTP `Authorization: Bearer`, or SMTP `XOAUTH2`.
     Bearer(String),
 }
@@ -90,7 +95,10 @@ impl AuthConfig {
     pub async fn resolve(&self) -> Result<Credential, AuthError> {
         match self {
             AuthConfig::None => Ok(Credential::None),
-            AuthConfig::Basic { login, password_env } => Ok(Credential::Basic {
+            AuthConfig::Basic {
+                login,
+                password_env,
+            } => Ok(Credential::Basic {
                 login: login.clone(),
                 secret: env_secret(password_env)?,
             }),
@@ -106,8 +114,8 @@ impl Credential {
         match self {
             Credential::None => None,
             Credential::Basic { login, secret } => {
-                use base64::engine::general_purpose::STANDARD;
                 use base64::Engine;
+                use base64::engine::general_purpose::STANDARD;
                 let encoded = STANDARD.encode(format!("{login}:{secret}"));
                 Some(format!("Basic {encoded}"))
             }
@@ -142,7 +150,11 @@ impl HttpAuth {
     /// Build sharing a caller-supplied HTTP client (pool reuse; a proxy-free
     /// client in tests).
     pub fn with_client(config: AuthConfig, client: reqwest::Client) -> Self {
-        Self { config, client, cache: Mutex::new(None) }
+        Self {
+            config,
+            client,
+            cache: Mutex::new(None),
+        }
     }
 
     pub fn config(&self) -> &AuthConfig {
@@ -153,7 +165,12 @@ impl HttpAuth {
     /// cached one is absent or near expiry.
     pub async fn credential(&self) -> Result<Credential, AuthError> {
         match &self.config {
-            AuthConfig::Oauth2 { token_url, client_id, client_secret_env, refresh_token_env } => {
+            AuthConfig::Oauth2 {
+                token_url,
+                client_id,
+                client_secret_env,
+                refresh_token_env,
+            } => {
                 let token = self
                     .oauth2_token(token_url, client_id, client_secret_env, refresh_token_env)
                     .await?;
@@ -228,9 +245,15 @@ impl HttpAuth {
             .await
             .map_err(|e| AuthError::TokenRequest(e.to_string()))?;
         let status = resp.status();
-        let body = resp.text().await.map_err(|e| AuthError::TokenRequest(e.to_string()))?;
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| AuthError::TokenRequest(e.to_string()))?;
         if !status.is_success() {
-            return Err(AuthError::TokenRefused { status: status.as_u16(), body });
+            return Err(AuthError::TokenRefused {
+                status: status.as_u16(),
+                body,
+            });
         }
         let parsed: TokenResponse =
             serde_json::from_str(&body).map_err(|e| AuthError::TokenParse(e.to_string()))?;
@@ -295,7 +318,12 @@ mod tests {
             login: "user".into(),
             password_env: "HTTP_AUTH_TEST_PW".into(),
         });
-        let header = auth.credential().await.unwrap().http_authorization().unwrap();
+        let header = auth
+            .credential()
+            .await
+            .unwrap()
+            .http_authorization()
+            .unwrap();
         // base64("user:s3cret") == "dXNlcjpzM2NyZXQ="
         assert_eq!(header, "Basic dXNlcjpzM2NyZXQ=");
     }
@@ -303,15 +331,27 @@ mod tests {
     #[tokio::test]
     async fn bearer_resolves_to_bearer_header() {
         unsafe { std::env::set_var("HTTP_AUTH_TEST_TOKEN", "abc123") };
-        let auth = HttpAuth::new(AuthConfig::Bearer { token_env: "HTTP_AUTH_TEST_TOKEN".into() });
-        let header = auth.credential().await.unwrap().http_authorization().unwrap();
+        let auth = HttpAuth::new(AuthConfig::Bearer {
+            token_env: "HTTP_AUTH_TEST_TOKEN".into(),
+        });
+        let header = auth
+            .credential()
+            .await
+            .unwrap()
+            .http_authorization()
+            .unwrap();
         assert_eq!(header, "Bearer abc123");
     }
 
     #[tokio::test]
     async fn missing_secret_errors() {
-        let auth = HttpAuth::new(AuthConfig::Bearer { token_env: "DEFINITELY_UNSET_XYZ".into() });
-        assert!(matches!(auth.credential().await, Err(AuthError::MissingSecret(_))));
+        let auth = HttpAuth::new(AuthConfig::Bearer {
+            token_env: "DEFINITELY_UNSET_XYZ".into(),
+        });
+        assert!(matches!(
+            auth.credential().await,
+            Err(AuthError::MissingSecret(_))
+        ));
     }
 
     #[test]
@@ -321,7 +361,8 @@ mod tests {
 
     #[test]
     fn token_response_parses_google_shape() {
-        let json = r#"{"access_token":"ya29.a0","expires_in":3599,"token_type":"Bearer","scope":"..."}"#;
+        let json =
+            r#"{"access_token":"ya29.a0","expires_in":3599,"token_type":"Bearer","scope":"..."}"#;
         let t: TokenResponse = serde_json::from_str(json).unwrap();
         assert_eq!(t.access_token, "ya29.a0");
         assert_eq!(t.expires_in, Some(3599));
@@ -335,6 +376,9 @@ mod tests {
             client_secret_env: "CS".into(),
             refresh_token_env: "RT".into(),
         };
-        assert!(matches!(cfg.resolve().await, Err(AuthError::OAuth2NeedsRuntime)));
+        assert!(matches!(
+            cfg.resolve().await,
+            Err(AuthError::OAuth2NeedsRuntime)
+        ));
     }
 }

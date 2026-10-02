@@ -12,21 +12,23 @@
 //! The cogitator is pre-subscribed by the runtime before any connector
 //! publishes — guaranteeing no missed early envelopes.
 
-use std::collections::{HashMap, HashSet};
-use std::path::Path;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
 
 use futures::FutureExt;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    Cogitator, CogitatorContext, Connector, ConnectorContext, ConnectorInfo, EmptyCogitator,
+    OctoResult, PayloadRegistry, RestartPolicy, Router, RouterContext, SubscribeOptions,
     bus::{EventBus, Filter, InProcessBus, Subscription},
     config::{self, ConfigError, ConnectorFactory, Reloader},
-    control, Cogitator, CogitatorContext, Connector, ConnectorContext, ConnectorInfo,
-    EmptyCogitator, OctoResult, PayloadRegistry, RestartPolicy, Router, RouterContext,
-    SubscribeOptions,
+    control,
 };
 
 /// The runtime — owns the in-process bus, the cogitator, the optional router
@@ -105,8 +107,11 @@ impl Octo {
                     capabilities: c.capabilities().clone(),
                 })
                 .collect();
-            let cog_ctx =
-                CogitatorContext::new(self.shutdown.clone(), Arc::clone(&self.bus), connectors_info);
+            let cog_ctx = CogitatorContext::new(
+                self.shutdown.clone(),
+                Arc::clone(&self.bus),
+                connectors_info,
+            );
 
             tokio::spawn(async move {
                 if let Err(e) = cog.run(cog_ctx, cog_sub).await {
@@ -143,9 +148,10 @@ impl Octo {
         let ctrl_handle = {
             // Control plane is low-rate; default (drop-oldest, visible) is fine.
             // A never-drop criticality lane is a deferred option (see fix brief).
-            let mut ctrl_sub = self
-                .bus
-                .subscribe_sync(Filter::by_kind(control::CONTROL_GLOB), SubscribeOptions::default());
+            let mut ctrl_sub = self.bus.subscribe_sync(
+                Filter::by_kind(control::CONTROL_GLOB),
+                SubscribeOptions::default(),
+            );
             let ctrl_shutdown = self.shutdown.clone();
             let notifies = restart_notifies.clone();
             tokio::spawn(async move {
@@ -192,7 +198,9 @@ impl Octo {
                 .cloned()
                 .unwrap_or_else(|| Arc::new(Notify::new()));
             let reload = self.reloaders.get(conn.id().as_str()).cloned();
-            conn_handles.push(tokio::spawn(supervise(conn, shutdown, bus, restart, reload)));
+            conn_handles.push(tokio::spawn(supervise(
+                conn, shutdown, bus, restart, reload,
+            )));
         }
 
         // 4) Wait for connectors. They drive the lifecycle.

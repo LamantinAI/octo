@@ -50,9 +50,7 @@ impl TrailEntry {
 pub enum TrailActor {
     Connector(ConnectorId),
     Reflex(RuleId),
-    Cognition {
-        backend: String,
-    },
+    Cognition { backend: String },
     External(String),
 }
 

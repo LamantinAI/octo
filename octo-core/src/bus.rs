@@ -4,14 +4,16 @@
 //! observability, cognition) read independently. The bus does not interpret
 //! envelopes — it only routes them by header fields.
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::{
+    collections::VecDeque,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::{Notify, broadcast};
 
 use crate::{
     BackpressureStrategy, ChannelId, ConnectorId, Envelope, EventId, EventKind, OctoError,
@@ -26,11 +28,7 @@ use crate::{
 pub trait EventBus: Send + Sync {
     async fn publish(&self, envelope: Envelope) -> OctoResult<()>;
 
-    async fn subscribe(
-        &self,
-        filter: Filter,
-        opts: SubscribeOptions,
-    ) -> OctoResult<Subscription>;
+    async fn subscribe(&self, filter: Filter, opts: SubscribeOptions) -> OctoResult<Subscription>;
 
     /// Publish a command envelope and await a single response envelope
     /// correlated by id — broker-style request/response.
@@ -489,7 +487,11 @@ impl InProcessBus {
         let rx = self.sender.subscribe();
         let lagged = Arc::new(AtomicU64::new(0));
         if !opts.needs_shim(self.capacity) {
-            return Subscription { inner: SubInner::Broadcast(rx), filter, lagged };
+            return Subscription {
+                inner: SubInner::Broadcast(rx),
+                filter,
+                lagged,
+            };
         }
         let chan = Arc::new(ShimChan {
             queue: Mutex::new(VecDeque::new()),
@@ -497,8 +499,18 @@ impl InProcessBus {
             space: Notify::new(),
             closed: AtomicBool::new(false),
         });
-        spawn_forwarder(rx, filter.clone(), opts, Arc::clone(&chan), Arc::clone(&lagged));
-        Subscription { inner: SubInner::Shim(chan), filter, lagged }
+        spawn_forwarder(
+            rx,
+            filter.clone(),
+            opts,
+            Arc::clone(&chan),
+            Arc::clone(&lagged),
+        );
+        Subscription {
+            inner: SubInner::Shim(chan),
+            filter,
+            lagged,
+        }
     }
 }
 
@@ -515,11 +527,7 @@ impl EventBus for InProcessBus {
         Ok(())
     }
 
-    async fn subscribe(
-        &self,
-        filter: Filter,
-        opts: SubscribeOptions,
-    ) -> OctoResult<Subscription> {
+    async fn subscribe(&self, filter: Filter, opts: SubscribeOptions) -> OctoResult<Subscription> {
         Ok(self.make_subscription(filter, opts))
     }
 }

@@ -31,7 +31,7 @@ use octo_core::{
     EventId, EventKind, FactoryContext, Filter, OctoResult, SubscribeOptions,
 };
 use octo_http_auth::{AuthConfig, HttpAuth};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::OnceCell;
 
 pub use dav::DavError;
@@ -59,7 +59,10 @@ pub enum CollectionSource {
     /// A known collection URL — used verbatim, no discovery.
     Explicit(String),
     /// Discover from a server root, optionally selecting a calendar by display name.
-    Discover { base_url: String, calendar: Option<String> },
+    Discover {
+        base_url: String,
+        calendar: Option<String>,
+    },
 }
 
 pub struct CaldavConnector {
@@ -81,7 +84,11 @@ pub struct CaldavConnector {
 impl CaldavConnector {
     /// A calendar instance bound to a known CalDAV `collection` URL, authenticated
     /// via `auth`. Uses a default HTTP client.
-    pub fn new(id: impl Into<String>, collection: impl Into<String>, auth: AuthConfig) -> Arc<Self> {
+    pub fn new(
+        id: impl Into<String>,
+        collection: impl Into<String>,
+        auth: AuthConfig,
+    ) -> Arc<Self> {
         Self::from_source(
             id,
             CollectionSource::Explicit(collection.into()),
@@ -101,8 +108,18 @@ impl CaldavConnector {
         calendar: Option<String>,
         auth: AuthConfig,
     ) -> Arc<Self> {
-        let source = CollectionSource::Discover { base_url: base_url.into(), calendar };
-        Self::from_source(id, source, auth, reqwest::Client::new(), chrono_tz::UTC, None)
+        let source = CollectionSource::Discover {
+            base_url: base_url.into(),
+            calendar,
+        };
+        Self::from_source(
+            id,
+            source,
+            auth,
+            reqwest::Client::new(),
+            chrono_tz::UTC,
+            None,
+        )
     }
 
     /// As [`new`](Self::new), sharing a caller-supplied HTTP client (pool reuse /
@@ -193,7 +210,10 @@ impl Connector for CaldavConnector {
 
     async fn run(self: Arc<Self>, ctx: ConnectorContext) -> OctoResult<()> {
         let mut cmds = ctx
-            .subscribe(Filter::by_target(self.id.clone()), SubscribeOptions::default())
+            .subscribe(
+                Filter::by_target(self.id.clone()),
+                SubscribeOptions::default(),
+            )
             .await?;
         tracing::info!(connector = %self.id, "caldav ready");
         loop {
@@ -218,10 +238,20 @@ impl CaldavConnector {
         let outcome = match self.resolve_collection().await {
             Ok(collection) => match kind {
                 LIST => {
-                    let from = params.get("from").and_then(Value::as_str).unwrap_or_default();
+                    let from = params
+                        .get("from")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
                     let to = params.get("to").and_then(Value::as_str).unwrap_or_default();
-                    dav::list_events(&self.client, collection, &self.auth, from, to, self.display_tz)
-                        .await
+                    dav::list_events(
+                        &self.client,
+                        collection,
+                        &self.auth,
+                        from,
+                        to,
+                        self.display_tz,
+                    )
+                    .await
                 }
                 CREATE => {
                     let uid = EventId::new().to_string();
@@ -248,8 +278,12 @@ impl CaldavConnector {
                 json!({ "error": e.to_string() })
             }
         };
-        let resp = Envelope::new(self.id.clone(), EventKind::new(format!("{kind}.result")), payload)
-            .with_correlation(env.id);
+        let resp = Envelope::new(
+            self.id.clone(),
+            EventKind::new(format!("{kind}.result")),
+            payload,
+        )
+        .with_correlation(env.id);
         if let Err(e) = ctx.publish(resp).await {
             tracing::warn!(error = %e, "caldav failed to publish result");
         }
@@ -267,7 +301,9 @@ pub struct CaldavConnectorFactory {
 
 impl CaldavConnectorFactory {
     pub fn new() -> Self {
-        Self { client: reqwest::Client::new() }
+        Self {
+            client: reqwest::Client::new(),
+        }
     }
 }
 
@@ -301,7 +337,10 @@ impl ConnectorFactory for CaldavConnectorFactory {
                     .and_then(|v| v.as_str())
                     .ok_or("caldav: [connector] needs either `collection` or `base_url`")?
                     .to_string();
-                let calendar = table.get("calendar").and_then(|v| v.as_str()).map(String::from);
+                let calendar = table
+                    .get("calendar")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
                 CollectionSource::Discover { base_url, calendar }
             }
         };
@@ -311,9 +350,9 @@ impl ConnectorFactory for CaldavConnectorFactory {
         // Optional `timezone` (IANA name) renders listed event times as local
         // wall-clock for the agent; defaults to UTC.
         let display_tz = match table.get("timezone").and_then(|v| v.as_str()) {
-            Some(name) => name.parse::<chrono_tz::Tz>().map_err(|e| {
-                format!("caldav: invalid timezone `{name}`: {e}")
-            })?,
+            Some(name) => name
+                .parse::<chrono_tz::Tz>()
+                .map_err(|e| format!("caldav: invalid timezone `{name}`: {e}"))?,
             None => chrono_tz::UTC,
         };
         // Optional `reminder_minutes` — the default popup lead time for created
@@ -346,8 +385,12 @@ mod tests {
     use super::*;
 
     fn cmd(target: &str, kind: &str, payload: Value) -> Envelope {
-        Envelope::new(ConnectorId::new("test-driver"), EventKind::new(kind), payload)
-            .with_target(ConnectorId::new(target))
+        Envelope::new(
+            ConnectorId::new("test-driver"),
+            EventKind::new(kind),
+            payload,
+        )
+        .with_target(ConnectorId::new(target))
     }
 
     /// Live end-to-end **through the connector**: spin it up on a bus, dispatch
@@ -359,7 +402,10 @@ mod tests {
         let login = std::env::var("OCTO_TEST_CALDAV_LOGIN").expect("OCTO_TEST_CALDAV_LOGIN");
         let collection =
             std::env::var("OCTO_TEST_CALDAV_COLLECTION").expect("OCTO_TEST_CALDAV_COLLECTION");
-        let auth = AuthConfig::Basic { login, password_env: "OCTO_YANDEX_APP_PASSWORD".into() };
+        let auth = AuthConfig::Basic {
+            login,
+            password_env: "OCTO_YANDEX_APP_PASSWORD".into(),
+        };
 
         let bus = Arc::new(InProcessBus::new(64));
         let shutdown = CancellationToken::new();
@@ -392,13 +438,20 @@ mod tests {
         // list
         let listed = bus
             .publish_and_await_response(
-                cmd("calendar", LIST, json!({ "from": "2026-07-01T00:00:00Z", "to": "2026-07-03T00:00:00Z" })),
+                cmd(
+                    "calendar",
+                    LIST,
+                    json!({ "from": "2026-07-01T00:00:00Z", "to": "2026-07-03T00:00:00Z" }),
+                ),
                 Duration::from_secs(20),
             )
             .await
             .expect("list result");
         let listed = listed.payload_as::<Value>().cloned().unwrap_or(Value::Null);
-        println!("connector list -> {}", serde_json::to_string_pretty(&listed).unwrap());
+        println!(
+            "connector list -> {}",
+            serde_json::to_string_pretty(&listed).unwrap()
+        );
         let found = listed["events"]
             .as_array()
             .map(|a| a.iter().any(|e| e["title"] == "Via connector"))
@@ -414,7 +467,10 @@ mod tests {
 
         shutdown.cancel();
         let _ = handle.await;
-        assert!(found, "the event created via the connector should list back");
+        assert!(
+            found,
+            "the event created via the connector should list back"
+        );
     }
 
     /// Live end-to-end through a **discovering** connector: configured with only a
@@ -424,9 +480,13 @@ mod tests {
     #[ignore]
     async fn live_via_discovering_connector() {
         let login = std::env::var("OCTO_TEST_CALDAV_LOGIN").expect("OCTO_TEST_CALDAV_LOGIN");
-        let base_url = std::env::var("OCTO_TEST_CALDAV_BASE_URL").expect("OCTO_TEST_CALDAV_BASE_URL");
+        let base_url =
+            std::env::var("OCTO_TEST_CALDAV_BASE_URL").expect("OCTO_TEST_CALDAV_BASE_URL");
         let calendar = std::env::var("OCTO_TEST_CALDAV_CALENDAR").ok();
-        let auth = AuthConfig::Basic { login, password_env: "OCTO_YANDEX_APP_PASSWORD".into() };
+        let auth = AuthConfig::Basic {
+            login,
+            password_env: "OCTO_YANDEX_APP_PASSWORD".into(),
+        };
 
         let bus = Arc::new(InProcessBus::new(64));
         let shutdown = CancellationToken::new();
@@ -456,7 +516,11 @@ mod tests {
 
         let listed = bus
             .publish_and_await_response(
-                cmd("calendar", LIST, json!({ "from": "2026-07-03T00:00:00Z", "to": "2026-07-05T00:00:00Z" })),
+                cmd(
+                    "calendar",
+                    LIST,
+                    json!({ "from": "2026-07-03T00:00:00Z", "to": "2026-07-05T00:00:00Z" }),
+                ),
                 Duration::from_secs(20),
             )
             .await
@@ -476,6 +540,9 @@ mod tests {
 
         shutdown.cancel();
         let _ = handle.await;
-        assert!(found, "the event created via the discovering connector should list back");
+        assert!(
+            found,
+            "the event created via the discovering connector should list back"
+        );
     }
 }

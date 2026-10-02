@@ -9,9 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    BackpressureStrategy, ChannelId, ChannelMetadata, EventKind, RestartPolicy,
-};
+use crate::{BackpressureStrategy, ChannelId, ChannelMetadata, EventKind, RestartPolicy};
 
 /// Static description of a channel — a configuration record + capability list.
 ///

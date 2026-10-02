@@ -33,29 +33,30 @@ mod format;
 mod fs;
 mod live;
 
-use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
-
-use async_trait::async_trait;
-use futures::StreamExt;
-use octo_core::{
-    Blob, ChannelId, ChannelMetadata, Connector, ConnectorCapabilities, ConnectorContext,
-    ConnectorFactory, ConnectorId, Envelope, EventKind, FactoryContext, Filter, OctoResult,
-    ReplyChannel, SubscribeOptions, TrustLevel,
+use std::{
+    path::PathBuf,
+    sync::{Arc, RwLock},
+    time::Duration,
 };
-use serde::Deserialize;
-use serde_json::{json, Value};
-use teloxide::net::Download;
-use teloxide::prelude::*;
-use teloxide::types::{ChatId, InputFile, ParseMode, UpdateKind};
-use teloxide::update_listeners::{polling_default, AsUpdateStream};
 
-use crate::api::{is_unsupported, send_rich_markdown};
-use crate::batch::{Batcher, Emit, Flush};
-use crate::commands::{set_commands, SET_COMMANDS};
+use octo_core::{ConnectorCapabilities, ConnectorId, EventKind};
+
+use crate::commands::SET_COMMANDS;
 
 pub use acl::{Acl, AclEntry, Role};
+mod config;
+mod inbound;
+mod outbound;
+mod runtime;
+#[cfg(test)]
+use self::{
+    inbound::{
+        caption_with_saved, hms, inbox_name, reply_context, video_caption, video_media,
+        voice_media, with_reply,
+    },
+    outbound::{Outbound, is_voice_blob, outbound_kind},
+};
+pub use config::{TelegramConnectorFactory, factory};
 
 /// Default quiet window before a coalescing burst (album / forward) is flushed.
 /// Short, because these bursts arrive machine-fast; single typed messages are
@@ -163,8 +164,18 @@ impl TelegramConnector {
         acl: Acl,
         acl_path: Option<PathBuf>,
     ) -> Arc<Self> {
-        let state = Arc::new(AclState { acl: RwLock::new(acl), path: acl_path });
-        Self::build(id, token, Some(state), DEFAULT_DEBOUNCE, DEFAULT_MAX_WAIT, None)
+        let state = Arc::new(AclState {
+            acl: RwLock::new(acl),
+            path: acl_path,
+        });
+        Self::build(
+            id,
+            token,
+            Some(state),
+            DEFAULT_DEBOUNCE,
+            DEFAULT_MAX_WAIT,
+            None,
+        )
     }
 
     fn build(
@@ -200,988 +211,10 @@ impl TelegramConnector {
     }
 }
 
-#[async_trait]
-impl Connector for TelegramConnector {
-    fn id(&self) -> &ConnectorId {
-        &self.id
-    }
-
-    fn capabilities(&self) -> &ConnectorCapabilities {
-        &self.capabilities
-    }
-
-    async fn run(self: Arc<Self>, ctx: ConnectorContext) -> OctoResult<()> {
-        let bot = Bot::new(self.token.clone());
-
-        // ── Outbound: chat.reply → Telegram message ──────────────────────────
-        let mut replies = ctx
-            .subscribe(Filter::by_target(self.id.clone()), SubscribeOptions::default())
-            .await?;
-        let out_bot = bot.clone();
-        let out_shutdown = ctx.shutdown.clone();
-        let out_ctx = ctx.clone();
-        let out_acl = self.acl.clone();
-        let out_id = self.id.clone();
-        let out_workspace = self.workspace.clone();
-        let live = live::Live::new();
-        tokio::spawn(async move {
-            // Latched off the first time the server says it has no rich messages
-            // (an older self-hosted Bot API), so replies stop paying for a call
-            // that can't succeed. A per-message rejection doesn't clear it.
-            let mut rich_messages = true;
-            loop {
-                tokio::select! {
-                    reply = replies.next() => match reply {
-                        Some(env) => {
-                            // Control commands mutate the ACL; everything else is
-                            // an outbound message to send.
-                            if matches!(env.kind.as_str(), ALLOW_CHAT | REMOVE_CHAT | LIST_CHATS) {
-                                handle_control(&out_acl, &out_id, &env, &out_ctx).await;
-                                continue;
-                            }
-                            // The bot's command menu (set by the assembly at startup).
-                            if env.kind.as_str() == SET_COMMANDS {
-                                let owners = owner_chats(&out_acl);
-                                let payload = env.payload_as::<Value>().cloned().unwrap_or(Value::Null);
-                                let result = set_commands(&out_bot, &owners, &payload).await;
-                                let resp = Envelope::new(out_id.clone(), EventKind::new(format!("{SET_COMMANDS}.result")), result)
-                                    .with_correlation(env.id);
-                                if let Err(e) = out_ctx.publish(resp).await {
-                                    tracing::warn!(error = %e, "telegram: failed to publish set_commands result");
-                                }
-                                continue;
-                            }
-                            // Send a file from the shared workspace (by reference).
-                            if env.kind.as_str() == SEND_FILE {
-                                send_workspace_file(&out_bot, &out_workspace, &env).await;
-                                continue;
-                            }
-                            // The chat id rides on the envelope's channel.
-                            let Some(chat) = env.channel.as_ref().and_then(|c| c.as_str().parse::<i64>().ok()) else {
-                                tracing::warn!(kind = %env.kind, "outbound without a numeric channel; dropped");
-                                continue;
-                            };
-                            let chat_id = ChatId(chat);
-
-                            // Live-turn feedback: typing indicator / status trace.
-                            match env.kind.as_str() {
-                                TYPING => {
-                                    live.start_typing(out_bot.clone(), chat_id);
-                                    continue;
-                                }
-                                STATUS => {
-                                    if let Some(line) = env.payload_as::<String>() {
-                                        live.status(&out_bot, chat_id, line).await;
-                                    }
-                                    continue;
-                                }
-                                _ => {}
-                            }
-
-                            // The turn's reply is going out — stop typing, delete
-                            // the status trace.
-                            live.end_turn(&out_bot, chat_id);
-
-                            // A media payload → photo/voice/document; a String → text.
-                            if let Some(blob) = env.payload_as::<Blob>() {
-                                let file = InputFile::memory(blob.bytes().clone())
-                                    .file_name(blob.filename().unwrap_or("file").to_string());
-                                let sent = if blob.is_image() {
-                                    out_bot.send_photo(chat_id, file).await.map(|_| ())
-                                } else if is_voice_blob(blob) {
-                                    out_bot.send_voice(chat_id, file).await.map(|_| ())
-                                } else {
-                                    out_bot.send_document(chat_id, file).await.map(|_| ())
-                                };
-                                match sent {
-                                    Ok(_) => tracing::info!(chat, ct = blob.content_type(), "sent media"),
-                                    Err(e) => tracing::warn!(error = %e, "telegram media send failed"),
-                                }
-                            } else if let Some(text) = env.payload_as::<String>() {
-                                send_reply(&out_bot, chat_id, text, &mut rich_messages).await;
-                            }
-                        }
-                        None => break,
-                    },
-                    _ = out_shutdown.cancelled() => break,
-                }
-            }
-        });
-
-        // ── Inbound: long-poll updates → chat.message ────────────────────────
-        // A per-chat Batcher coalesces rapid/forwarded bursts into one input; a
-        // periodic tick flushes buffers whose quiet window has elapsed.
-        let mut batcher = Batcher::new(self.debounce, self.max_wait);
-        let mut flush_tick = tokio::time::interval(FLUSH_TICK);
-        flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut listener = polling_default(bot.clone()).await;
-        let stream = listener.as_stream();
-        // PollingStream is !Unpin; pin it on the stack to poll in select!.
-        tokio::pin!(stream);
-        tracing::info!(connector = %self.id, "telegram polling started");
-        loop {
-            tokio::select! {
-                _ = flush_tick.tick() => {
-                    for flush in batcher.drain_due(Instant::now()) {
-                        publish_flush(&self.id, &ctx, flush).await;
-                    }
-                }
-                update = stream.next() => match update {
-                    Some(Ok(update)) => {
-                        if let UpdateKind::Message(msg) = update.kind {
-                            let chat = msg.chat.id.0.to_string();
-                            // Authorization at the edge: a chat not on the ACL is
-                            // dropped here, before the bus — untrusted input never
-                            // reaches cognition. `None` ACL = allow all; otherwise
-                            // the chat's role/trust is stamped onto the envelope.
-                            let trust = match &self.acl {
-                                Some(state) => match state.acl.read().unwrap().role(msg.chat.id.0) {
-                                    Some(role) => Some((role, role.trust())),
-                                    None => {
-                                        tracing::warn!(%chat, "telegram: message from unlisted chat — dropped");
-                                        continue;
-                                    }
-                                },
-                                None => None,
-                            };
-                            let now = Instant::now();
-                            // Coalesce only what Telegram groups: an album shares a
-                            // media_group_id; a forward burst carries forward_origin
-                            // (no batch id, so group per chat). Everything else is
-                            // emitted immediately — zero latency for normal chat.
-                            let coalesce_key = coalesce_key(&msg, &chat);
-                            let buffer = batcher.enabled() && coalesce_key.is_some();
-                            // A reply carries the message it answers — fold a short context
-                            // of that quoted message into the perceived text/caption so the
-                            // cogitator sees what is being replied to (#17).
-                            let reply = reply_context(&msg);
-                            if let Some(text) = msg.text() {
-                                tracing::info!(%chat, "recv: {text}");
-                                let body =
-                                    with_reply(&reply, Some(text.to_string())).unwrap_or_default();
-                                if buffer {
-                                    batcher.push_text(
-                                        coalesce_key.unwrap(), &chat, body, trust, now,
-                                    );
-                                } else {
-                                    publish_flush(&self.id, &ctx, Flush {
-                                        chat: chat.clone(),
-                                        trust,
-                                        emit: Emit::Text { text: body, caption: None },
-                                    }).await;
-                                }
-                            } else if let Some(photo) = msg.photo().and_then(<[_]>::last) {
-                                // Largest size is last. Download bytes → Blob so a
-                                // (vision) cogitator can perceive the image.
-                                match download_bytes(&bot, &photo.file.id).await {
-                                    Ok(bytes) => {
-                                        tracing::info!(%chat, bytes = bytes.len(), "recv: photo");
-                                        // Also persist a copy to the workspace inbox: the
-                                        // Blob is ephemeral (it lives only for the turn), so
-                                        // without this the image can't be saved, forwarded,
-                                        // or referenced later. Perception is unaffected if
-                                        // the save fails — the Blob still goes out.
-                                        let saved = self
-                                            .save_incoming(&inbox_name("photo.jpg"), &bytes)
-                                            .map_err(|e| tracing::warn!(error = %e, "failed to save incoming photo"))
-                                            .ok();
-                                        let blob = Blob::new(bytes, "image/jpeg")
-                                            .with_filename("photo.jpg");
-                                        let caption = caption_with_saved(
-                                            with_reply(&reply, msg.caption().map(str::to_string)),
-                                            saved.as_deref(),
-                                        );
-                                        if buffer {
-                                            batcher.push_image(
-                                                coalesce_key.unwrap(), &chat, blob, caption, trust, now,
-                                            );
-                                        } else {
-                                            publish_flush(&self.id, &ctx, Flush {
-                                                chat: chat.clone(),
-                                                trust,
-                                                emit: Emit::Image { blob, caption },
-                                            }).await;
-                                        }
-                                    }
-                                    Err(e) => tracing::warn!(error = %e, "telegram photo download failed"),
-                                }
-                            } else if let Some((doc, mime)) = image_document(&msg) {
-                                // An image sent "as a file" (uncompressed): perceived as
-                                // a photo (the vision Blob, keeping its real MIME) AND
-                                // saved to the workspace inbox so it persists — same as a
-                                // compressed photo above. Emitted immediately.
-                                match download_bytes(&bot, &doc.file.id).await {
-                                    Ok(bytes) => {
-                                        tracing::info!(%chat, bytes = bytes.len(), %mime, "recv: image document");
-                                        let fname =
-                                            doc.file_name.clone().unwrap_or_else(|| "image".into());
-                                        let saved = self
-                                            .save_incoming(&inbox_name(&fname), &bytes)
-                                            .map_err(|e| tracing::warn!(error = %e, "failed to save incoming image document"))
-                                            .ok();
-                                        let blob = Blob::new(bytes, mime).with_filename(fname);
-                                        let caption = caption_with_saved(
-                                            with_reply(&reply, msg.caption().map(str::to_string)),
-                                            saved.as_deref(),
-                                        );
-                                        publish_flush(&self.id, &ctx, Flush {
-                                            chat: chat.clone(),
-                                            trust,
-                                            emit: Emit::Image { blob, caption },
-                                        }).await;
-                                    }
-                                    Err(e) => tracing::warn!(error = %e, "telegram document download failed"),
-                                }
-                            } else if let Some(audio) = voice_media(&msg) {
-                                // A voice note or an audio file → downloaded into a
-                                // Blob so a hearing cogitator can transcribe it,
-                                // the same way a photo reaches a vision one. Audio
-                                // sent as a plain *document* deliberately keeps the
-                                // workspace route below: long recordings belong to
-                                // a tool, not to the turn itself. Emitted immediately
-                                // (Telegram never groups voice into an album).
-                                match download_bytes(&bot, audio.file_id).await {
-                                    Ok(bytes) => {
-                                        tracing::info!(
-                                            %chat, bytes = bytes.len(), secs = audio.duration_secs,
-                                            "recv: voice"
-                                        );
-                                        // Persist the raw audio to the workspace inbox too:
-                                        // transcription is perception, but the file itself
-                                        // should survive so it can be kept, forwarded, or
-                                        // moved to storage. Save failure doesn't stop the
-                                        // transcription turn.
-                                        let path = self
-                                            .save_incoming(&inbox_name(&audio.filename), &bytes)
-                                            .map_err(|e| tracing::warn!(error = %e, "failed to save incoming voice"))
-                                            .ok();
-                                        let blob = Blob::new(bytes, audio.mime)
-                                            .with_filename(audio.filename);
-                                        publish_flush(&self.id, &ctx, Flush {
-                                            chat: chat.clone(),
-                                            trust,
-                                            emit: Emit::Audio {
-                                                blob,
-                                                caption: with_reply(&reply, msg.caption().map(str::to_string)),
-                                                duration_secs: Some(audio.duration_secs),
-                                                path,
-                                            },
-                                        }).await;
-                                    }
-                                    Err(e) => tracing::warn!(error = %e, "telegram voice download failed"),
-                                }
-                            } else if let Some(video) = video_media(&msg) {
-                                // A video clip or a round video note. The bytes never
-                                // travel to the model — no model perceives video, and
-                                // clips are large — so the file lands in the workspace
-                                // for a tool (ffprobe/ffmpeg, transcription) while
-                                // Telegram's OWN thumbnail rides along as an `Image`
-                                // blob, so a vision cogitator sees what arrived instead
-                                // of a bare path. Emitted immediately (Telegram groups
-                                // video into an album only with photos, handled above).
-                                match download_bytes(&bot, video.file_id).await {
-                                    Ok(bytes) => {
-                                        let saved = self
-                                            .save_incoming(&inbox_name(&video.filename), &bytes)
-                                            .map_err(|e| tracing::warn!(error = %e, "failed to save incoming video"))
-                                            .ok();
-                                        tracing::info!(
-                                            %chat, bytes = bytes.len(), secs = video.duration_secs,
-                                            rel = saved.as_deref().unwrap_or("-"), "recv: video"
-                                        );
-                                        let caption = video_caption(
-                                            &video,
-                                            with_reply(&reply, msg.caption().map(str::to_string)),
-                                            saved.as_deref(),
-                                        );
-                                        // The poster frame, when Telegram sent one — a
-                                        // failed thumbnail download must not cost us the
-                                        // whole turn, so it degrades to plain text.
-                                        let thumb = match video.thumbnail {
-                                            Some(t) => download_bytes(&bot, &t.file.id).await.ok(),
-                                            None => None,
-                                        };
-                                        let emit = match thumb {
-                                            Some(bytes) => Emit::Image {
-                                                blob: Blob::new(bytes, "image/jpeg")
-                                                    .with_filename("video-thumb.jpg"),
-                                                caption: Some(caption),
-                                            },
-                                            None => Emit::Text { text: caption, caption: None },
-                                        };
-                                        publish_flush(&self.id, &ctx, Flush {
-                                            chat: chat.clone(),
-                                            trust,
-                                            emit,
-                                        }).await;
-                                    }
-                                    Err(e) => {
-                                        // The Bot API caps downloads at 20 MB, so a long
-                                        // clip fails right here. Say so: staying silent
-                                        // reads as the bot ignoring the message.
-                                        tracing::warn!(error = %e, "telegram video download failed");
-                                        publish_flush(&self.id, &ctx, Flush {
-                                            chat: chat.clone(),
-                                            trust,
-                                            emit: Emit::Text {
-                                                text: format!(
-                                                    "[received a video ({}) but could not download it \
-                                                     — Telegram caps bot downloads at 20 MB]",
-                                                    hms(video.duration_secs)
-                                                ),
-                                                caption: None,
-                                            },
-                                        }).await;
-                                    }
-                                }
-                            } else if let Some(doc) = msg.document() {
-                                // Any other file → saved into the shared workspace;
-                                // the cogitator is handed its path (bytes by
-                                // reference, never through the model). Emitted
-                                // immediately.
-                                let name = doc.file_name.clone().unwrap_or_else(|| "file".into());
-                                match download_bytes(&bot, &doc.file.id).await {
-                                    Ok(bytes) => match self.save_incoming(&name, &bytes) {
-                                        Ok(rel) => {
-                                            tracing::info!(%chat, %rel, bytes = bytes.len(), "recv: file");
-                                            let text = format!(
-                                                "[received file `{name}` — saved to workspace path `{rel}`]"
-                                            );
-                                            publish_flush(&self.id, &ctx, Flush {
-                                                chat: chat.clone(),
-                                                trust,
-                                                emit: Emit::Text { text, caption: None },
-                                            }).await;
-                                        }
-                                        Err(e) => tracing::warn!(error = %e, "failed to save incoming file"),
-                                    },
-                                    Err(e) => tracing::warn!(error = %e, "telegram file download failed"),
-                                }
-                            }
-                        }
-                    }
-                    Some(Err(e)) => tracing::warn!(error = %e, "telegram update error"),
-                    None => {
-                        for flush in batcher.drain_all() {
-                            publish_flush(&self.id, &ctx, flush).await;
-                        }
-                        return Ok(());
-                    }
-                },
-                _ = ctx.shutdown.cancelled() => {
-                    for flush in batcher.drain_all() {
-                        publish_flush(&self.id, &ctx, flush).await;
-                    }
-                    return Ok(());
-                }
-            }
-        }
-    }
-}
-
-impl TelegramConnector {
-    /// Save an incoming file into the shared workspace's inbox, returning its
-    /// workspace-relative path.
-    fn save_incoming(
-        &self,
-        filename: &str,
-        bytes: &[u8],
-    ) -> Result<String, octo_workspace::WorkspaceError> {
-        let root = fs::workspace_root(&self.workspace)?;
-        fs::save_incoming(&root, filename, bytes)
-    }
-}
-
-/// How an outgoing file is presented in Telegram.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Outbound {
-    /// `sendPhoto`: an inline preview.
-    Photo,
-    /// `sendVoice`: the play-in-place voice bubble. Telegram only renders OGG/Opus
-    /// this way — an MP3 or M4A sent as a voice note comes back as an error.
-    Voice,
-    /// `sendDocument`: everything else.
-    Document,
-}
-
-/// Classify an outgoing file by its extension. The name is ours (a workspace path
-/// or a caller-chosen `filename`), not a remote-controlled string.
-fn outbound_kind(filename: &str) -> Outbound {
-    let lower = filename.to_ascii_lowercase();
-    let has = |exts: &[&str]| exts.iter().any(|ext| lower.ends_with(ext));
-    if has(&[".png", ".jpg", ".jpeg", ".webp", ".gif"]) {
-        Outbound::Photo
-    } else if has(&[".ogg", ".oga", ".opus"]) {
-        Outbound::Voice
-    } else {
-        Outbound::Document
-    }
-}
-
-/// An audio `Blob` that Telegram will accept as a voice note: OGG/Opus by MIME, or
-/// by the filename it was labelled with.
-fn is_voice_blob(blob: &Blob) -> bool {
-    blob.content_type().starts_with("audio/ogg")
-        || blob
-            .filename()
-            .is_some_and(|f| outbound_kind(f) == Outbound::Voice)
-}
-
-/// Send a model reply to a chat: a rich message where the server has them
-/// (Markdown as-is, laid out by Telegram), dropping to the pre-10.1 HTML
-/// renderer and then to plain text if it doesn't — so a reply always lands, and
-/// only its formatting degrades.
-async fn send_reply(bot: &Bot, chat: ChatId, text: &str, rich_messages: &mut bool) {
-    if !*rich_messages {
-        send_html(bot, chat, text).await;
-        return;
-    }
-    for chunk in format::split_rich(text) {
-        let markdown = format::sanitize_rich(&chunk);
-        match send_rich_markdown(bot, chat, &markdown).await {
-            Ok(()) => tracing::info!(%chat, "sent reply (rich)"),
-            Err(e) => {
-                if is_unsupported(&e) {
-                    tracing::warn!(error = %e, "telegram: server has no rich messages; using the HTML renderer from here on");
-                    *rich_messages = false;
-                } else {
-                    tracing::warn!(error = %e, "telegram rich send failed; falling back to HTML");
-                }
-                send_html(bot, chat, &chunk).await;
-            }
-        }
-    }
-}
-
-/// The pre-10.1 path, and the fallback under a rejected rich send: the model's
-/// Markdown rendered into Telegram's HTML subset, split to the message-length
-/// limit, and stripped to plain text if the Bot API rejects a chunk's HTML.
-async fn send_html(bot: &Bot, chat: ChatId, text: &str) {
-    let html = format::to_telegram_html(text);
-    for chunk in format::split_for_telegram(&html) {
-        let sent = bot.send_message(chat, chunk.clone()).parse_mode(ParseMode::Html).await;
-        match sent {
-            Ok(_) => tracing::info!(%chat, "sent reply"),
-            Err(e) => {
-                tracing::warn!(error = %e, "telegram HTML send failed; retrying as plain text");
-                let plain = format::strip_tags(&chunk);
-                if let Err(e2) = bot.send_message(chat, plain).await {
-                    tracing::warn!(error = %e2, "telegram plain send failed");
-                }
-            }
-        }
-    }
-}
-
-/// Handle `chat.send_file`: load a file from the shared workspace by its path and
-/// send it — a photo for images, a voice note for OGG/Opus audio, a document
-/// otherwise, with an optional `caption`.
-/// Chat id comes from the payload `chat`, else
-/// the envelope's channel. Bytes never pass through the model — the payload only
-/// names a path.
-async fn send_workspace_file(bot: &Bot, workspace: &Option<PathBuf>, env: &Envelope) {
-    let params = env.payload_as::<Value>().cloned().unwrap_or(Value::Null);
-    let Some(path) = params.get("path").and_then(Value::as_str) else {
-        tracing::warn!("chat.send_file without a `path`; dropped");
-        return;
-    };
-    let chat = params.get("chat").and_then(Value::as_i64).or_else(|| {
-        env.channel
-            .as_ref()
-            .and_then(|c| c.as_str().parse::<i64>().ok())
-    });
-    let Some(chat) = chat else {
-        tracing::warn!("chat.send_file without a chat id; dropped");
-        return;
-    };
-    let root = match fs::workspace_root(workspace) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(error = %e, "chat.send_file: workspace unavailable");
-            return;
-        }
-    };
-    let (bytes, name) = match fs::load_outgoing(&root, path) {
-        Ok(x) => x,
-        Err(e) => {
-            tracing::warn!(error = %e, %path, "chat.send_file: cannot read workspace file");
-            return;
-        }
-    };
-    let filename = params
-        .get("filename")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or(name);
-    let caption = params
-        .get("caption")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    // An image goes as a photo (inline preview) and OGG/Opus as a voice note (the
-    // play-in-place bubble) rather than a document. Judge by extension — the workspace
-    // filename is ours, not a remote-controlled string.
-    let kind = outbound_kind(&filename);
-    let file = InputFile::memory(bytes).file_name(filename);
-    let sent = match kind {
-        Outbound::Photo => {
-            let mut req = bot.send_photo(ChatId(chat), file);
-            if let Some(c) = caption {
-                req = req.caption(c);
-            }
-            req.await.map(|_| ())
-        }
-        Outbound::Voice => {
-            let mut req = bot.send_voice(ChatId(chat), file);
-            if let Some(c) = caption {
-                req = req.caption(c);
-            }
-            req.await.map(|_| ())
-        }
-        Outbound::Document => {
-            let mut req = bot.send_document(ChatId(chat), file);
-            if let Some(c) = caption {
-                req = req.caption(c);
-            }
-            req.await.map(|_| ())
-        }
-    };
-    match sent {
-        Ok(_) => tracing::info!(chat, %path, kind = ?kind, "sent file"),
-        Err(e) => tracing::warn!(error = %e, "telegram send_file failed"),
-    }
-}
-
-/// The coalescing key for a message, or `None` to emit it immediately.
-///
-/// Telegram groups an album under one `media_group_id`; a forwarded burst has no
-/// batch id, so forwarded messages are grouped per chat. A plain typed message
-/// (the common case) returns `None` and is published with zero added latency.
-fn coalesce_key(msg: &teloxide::types::Message, chat: &str) -> Option<String> {
-    if let Some(group) = msg.media_group_id() {
-        Some(format!("mg:{}", group.0))
-    } else if msg.forward_origin().is_some() {
-        Some(format!("fwd:{chat}"))
-    } else {
-        None
-    }
-}
-
-/// Publish a flushed batch as one `chat.message` envelope.
-async fn publish_flush(id: &ConnectorId, ctx: &ConnectorContext, flush: Flush) {
-    let Flush { chat, trust, emit } = flush;
-    let env = match emit {
-        Emit::Text { text, caption } => {
-            chat_envelope(id, &chat, text, caption.as_deref(), trust)
-        }
-        Emit::Image { blob, caption } => {
-            chat_envelope(id, &chat, blob, caption.as_deref(), trust)
-        }
-        Emit::Audio { blob, caption, duration_secs, path } => {
-            let mut env = chat_envelope(id, &chat, blob, caption.as_deref(), trust);
-            // Length is metadata, not content; the workspace path lets a cogitator hand
-            // the recording to a tool (the transcribe organ) by reference.
-            if let Some(secs) = duration_secs {
-                env = env.with_tag("duration_secs", secs.to_string());
-            }
-            if let Some(path) = path {
-                env = env.with_tag("workspace_path", path);
-            }
-            env
-        }
-        Emit::Multipart(msg) => chat_envelope(id, &chat, msg, None, trust),
-    };
-    if let Err(e) = ctx.publish(env).await {
-        tracing::warn!(error = %e, "failed to publish chat.message");
-    }
-}
-
-/// Build an inbound `chat.message` envelope: the payload is the text (a `String`)
-/// or the image (a `Blob`); the `chat_id` rides on both the channel and the
-/// reply recommendation, and a non-empty caption is attached as a `caption` tag.
-fn chat_envelope<P: std::any::Any + Send + Sync>(
-    id: &ConnectorId,
-    chat: &str,
-    payload: P,
-    caption: Option<&str>,
-    trust: Option<(Role, TrustLevel)>,
-) -> Envelope {
-    let mut env = Envelope::new(id.clone(), EventKind::from_static("chat.message"), payload)
-        .with_channel(ChannelId::new(chat.to_string()))
-        .with_reply_to(ReplyChannel::new(ChannelId::new(chat.to_string())));
-    if let Some(cap) = caption.filter(|c| !c.is_empty()) {
-        env = env.with_tag("caption", cap);
-    }
-    // Front-load authorization: the trust gradient (generic reflex gating) plus
-    // the precise role (capability checks live downstream).
-    if let Some((role, level)) = trust {
-        env = env.with_channel_metadata(
-            ChannelMetadata::new().with_trust(level).with_tag("role", role.as_str()),
-        );
-    }
-    env
-}
-
-/// An inbound voice note or audio file: what's needed to fetch it and label the
-/// resulting [`Blob`].
-struct VoiceMedia<'a> {
-    file_id: &'a teloxide::types::FileId,
-    /// MIME as declared by the sender, defaulted per kind when absent.
-    mime: String,
-    filename: String,
-    duration_secs: u32,
-}
-
-/// Inbound audio: a voice note (`voice`) or an audio file sent as music (`audio`).
-/// A voice note is OGG/Opus and its MIME is often missing, hence the defaults.
-fn voice_media(msg: &teloxide::types::Message) -> Option<VoiceMedia<'_>> {
-    if let Some(voice) = msg.voice() {
-        return Some(VoiceMedia {
-            file_id: &voice.file.id,
-            mime: voice
-                .mime_type
-                .as_ref()
-                .map_or_else(|| "audio/ogg".to_string(), |m| m.essence_str().to_string()),
-            filename: "voice.ogg".to_string(),
-            duration_secs: voice.duration.seconds(),
-        });
-    }
-    let audio = msg.audio()?;
-    Some(VoiceMedia {
-        file_id: &audio.file.id,
-        mime: audio
-            .mime_type
-            .as_ref()
-            .map_or_else(|| "audio/mpeg".to_string(), |m| m.essence_str().to_string()),
-        filename: audio.file_name.clone().unwrap_or_else(|| "audio".to_string()),
-        duration_secs: audio.duration.seconds(),
-    })
-}
-
-/// An inbound video: what's needed to fetch it, name it in the workspace, and
-/// describe it to a cogitator.
-struct VideoMedia<'a> {
-    file_id: &'a teloxide::types::FileId,
-    /// Telegram's own poster frame, when it sent one — a free first look at the
-    /// clip that costs no local decoding.
-    thumbnail: Option<&'a teloxide::types::PhotoSize>,
-    filename: String,
-    duration_secs: u32,
-    /// A round `video_note` rather than a regular clip; the two read differently
-    /// in a chat, so the note says which arrived.
-    is_note: bool,
-}
-
-/// Inbound video: a clip (`video`) or a round video note (`video_note`). Video
-/// sent as a plain *document* deliberately keeps the generic workspace route,
-/// exactly as audio documents do.
-fn video_media(msg: &teloxide::types::Message) -> Option<VideoMedia<'_>> {
-    if let Some(video) = msg.video() {
-        return Some(VideoMedia {
-            file_id: &video.file.id,
-            thumbnail: video.thumbnail.as_ref(),
-            filename: video.file_name.clone().unwrap_or_else(|| "video.mp4".to_string()),
-            duration_secs: video.duration.seconds(),
-            is_note: false,
-        });
-    }
-    let note = msg.video_note()?;
-    Some(VideoMedia {
-        file_id: &note.file.id,
-        thumbnail: note.thumbnail.as_ref(),
-        // A video note carries no name of its own.
-        filename: "video_note.mp4".to_string(),
-        duration_secs: note.duration.seconds(),
-        is_note: true,
-    })
-}
-
-/// A clip length as `m:ss`, or `h:mm:ss` once it passes an hour.
-fn hms(secs: u32) -> String {
-    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-    if h > 0 {
-        format!("{h}:{m:02}:{s:02}")
-    } else {
-        format!("{m}:{s:02}")
-    }
-}
-
-/// What the cogitator reads for an inbound video: the sender's caption (if any)
-/// plus a note naming the clip, its length and the workspace path it was saved
-/// to — the handle every ffmpeg/transcription tool needs. Mirrors the
-/// `saved to workspace path` wording a plain document already gets.
-fn video_caption(video: &VideoMedia<'_>, caption: Option<String>, saved: Option<&str>) -> String {
-    let kind = if video.is_note { "video note" } else { "video" };
-    let (name, len) = (&video.filename, hms(video.duration_secs));
-    let note = match saved {
-        Some(rel) => {
-            format!("[received {kind} `{name}` ({len}) — saved to workspace path `{rel}`]")
-        }
-        // Perception still happens (the thumbnail is attached); only the handle
-        // for tools is missing, so say that rather than naming a path that isn't.
-        None => format!("[received {kind} `{name}` ({len}) — could not save it to the workspace]"),
-    };
-    match caption {
-        Some(c) if !c.is_empty() => format!("{c}\n\n{note}"),
-        _ => note,
-    }
-}
-
-/// A document attachment that is actually an image (`image/*` MIME), with its
-/// MIME type rendered to a string — the "send as file" (uncompressed) path.
-fn image_document(msg: &teloxide::types::Message) -> Option<(&teloxide::types::Document, String)> {
-    let doc = msg.document()?;
-    let mime = doc.mime_type.as_ref()?;
-    (mime.type_() == "image").then(|| (doc, mime.essence_str().to_string()))
-}
-
-/// A unique inbox filename for an incoming image: `<unix_millis>-<basename>`.
-/// Telegram photos all arrive named `photo.jpg`, so a bare basename would have
-/// each new image clobber the previous one in the inbox.
-fn inbox_name(base: &str) -> String {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let base = std::path::Path::new(base)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("image");
-    format!("{ts}-{base}")
-}
-
-/// Fold the saved workspace path into the image caption, so a cogitator learns
-/// the image also lives on disk (and can be saved / forwarded / referenced) —
-/// mirroring the `saved to workspace path` note a plain document already gets.
-/// With no saved path (the write failed), the caption is passed through untouched.
-fn caption_with_saved(caption: Option<String>, saved: Option<&str>) -> Option<String> {
-    let Some(rel) = saved else { return caption };
-    let note = format!("[image saved to workspace path `{rel}`]");
-    Some(match caption {
-        Some(c) if !c.is_empty() => format!("{c}\n\n{note}"),
-        _ => note,
-    })
-}
-
-/// A short context line for a message that replies to another one, naming what it
-/// answers so the cogitator has the quoted message in view. Quoted text (or caption)
-/// is included, trimmed to a snippet; quoted media is named, never downloaded.
-/// `None` when the message is not a reply.
-fn reply_context(msg: &teloxide::types::Message) -> Option<String> {
-    let replied = msg.reply_to_message()?;
-    let what = if let Some(text) = replied.text().or_else(|| replied.caption()) {
-        let text = text.trim();
-        let snippet: String = text.chars().take(300).collect();
-        let ellipsis = if text.chars().count() > 300 { "…" } else { "" };
-        format!("\"{snippet}{ellipsis}\"")
-    } else if replied.photo().is_some() {
-        "a photo".to_string()
-    } else if replied.video().is_some() || replied.video_note().is_some() {
-        "a video".to_string()
-    } else if replied.voice().is_some() {
-        "a voice message".to_string()
-    } else if replied.audio().is_some() {
-        "an audio file".to_string()
-    } else if replied.document().is_some() {
-        "a file".to_string()
-    } else {
-        "an earlier message".to_string()
-    };
-    Some(format!("[replying to {what}]"))
-}
-
-/// Fold an optional reply-context line onto the front of the user's text/caption, so
-/// the quoted message rides with what they actually wrote. Empty body → the context
-/// stands alone; no reply → the body passes through untouched.
-fn with_reply(reply: &Option<String>, body: Option<String>) -> Option<String> {
-    match (reply, body) {
-        (Some(r), Some(b)) if !b.trim().is_empty() => Some(format!("{r}\n{b}")),
-        (Some(r), _) => Some(r.clone()),
-        (None, b) => b,
-    }
-}
-
-/// Resolve a Telegram `file_id` and download its bytes.
-async fn download_bytes(
-    bot: &Bot,
-    file_id: &teloxide::types::FileId,
-) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    let file = bot.get_file(file_id.clone()).await?;
-    let mut bytes: Vec<u8> = Vec::new();
-    bot.download_file(&file.path, &mut bytes).await?;
-    Ok(bytes)
-}
-
-/// Handle an `octo.telegram.*` control command: mutate the ACL, persist it, and
-/// publish a correlated `<kind>.result` reply. Authorization (only the owner may
-/// run these) is enforced *upstream* by the dispatching cogitator — the command
-/// reaching here is already vouched for; the connector just applies it.
-async fn handle_control(
-    acl: &Option<Arc<AclState>>,
-    id: &ConnectorId,
-    env: &Envelope,
-    ctx: &ConnectorContext,
-) {
-    let Some(state) = acl else {
-        tracing::warn!(kind = %env.kind, "telegram: control command but no ACL configured; ignored");
-        return;
-    };
-    let payload = env.payload_as::<Value>().cloned().unwrap_or(Value::Null);
-    let chat_id = payload.get("chat_id").and_then(Value::as_i64);
-
-    let result = match env.kind.as_str() {
-        ALLOW_CHAT => match chat_id {
-            Some(chat_id) => {
-                let role = match payload.get("role").and_then(Value::as_str) {
-                    Some("owner") => Role::Owner,
-                    _ => Role::Trusted,
-                };
-                let added = {
-                    let mut acl = state.acl.write().unwrap();
-                    let added = acl.insert(chat_id, role);
-                    persist(&acl, &state.path);
-                    added
-                };
-                tracing::info!(chat_id, role = role.as_str(), added, "telegram: allow_chat");
-                json!({ "ok": true, "chat_id": chat_id, "role": role.as_str(), "added": added })
-            }
-            None => json!({ "ok": false, "error": "missing or non-integer chat_id" }),
-        },
-        REMOVE_CHAT => match chat_id {
-            Some(chat_id) => {
-                let removed = {
-                    let mut acl = state.acl.write().unwrap();
-                    let removed = acl.remove(chat_id);
-                    persist(&acl, &state.path);
-                    removed
-                };
-                tracing::info!(chat_id, removed, "telegram: remove_chat");
-                json!({ "ok": true, "chat_id": chat_id, "removed": removed })
-            }
-            None => json!({ "ok": false, "error": "missing or non-integer chat_id" }),
-        },
-        LIST_CHATS => {
-            let chats = state.acl.read().unwrap().entries();
-            json!({ "ok": true, "chats": chats })
-        }
-        _ => json!({ "ok": false, "error": "unknown command" }),
-    };
-
-    let resp = Envelope::new(
-        id.clone(),
-        EventKind::new(format!("{}.result", env.kind.as_str())),
-        result,
-    )
-    .with_correlation(env.id);
-    if let Err(e) = ctx.publish(resp).await {
-        tracing::warn!(error = %e, "telegram: failed to publish control result");
-    }
-}
-
-/// The chats the ACL marks as owners (none without an ACL).
-fn owner_chats(acl: &Option<Arc<AclState>>) -> Vec<i64> {
-    acl.as_ref()
-        .map(|state| {
-            state.acl.read().unwrap().entries().into_iter().filter(|e| e.role == Role::Owner).map(|e| e.chat_id).collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Persist the ACL to its file if one is configured, logging (not failing) on error.
-fn persist(acl: &Acl, path: &Option<PathBuf>) {
-    if let Some(p) = path {
-        if let Err(e) = acl.save(p) {
-            tracing::warn!(error = %e, path = %p.display(), "telegram: failed to persist ACL");
-        }
-    }
-}
-
-// ── Config-driven construction (`type = "telegram"` manifest) ────────────────
-
-/// One connector manifest file (`[connector]` table at its root).
-#[derive(Debug, Deserialize)]
-struct ConnectorFile {
-    connector: TelegramConfig,
-}
-
-/// Static config from a `type = "telegram"` manifest. The token is a secret, so
-/// the manifest names the env var that holds it rather than the value.
-#[derive(Debug, Deserialize)]
-struct TelegramConfig {
-    #[serde(default = "default_token_env")]
-    token_env: String,
-    /// Path (relative to the manifest) to the JSON ACL file. Absent **and** no
-    /// `owner_chat` → no access control (allow all).
-    acl_path: Option<String>,
-    /// Seed owner chat id — inserted into the ACL at `owner`, so the bot is
-    /// reachable on first run even with an empty/absent ACL file.
-    owner_chat: Option<i64>,
-    /// Coalescing quiet window in ms (default 500; `0` disables coalescing).
-    batch_debounce_ms: Option<u64>,
-    /// Cap in ms on how long a chat's buffer stays open (default 3000).
-    batch_max_wait_ms: Option<u64>,
-    /// Shared workspace root (relative to the manifest) for file transfer. Must
-    /// match octo-code's. Absent → `$OCTO_CODE_WORKSPACE`, then the default.
-    workspace: Option<String>,
-}
-
-fn default_token_env() -> String {
-    "OCTO_TELEGRAM_TOKEN".to_string()
-}
-
-/// [`ConnectorFactory`] for `type = "telegram"`. Register once with
-/// `Octo::builder().register_connector_type("telegram", octo_connector_telegram::factory())`,
-/// and every manifest with `type = "telegram"` becomes an instance.
-pub struct TelegramConnectorFactory;
-
-impl ConnectorFactory for TelegramConnectorFactory {
-    fn type_name(&self) -> &str {
-        "telegram"
-    }
-
-    fn create(
-        &self,
-        id: ConnectorId,
-        config: &toml::Value,
-        ctx: FactoryContext<'_>,
-    ) -> Result<Arc<dyn Connector>, Box<dyn std::error::Error + Send + Sync>> {
-        let file: ConnectorFile = config.clone().try_into()?;
-        let cfg = file.connector;
-        let token = std::env::var(&cfg.token_env)
-            .map_err(|_| format!("telegram: env var {} is not set", cfg.token_env))?;
-
-        let debounce = cfg.batch_debounce_ms.map(Duration::from_millis).unwrap_or(DEFAULT_DEBOUNCE);
-        let max_wait = cfg.batch_max_wait_ms.map(Duration::from_millis).unwrap_or(DEFAULT_MAX_WAIT);
-        let workspace: Option<PathBuf> = cfg.workspace.as_ref().map(|w| ctx.base_dir.join(w));
-
-        // No ACL configured → allow-all connector (the playground shape).
-        let acl_state = if cfg.acl_path.is_none() && cfg.owner_chat.is_none() {
-            None
-        } else {
-            // Resolve the ACL path (relative to the manifest) once — used to load
-            // it now and to persist runtime mutations later.
-            let acl_path: Option<PathBuf> = cfg.acl_path.as_ref().map(|p| ctx.base_dir.join(p));
-            let mut acl = match &acl_path {
-                Some(p) => Acl::load(p)?,
-                None => Acl::new(),
-            };
-            if let Some(owner) = cfg.owner_chat {
-                acl.ensure(owner, Role::Owner);
-            }
-            tracing::info!(connector = %id, allowed = acl.len(), "telegram: access-control list loaded");
-            Some(Arc::new(AclState { acl: RwLock::new(acl), path: acl_path }))
-        };
-        Ok(TelegramConnector::build(id.as_str(), token, acl_state, debounce, max_wait, workspace))
-    }
-}
-
-/// Convenience factory handle for registration.
-pub fn factory() -> Arc<dyn ConnectorFactory> {
-    Arc::new(TelegramConnectorFactory)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use octo_core::{Blob, Connector, ConnectorFactory, FactoryContext};
 
     /// A Telegram `Message` from its wire JSON, so the media classifiers can be
     /// tested against what the API actually sends.
@@ -1263,7 +296,12 @@ mod tests {
         assert_eq!(media.duration_secs, 95);
         assert!(!media.is_note);
         assert_eq!(
-            media.thumbnail.expect("Telegram sent a poster frame").file.id.0,
+            media
+                .thumbnail
+                .expect("Telegram sent a poster frame")
+                .file
+                .id
+                .0,
             "THUMB"
         );
     }
@@ -1383,7 +421,9 @@ mod tests {
             .create(
                 ConnectorId::new("telegram"),
                 &value,
-                FactoryContext { base_dir: std::path::Path::new(".") },
+                FactoryContext {
+                    base_dir: std::path::Path::new("."),
+                },
             )
             .expect("factory builds the connector");
         assert_eq!(conn.id().as_str(), "telegram");
@@ -1401,7 +441,9 @@ mod tests {
         let result = TelegramConnectorFactory.create(
             ConnectorId::new("telegram"),
             &value,
-            FactoryContext { base_dir: std::path::Path::new(".") },
+            FactoryContext {
+                base_dir: std::path::Path::new("."),
+            },
         );
         // `dyn Connector` isn't `Debug`, so match instead of `unwrap_err`.
         let err = match result {
@@ -1414,11 +456,15 @@ mod tests {
     #[test]
     fn caption_with_saved_folds_the_path_and_preserves_the_caption() {
         // No saved path (write failed): the caption passes through untouched.
-        assert_eq!(caption_with_saved(Some("hi".into()), None), Some("hi".into()));
+        assert_eq!(
+            caption_with_saved(Some("hi".into()), None),
+            Some("hi".into())
+        );
         assert_eq!(caption_with_saved(None, None), None);
 
         // A caption present: the saved-path note is appended, not replaced.
-        let both = caption_with_saved(Some("what is this?".into()), Some("inbox/1-photo.jpg")).unwrap();
+        let both =
+            caption_with_saved(Some("what is this?".into()), Some("inbox/1-photo.jpg")).unwrap();
         assert!(both.starts_with("what is this?"));
         assert!(both.contains("inbox/1-photo.jpg"));
 
@@ -1452,15 +498,24 @@ mod tests {
                  "from":{"id":9,"is_bot":false,"first_name":"T"},
                  "photo":[{"file_id":"P","file_unique_id":"u","file_size":1,"width":1,"height":1}]}"#,
         );
-        assert_eq!(reply_context(&to_photo).as_deref(), Some("[replying to a photo]"));
+        assert_eq!(
+            reply_context(&to_photo).as_deref(),
+            Some("[replying to a photo]")
+        );
     }
 
     #[test]
     fn with_reply_folds_context_onto_the_body() {
         let r = Some("[replying to \"x\"]".to_string());
-        assert_eq!(with_reply(&r, Some("hi".into())).unwrap(), "[replying to \"x\"]\nhi");
+        assert_eq!(
+            with_reply(&r, Some("hi".into())).unwrap(),
+            "[replying to \"x\"]\nhi"
+        );
         // An empty body leaves the context standing alone (a bare reply, e.g. a sticker).
-        assert_eq!(with_reply(&r, Some("  ".into())).unwrap(), "[replying to \"x\"]");
+        assert_eq!(
+            with_reply(&r, Some("  ".into())).unwrap(),
+            "[replying to \"x\"]"
+        );
         assert_eq!(with_reply(&r, None).unwrap(), "[replying to \"x\"]");
         // No reply → the body passes through untouched.
         assert_eq!(with_reply(&None, Some("hi".into())), Some("hi".into()));

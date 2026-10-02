@@ -4,19 +4,20 @@
 
 mod mock_http;
 
-use std::path::Path;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::{
+    path::Path,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use async_trait::async_trait;
+use mock_http::{MockServer, Route};
 use octo_connector_http::{HttpConnector, HttpSpec};
 use octo_core::{
     Connector, ConnectorCapabilities, ConnectorContext, ConnectorId, Envelope, EventKind, Octo,
-    OctoResult,
+    OctoResult, control::RESTART_PROCESS,
 };
-use serde_json::{json, Value};
-
-use mock_http::{MockServer, Route};
+use serde_json::{Value, json};
 
 const MANIFEST: &str = r#"
 [connector]
@@ -64,7 +65,12 @@ impl Connector for Agent {
         {
             *self.out.lock().unwrap() = resp.payload_as::<Value>().cloned();
         }
-        ctx.shutdown.cancel();
+        ctx.publish(Envelope::new(
+            self.id.clone(),
+            EventKind::from_static(RESTART_PROCESS),
+            String::new(),
+        ))
+        .await?;
         Ok(())
     }
 }
@@ -72,7 +78,10 @@ impl Connector for Agent {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn templated_body_reaches_server_transformed() {
     // The mock echoes the request body it received back as the response.
-    let server = MockServer::start(vec![Route::new("POST", "/notify", 200, |body| body.to_string())]).await;
+    let server = MockServer::start(vec![Route::new("POST", "/notify", 200, |body| {
+        body.to_string()
+    })])
+    .await;
 
     let mut spec = HttpSpec::from_toml_str(MANIFEST, Path::new(".")).unwrap();
     spec.base_url = server.base_url();
@@ -89,7 +98,10 @@ async fn templated_body_reaches_server_transformed() {
         }))
         .build();
 
-    octo.run().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(15), octo.run())
+        .await
+        .expect("runtime must stop")
+        .unwrap();
 
     let echoed = out.lock().unwrap().clone().expect("got a response body");
     // The server received the *templated* shape, not the raw {text, channel}.

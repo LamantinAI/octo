@@ -25,16 +25,17 @@ use std::{
 };
 
 use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use chrono::Utc;
 use octo_core::{
     Connector, ConnectorCapabilities, ConnectorContext, ConnectorId, Envelope, EventKind, Filter,
     OctoResult, SubscribeOptions,
+    control::{CANCEL, CANCEL_SCOPE_TAG, ScopedTasks},
 };
 use octo_openai_auth::{Subscription, SubscriptionAuth};
 use octo_workspace::{read_in_root, workspace_root, write_in_root};
 use reqwest::{Client as HttpClient, StatusCode};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -57,7 +58,7 @@ pub(crate) const BACKGROUNDS: [&str; 3] = ["transparent", "opaque", "auto"];
 
 mod manifest;
 
-pub use crate::manifest::{factory, Defaults};
+pub use crate::manifest::{Defaults, factory};
 
 const CATALOG: &str = "Draw or edit an image with gpt-image-2 on the ChatGPT subscription. Dispatch to this connector's id:
 - imagegen.run { prompt, size?, quality?, background?, images? } -> { path }
@@ -100,7 +101,13 @@ impl ImagegenConnector {
         let capabilities = ConnectorCapabilities::bidirectional()
             .with_accept_kinds([EventKind::from_static(RUN)])
             .with_description(CATALOG);
-        Arc::new(Self { id: ConnectorId::new(id), capabilities, auth, workspace, defaults })
+        Arc::new(Self {
+            id: ConnectorId::new(id),
+            capabilities,
+            auth,
+            workspace,
+            defaults,
+        })
     }
 
     async fn handle(&self, env: &Envelope, ctx: &ConnectorContext) {
@@ -108,9 +115,16 @@ impl ImagegenConnector {
             return;
         }
         let params = env.payload_as::<Value>().cloned().unwrap_or(Value::Null);
-        let payload = self.run(&params).await.unwrap_or_else(|e| json!({ "error": e }));
-        let resp = Envelope::new(self.id.clone(), EventKind::new(format!("{RUN}.result")), payload)
-            .with_correlation(env.id);
+        let payload = self
+            .run(&params)
+            .await
+            .unwrap_or_else(|e| json!({ "error": e }));
+        let resp = Envelope::new(
+            self.id.clone(),
+            EventKind::new(format!("{RUN}.result")),
+            payload,
+        )
+        .with_correlation(env.id);
         if let Err(e) = ctx.publish(resp).await {
             warn!(error = %e, "imagegen: failed to publish result");
         }
@@ -135,7 +149,10 @@ impl ImagegenConnector {
         }
         .map_err(|e| e.to_string())?;
 
-        let rel = format!("image-{}.png", Utc::now().timestamp_nanos_opt().unwrap_or_default());
+        let rel = format!(
+            "image-{}.png",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
         write_in_root(&root, &rel, &png).map_err(|e| e.to_string())?;
         info!(path = %rel, bytes = png.len(), "imagegen: wrote image");
         Ok(json!({ "path": rel, "bytes": png.len() }))
@@ -153,19 +170,48 @@ impl Connector for ImagegenConnector {
     }
 
     async fn run(self: Arc<Self>, ctx: ConnectorContext) -> OctoResult<()> {
-        let mut cmds = ctx
-            .subscribe(Filter::by_target(self.id.clone()), SubscribeOptions::default())
+        // One ordered subscription for commands and cancellations: a cancel cannot
+        // overtake a queued command through a separate subscription.
+        let mut events = ctx
+            .subscribe(
+                Filter::by_kind(RUN).with_kind(CANCEL),
+                SubscribeOptions::default(),
+            )
             .await?;
+        let mut jobs = ScopedTasks::default();
         info!(connector = %self.id, "imagegen ready");
         loop {
             tokio::select! {
-                next = cmds.next() => match next {
-                    Some(env) => self.handle(&env, &ctx).await,
-                    None => return Ok(()),
+                next = events.next() => match next {
+                    Some(env) if env.kind.as_str() == CANCEL => {
+                        if let Some(scope) = env.payload_as::<String>() { jobs.cancel(scope); }
+                    }
+                    Some(env) if env.target.as_ref() == Some(&self.id) => {
+                        let scope = env.tags.get(CANCEL_SCOPE_TAG).cloned();
+                        let me = self.clone();
+                        let ctx = ctx.clone();
+                        jobs.spawn(scope, move |cancel| async move {
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => {
+                                    let payload = json!({"error": "operation cancelled; external outcome may be unknown", "cancelled": true});
+                                    let response = Envelope::new(me.id.clone(), EventKind::new(format!("{RUN}.result")), payload).with_correlation(env.id);
+                                    let _ = ctx.publish(response).await;
+                                }
+                                _ = me.handle(&env, &ctx) => {}
+                            }
+                        });
+                    }
+                    Some(_) => {},
+                    None => break,
                 },
-                _ = ctx.shutdown.cancelled() => return Ok(()),
+                _ = jobs.join_next(), if !jobs.is_empty() => {},
+                _ = ctx.shutdown.cancelled() => break,
             }
         }
+        jobs.cancel_all();
+        while jobs.join_next().await.is_some() {}
+        Ok(())
     }
 }
 
@@ -194,7 +240,10 @@ impl ImageRequest {
             .filter(|p| !p.is_empty())
             .ok_or("provide `prompt` (the image spec)")?
             .to_string();
-        let size = optional_str(params, "size").map(validate_size).transpose()?.or_else(|| defaults.size.clone());
+        let size = optional_str(params, "size")
+            .map(validate_size)
+            .transpose()?
+            .or_else(|| defaults.size.clone());
         let quality = optional_str(params, "quality")
             .map(|q| one_of(q, &QUALITIES, "quality"))
             .transpose()?
@@ -208,19 +257,31 @@ impl ImageRequest {
             None | Some(Value::Null) => Vec::new(),
             Some(Value::Array(items)) => items
                 .iter()
-                .map(|v| v.as_str().ok_or("`images` must be a list of workspace paths"))
+                .map(|v| {
+                    v.as_str()
+                        .ok_or("`images` must be a list of workspace paths")
+                })
                 .collect::<Result<_, _>>()?,
             Some(_) => return Err("`images` must be a list of workspace paths".into()),
         };
         if paths.len() > MAX_INPUT_IMAGES {
-            return Err(format!("at most {MAX_INPUT_IMAGES} input images, got {}", paths.len()));
+            return Err(format!(
+                "at most {MAX_INPUT_IMAGES} input images, got {}",
+                paths.len()
+            ));
         }
         let images = paths
             .iter()
             .map(|path| Ok(data_url(path, &read(path)?)))
             .collect::<Result<_, String>>()?;
 
-        Ok(Self { prompt, size, quality, background, images })
+        Ok(Self {
+            prompt,
+            size,
+            quality,
+            background,
+            images,
+        })
     }
 
     fn is_edit(&self) -> bool {
@@ -229,7 +290,11 @@ impl ImageRequest {
 
     /// The route under the Codex base: generations, or edits when there are inputs.
     fn route(&self) -> &'static str {
-        if self.is_edit() { "images/edits" } else { "images/generations" }
+        if self.is_edit() {
+            "images/edits"
+        } else {
+            "images/generations"
+        }
     }
 
     /// The JSON body, shaped like Codex's own `ImageGenerationRequest` / `ImageEditRequest`.
@@ -237,13 +302,21 @@ impl ImageRequest {
         let mut body = Map::new();
         body.insert("model".into(), json!(MODEL));
         body.insert("prompt".into(), json!(self.prompt));
-        for (key, value) in [("size", &self.size), ("quality", &self.quality), ("background", &self.background)] {
+        for (key, value) in [
+            ("size", &self.size),
+            ("quality", &self.quality),
+            ("background", &self.background),
+        ] {
             if let Some(v) = value {
                 body.insert(key.into(), json!(v));
             }
         }
         if self.is_edit() {
-            let images: Vec<Value> = self.images.iter().map(|u| json!({ "image_url": u })).collect();
+            let images: Vec<Value> = self
+                .images
+                .iter()
+                .map(|u| json!({ "image_url": u }))
+                .collect();
             body.insert("images".into(), Value::Array(images));
         }
         Value::Object(body)
@@ -297,22 +370,30 @@ async fn generate(request: &ImageRequest, sub: &Subscription) -> Result<Vec<u8>,
 
 /// Decode `data[0].b64_json` from an Images response.
 fn first_image(body: &str) -> Result<Vec<u8>, String> {
-    let parsed: Value =
-        serde_json::from_str(body).map_err(|e| format!("bad response body: {e}: {}", snippet(body)))?;
+    let parsed: Value = serde_json::from_str(body)
+        .map_err(|e| format!("bad response body: {e}: {}", snippet(body)))?;
     let b64 = parsed
         .get("data")
         .and_then(|d| d.get(0))
         .and_then(|d| d.get("b64_json"))
         .and_then(Value::as_str)
         .ok_or_else(|| format!("no image in response: {}", snippet(body)))?;
-    BASE64.decode(b64).map_err(|e| format!("bad image payload: {e}"))
+    BASE64
+        .decode(b64)
+        .map_err(|e| format!("bad image payload: {e}"))
 }
 
 /// Map the endpoint's errors to something the agent can act on.
 fn explain_http(code: u16, body: &str) -> String {
     match code {
-        400 => format!("HTTP 400 — the request was rejected (often the prompt hit the content policy, or a bad size): {}", snippet(body)),
-        403 => format!("HTTP 403 — blocked before the endpoint (Cloudflare) or not allowed on this plan: {}", snippet(body)),
+        400 => format!(
+            "HTTP 400 — the request was rejected (often the prompt hit the content policy, or a bad size): {}",
+            snippet(body)
+        ),
+        403 => format!(
+            "HTTP 403 — blocked before the endpoint (Cloudflare) or not allowed on this plan: {}",
+            snippet(body)
+        ),
         429 => "HTTP 429 — the Codex usage window is exhausted; try later.".into(),
         _ => format!("HTTP {code}: {}", snippet(body)),
     }
@@ -323,7 +404,11 @@ pub(crate) fn validate_size(size: &str) -> Result<String, String> {
     if size == "auto" {
         return Ok(size.into());
     }
-    let bad = || format!("bad size {size:?}: use \"auto\" or \"WxH\" (edges multiples of 16, ratio at most 3:1)");
+    let bad = || {
+        format!(
+            "bad size {size:?}: use \"auto\" or \"WxH\" (edges multiples of 16, ratio at most 3:1)"
+        )
+    };
     let (w, h) = size.split_once('x').ok_or_else(bad)?;
     let (w, h): (u32, u32) = (w.parse().map_err(|_| bad())?, h.parse().map_err(|_| bad())?);
     if w == 0 || h == 0 || w % 16 != 0 || h % 16 != 0 || w.max(h) > 3 * w.min(h) {
@@ -341,12 +426,20 @@ pub(crate) fn one_of(value: &str, allowed: &[&str], what: &str) -> Result<String
 }
 
 fn optional_str<'a>(params: &'a Value, key: &str) -> Option<&'a str> {
-    params.get(key).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
+    params
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
 }
 
 /// An input image as a data URL, its type guessed from the extension.
 fn data_url(path: &str, bytes: &[u8]) -> String {
-    let ext = Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
     let mime = match ext.as_str() {
         "jpg" | "jpeg" => "image/jpeg",
         "webp" => "image/webp",
@@ -363,7 +456,7 @@ fn snippet(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{first_image, validate_size, Defaults, ImageRequest};
+    use super::{Defaults, ImageRequest, first_image, validate_size};
     use serde_json::json;
 
     fn no_files(_: &str) -> Result<Vec<u8>, String> {
@@ -382,8 +475,12 @@ mod tests {
 
     #[test]
     fn a_plain_request_is_a_generation() {
-        let r = ImageRequest::from_params(&json!({ "prompt": "a fox", "quality": "low" }), &Defaults::default(), no_files)
-            .unwrap();
+        let r = ImageRequest::from_params(
+            &json!({ "prompt": "a fox", "quality": "low" }),
+            &Defaults::default(),
+            no_files,
+        )
+        .unwrap();
         assert_eq!(r.route(), "images/generations");
         let body = r.body();
         assert_eq!(body["model"], "gpt-image-2");
@@ -400,7 +497,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.route(), "images/edits");
-        let url = r.body()["images"][0]["image_url"].as_str().unwrap().to_string();
+        let url = r.body()["images"][0]["image_url"]
+            .as_str()
+            .unwrap()
+            .to_string();
         assert!(url.starts_with("data:image/jpeg;base64,"));
     }
 
@@ -408,16 +508,29 @@ mod tests {
     fn bad_params_are_refused_with_a_reason() {
         let d = Defaults::default();
         assert!(ImageRequest::from_params(&json!({}), &d, no_files).is_err());
-        assert!(ImageRequest::from_params(&json!({ "prompt": "x", "quality": "ultra" }), &d, no_files).is_err());
-        assert!(ImageRequest::from_params(&json!({ "prompt": "x", "images": "a.png" }), &d, no_files).is_err());
+        assert!(
+            ImageRequest::from_params(&json!({ "prompt": "x", "quality": "ultra" }), &d, no_files)
+                .is_err()
+        );
+        assert!(
+            ImageRequest::from_params(&json!({ "prompt": "x", "images": "a.png" }), &d, no_files)
+                .is_err()
+        );
         let six: Vec<String> = (0..6).map(|i| format!("{i}.png")).collect();
-        assert!(ImageRequest::from_params(&json!({ "prompt": "x", "images": six }), &d, |_| Ok(vec![1])).is_err());
+        assert!(
+            ImageRequest::from_params(&json!({ "prompt": "x", "images": six }), &d, |_| Ok(vec![
+                1
+            ]))
+            .is_err()
+        );
     }
-
 
     #[test]
     fn the_first_image_is_decoded() {
-        assert_eq!(first_image(r#"{"data":[{"b64_json":"AQID"}]}"#).unwrap(), vec![1, 2, 3]);
+        assert_eq!(
+            first_image(r#"{"data":[{"b64_json":"AQID"}]}"#).unwrap(),
+            vec![1, 2, 3]
+        );
         assert!(first_image(r#"{"data":[]}"#).is_err());
     }
 
@@ -433,18 +546,25 @@ mod tests {
         use octo_openai_auth::SubscriptionAuth;
         use std::path::PathBuf;
 
-        let prompt = std::env::var("IMAGEGEN_PROMPT")
-            .unwrap_or_else(|_| "A small green frog reading a book, flat vector illustration".into());
+        let prompt = std::env::var("IMAGEGEN_PROMPT").unwrap_or_else(|_| {
+            "A small green frog reading a book, flat vector illustration".into()
+        });
         let out = std::env::var("IMAGEGEN_OUT").unwrap_or_else(|_| "/tmp/image.png".into());
-        let auth_path = std::env::var("ALBERT_AUTH_JSON")
-            .unwrap_or_else(|_| format!("{}/.codex/auth.json", std::env::var("HOME").expect("HOME")));
+        let auth_path = std::env::var("ALBERT_AUTH_JSON").unwrap_or_else(|_| {
+            format!("{}/.codex/auth.json", std::env::var("HOME").expect("HOME"))
+        });
 
         let auth = SubscriptionAuth::new(PathBuf::from(auth_path));
         let sub = auth.fresh().await.expect("a fresh subscription token");
-        let request =
-            ImageRequest::from_params(&json!({ "prompt": prompt, "quality": "low" }), &Defaults::default(), no_files)
-                .unwrap();
-        let png = generate(&request, &sub).await.expect("the endpoint draws the image");
+        let request = ImageRequest::from_params(
+            &json!({ "prompt": prompt, "quality": "low" }),
+            &Defaults::default(),
+            no_files,
+        )
+        .unwrap();
+        let png = generate(&request, &sub)
+            .await
+            .expect("the endpoint draws the image");
         std::fs::write(&out, &png).expect("write the png");
         println!("\n=== DREW {} bytes -> {out} ===", png.len());
         assert_eq!(&png[1..4], b"PNG");

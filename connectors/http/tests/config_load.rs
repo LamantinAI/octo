@@ -7,22 +7,23 @@
 //!   dyn connector → HTTP → bus.
 //! - `loads_real_config_manifest` — the *shipped* `config/octo.toml` parses and
 //!   wires the petstore connector (no network).
-//! - error cases: unknown `type` (no factory), duplicate `id`.
+//! - graceful degradation: unknown `type` (no factory), duplicate `id`.
 
 mod mock_http;
 
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use async_trait::async_trait;
+use mock_http::{MockServer, Route};
 use octo_connector_http::HttpConnectorFactory;
 use octo_core::{
-    ConfigError, Connector, ConnectorCapabilities, ConnectorContext, ConnectorId, Envelope,
-    EventKind, Filter, Octo, OctoResult, SubscribeOptions, TrailActor,
+    Connector, ConnectorCapabilities, ConnectorContext, ConnectorId, Envelope, EventKind, Filter,
+    Octo, OctoResult, SubscribeOptions, TrailActor, control::RESTART_PROCESS,
 };
-use serde_json::{json, Value};
-
-use mock_http::{MockServer, Route};
+use serde_json::{Value, json};
 
 fn real_config() -> String {
     format!("{}/../../config/octo.toml", env!("CARGO_MANIFEST_DIR"))
@@ -66,7 +67,12 @@ impl Connector for Agent {
     async fn run(self: Arc<Self>, ctx: ConnectorContext) -> OctoResult<()> {
         tokio::time::sleep(Duration::from_millis(150)).await;
         let result = self.scenario(&ctx).await;
-        ctx.shutdown.cancel();
+        ctx.publish(Envelope::new(
+            self.id.clone(),
+            EventKind::from_static(RESTART_PROCESS),
+            String::new(),
+        ))
+        .await?;
         result
     }
 }
@@ -79,14 +85,23 @@ impl Agent {
 
     async fn scenario(&self, ctx: &ConnectorContext) -> OctoResult<()> {
         for (kind, payload) in [
-            ("petstore.cmd.find_pets_by_status", json!({ "status": "available" })),
-            ("petstore.cmd.add_pet", json!({ "name": "octo-cfg-pup", "photoUrls": [] })),
+            (
+                "petstore.cmd.find_pets_by_status",
+                json!({ "status": "available" }),
+            ),
+            (
+                "petstore.cmd.add_pet",
+                json!({ "name": "octo-cfg-pup", "photoUrls": [] }),
+            ),
             ("petstore.cmd.delete_pet", json!({ "id": 777 })),
         ] {
             let resp = ctx
                 .publish_and_await_response(self.cmd(kind, payload), Duration::from_secs(5))
                 .await?;
-            self.kinds.lock().unwrap().push(resp.kind.as_str().to_string());
+            self.kinds
+                .lock()
+                .unwrap()
+                .push(resp.kind.as_str().to_string());
         }
         Ok(())
     }
@@ -134,7 +149,10 @@ async fn config_driven_round_trip() {
     assert!(octo.connector_ids().contains(&"petstore"));
     assert_eq!(octo.connector_count(), 2);
 
-    octo.run().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(15), octo.run())
+        .await
+        .expect("runtime must stop")
+        .unwrap();
 
     assert_eq!(
         *kinds.lock().unwrap(),
@@ -163,17 +181,14 @@ fn loads_real_config_manifest() {
 // ─── Test 3: unknown type without a registered factory ──────────────────────
 
 #[test]
-fn unknown_type_without_factory_errors() {
+fn unknown_type_without_factory_is_skipped() {
     // No `register_connector_type("http", …)` — the petstore manifest's
     // `type = "http"` cannot be resolved.
-    let err = match Octo::builder().from_config_file(real_config()) {
-        Err(e) => e,
-        Ok(_) => panic!("expected error without an http factory"),
-    };
-    assert!(
-        matches!(err, ConfigError::UnknownConnectorType { ref type_name, .. } if type_name == "http"),
-        "got: {err:?}"
-    );
+    let octo = Octo::builder()
+        .from_config_file(real_config())
+        .expect("an unavailable connector degrades without stopping the runtime")
+        .build();
+    assert!(octo.connector_ids().is_empty());
 }
 
 // ─── Test 4: duplicate connector id across code + config ────────────────────
@@ -221,7 +236,12 @@ impl Connector for Emitter {
         .await?;
         // Give the router time to process and emit before shutdown.
         tokio::time::sleep(Duration::from_millis(150)).await;
-        ctx.shutdown.cancel();
+        ctx.publish(Envelope::new(
+            self.id.clone(),
+            EventKind::from_static(RESTART_PROCESS),
+            String::new(),
+        ))
+        .await?;
         Ok(())
     }
 }
@@ -242,12 +262,18 @@ async fn router_loaded_from_toml_routes_envelope() {
 
     let alerter = ConnectorId::new("alerter");
     let mut sub = octo
-        .subscribe(Filter::by_target(alerter.clone()), SubscribeOptions::default())
+        .subscribe(
+            Filter::by_target(alerter.clone()),
+            SubscribeOptions::default(),
+        )
         .await
         .unwrap();
     let received = tokio::spawn(async move { sub.next().await });
 
-    octo.run().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(15), octo.run())
+        .await
+        .expect("runtime must stop")
+        .unwrap();
 
     let env = received
         .await
@@ -255,7 +281,11 @@ async fn router_loaded_from_toml_routes_envelope() {
         .expect("config-loaded route should deliver to the alerter");
     assert_eq!(env.kind.as_str(), "alert.text", "override_kind applied");
     assert_eq!(env.target.as_ref(), Some(&alerter));
-    assert_eq!(env.payload_as::<i32>(), Some(&7), "copy_payload carried the original");
+    assert_eq!(
+        env.payload_as::<i32>(),
+        Some(&7),
+        "copy_payload carried the original"
+    );
     assert!(
         env.trail.iter().any(|t| matches!(
             &t.actor,
@@ -266,22 +296,18 @@ async fn router_loaded_from_toml_routes_envelope() {
 }
 
 #[test]
-fn duplicate_id_errors() {
+fn duplicate_config_id_preserves_the_registered_connector() {
     let dummy = Arc::new(Dummy {
         id: ConnectorId::new("petstore"), // collides with the config connector
         capabilities: ConnectorCapabilities::output_only(),
     });
 
-    let err = match Octo::builder()
+    let octo = Octo::builder()
         .register_connector_type("http", no_proxy_factory())
         .add_connector(dummy)
         .from_config_file(real_config())
-    {
-        Err(e) => e,
-        Ok(_) => panic!("expected duplicate-id error"),
-    };
-    assert!(
-        matches!(err, ConfigError::DuplicateConnectorId(ref id) if id.as_str() == "petstore"),
-        "got: {err:?}"
-    );
+        .expect("a duplicate manifest must be skipped")
+        .build();
+    assert_eq!(octo.connector_ids(), ["petstore"]);
+    assert_eq!(octo.connector_count(), 1);
 }

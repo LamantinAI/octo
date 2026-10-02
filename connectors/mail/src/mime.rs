@@ -4,7 +4,7 @@
 //! for calendar invites (title / time / organizer).
 
 use mail_parser::{Address, MessageParser, MimeHeaders};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Parse `source` and shape it: headers, the best text body (plain, else html),
 /// truncation flag, attachment list, and any calendar events found.
@@ -118,7 +118,9 @@ fn extract_calendar(msg: &mail_parser::Message) -> Vec<Value> {
             .content_type()
             .map(|ct| {
                 ct.ctype().eq_ignore_ascii_case("text")
-                    && ct.subtype().is_some_and(|s| s.eq_ignore_ascii_case("calendar"))
+                    && ct
+                        .subtype()
+                        .is_some_and(|s| s.eq_ignore_ascii_case("calendar"))
             })
             .unwrap_or(false);
         // Also catch .ics attachments by name.
@@ -128,9 +130,10 @@ fn extract_calendar(msg: &mail_parser::Message) -> Vec<Value> {
         if !(is_cal || is_ics) {
             continue;
         }
-        if let Some(text) = part.text_contents().or_else(|| {
-            std::str::from_utf8(part.contents()).ok()
-        }) {
+        if let Some(text) = part
+            .text_contents()
+            .or_else(|| std::str::from_utf8(part.contents()).ok())
+        {
             if let Some(ev) = parse_vevent(text) {
                 events.push(ev);
             }
@@ -154,7 +157,10 @@ fn parse_vevent(ics: &str) -> Option<Value> {
             unfolded.push(line.to_string());
         }
     }
-    if !unfolded.iter().any(|l| l.eq_ignore_ascii_case("BEGIN:VEVENT")) {
+    if !unfolded
+        .iter()
+        .any(|l| l.eq_ignore_ascii_case("BEGIN:VEVENT"))
+    {
         return None;
     }
     let prop = |name: &str| -> Option<String> {

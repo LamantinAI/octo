@@ -2,13 +2,17 @@
 //! the original's Reply-To/From, threaded with In-Reply-To/References). Implicit
 //! TLS on 465 via `lettre`'s tokio-rustls transport.
 
-use lettre::message::{header, Mailbox, Message as Email};
-use lettre::transport::smtp::authentication::Credentials;
-use lettre::{AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
-use serde_json::{json, Value};
+use lettre::{
+    AsyncSmtpTransport, AsyncTransport, Tokio1Executor,
+    message::{Mailbox, Message as Email, header},
+    transport::smtp::authentication::Credentials,
+};
+use serde_json::{Value, json};
 
-use crate::config::MailConfig;
-use crate::error::{MailError, Result};
+use crate::{
+    config::MailConfig,
+    error::{MailError, Result},
+};
 
 /// Build the async SMTP transport (implicit TLS, authenticated).
 fn transport(cfg: &MailConfig) -> Result<AsyncSmtpTransport<Tokio1Executor>> {
@@ -50,10 +54,18 @@ pub(crate) async fn reply(cfg: &MailConfig, params: &Value) -> Result<Value> {
     };
 
     let mut builder = base_builder(cfg, &to)?.subject(subject);
-    if let Some(mid) = params.get("in_reply_to").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+    if let Some(mid) = params
+        .get("in_reply_to")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
         builder = builder.in_reply_to(mid.to_string());
     }
-    if let Some(refs) = params.get("references").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+    if let Some(refs) = params
+        .get("references")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
         builder = builder.references(refs.to_string());
     }
     let email = builder

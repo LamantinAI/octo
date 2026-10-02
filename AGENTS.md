@@ -90,6 +90,17 @@ Split a flat file into `mod.rs`-with-submodules when it passes ~500 lines or mor
 than a few cohesive concerns accumulate. Shared cross-submodule types live in the
 parent `mod.rs`.
 
+## Test Layout
+
+- Unit tests belong in inline `#[cfg(test)] mod tests` blocks in the owning `mod.rs`
+  or crate `lib.rs`. Do not add standalone `src/**/tests.rs` files.
+- Keep implementation helpers in cohesive sibling files when a module grows; keep
+  the facade and its tests together and respect the 600-line hard limit.
+- Tests exercising only the public API across components belong in the crate's
+  `tests/` directory. Shared integration fixtures may live in `tests/common/mod.rs`.
+- Async integration scenarios must have a bounded wait. A connector's local shutdown
+  token stops that connector; use the runtime control contract to stop the runtime.
+
 ## Import Rule (strict)
 
 - **Import the final entity, in full, by name** — structs, enums, functions,

@@ -51,9 +51,7 @@
 
 mod ddg;
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use octo_core::{
@@ -61,7 +59,7 @@ use octo_core::{
     EventKind, FactoryContext, Filter, OctoResult, SubscribeOptions,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub use ddg::DdgBackend;
 
@@ -69,7 +67,12 @@ const SEARCH: &str = "search.web";
 
 /// The catalog the model reads. Built per instance so it names the engines this
 /// deployment actually has (and which one answers when `engine` is omitted).
-fn catalog(engines: &BTreeMap<String, Arc<dyn SearchBackend>>, default_engine: &str, default_limit: usize, max_limit: usize) -> String {
+fn catalog(
+    engines: &BTreeMap<String, Arc<dyn SearchBackend>>,
+    default_engine: &str,
+    default_limit: usize,
+    max_limit: usize,
+) -> String {
     let names: Vec<&str> = engines.keys().map(String::as_str).collect();
     format!(
         "Web search — find pages/URLs for a question. Dispatch a command envelope to this \
@@ -157,7 +160,10 @@ impl Connector for SearchConnector {
 
     async fn run(self: Arc<Self>, ctx: ConnectorContext) -> OctoResult<()> {
         let mut cmds = ctx
-            .subscribe(Filter::by_target(self.id.clone()), SubscribeOptions::default())
+            .subscribe(
+                Filter::by_target(self.id.clone()),
+                SubscribeOptions::default(),
+            )
             .await?;
         // Log the linked libcurl: a vendored build (see ddg's build trap) shows up
         // here as an unexpected version, instead of as a puzzling 202 later.
@@ -198,23 +204,34 @@ impl SearchConnector {
         let payload = env.payload_as::<Value>().cloned().unwrap_or(Value::Null);
         let outcome = self.run_search(payload).await;
         let payload = outcome.unwrap_or_else(|e| json!({ "error": e }));
-        let resp = Envelope::new(self.id.clone(), EventKind::new(format!("{SEARCH}.result")), payload)
-            .with_correlation(env.id);
+        let resp = Envelope::new(
+            self.id.clone(),
+            EventKind::new(format!("{SEARCH}.result")),
+            payload,
+        )
+        .with_correlation(env.id);
         if let Err(e) = ctx.publish(resp).await {
             tracing::warn!(error = %e, "search failed to publish result");
         }
     }
 
     async fn run_search(&self, payload: Value) -> Result<Value, String> {
-        let args: SearchArgs = serde_json::from_value(payload).map_err(|e| format!("bad args: {e}"))?;
+        let args: SearchArgs =
+            serde_json::from_value(payload).map_err(|e| format!("bad args: {e}"))?;
         let query = args.query.trim();
         if query.is_empty() {
             return Err("`query` is required".into());
         }
-        let limit = args.limit.unwrap_or(self.default_limit).clamp(1, self.max_limit);
+        let limit = args
+            .limit
+            .unwrap_or(self.default_limit)
+            .clamp(1, self.max_limit);
         let engine = args.engine.as_deref().unwrap_or(&self.default_engine);
         let backend = self.engines.get(engine).ok_or_else(|| {
-            format!("unknown engine `{engine}`; available: {}", self.engine_names())
+            format!(
+                "unknown engine `{engine}`; available: {}",
+                self.engine_names()
+            )
         })?;
         let hits = backend.search(query, limit).await?;
         tracing::info!(query, engine, count = hits.len(), "search done");
@@ -253,10 +270,22 @@ impl ConnectorFactory for SearchConnectorFactory {
             .get("connector")
             .ok_or("search: manifest has no [connector] table")?;
         let timeout = Duration::from_secs(
-            table.get("timeout_secs").and_then(|v| v.as_integer()).unwrap_or(15).max(1) as u64,
+            table
+                .get("timeout_secs")
+                .and_then(|v| v.as_integer())
+                .unwrap_or(15)
+                .max(1) as u64,
         );
-        let default_limit = table.get("default_limit").and_then(|v| v.as_integer()).unwrap_or(10).max(1) as usize;
-        let max_limit = table.get("max_limit").and_then(|v| v.as_integer()).unwrap_or(25).max(1) as usize;
+        let default_limit = table
+            .get("default_limit")
+            .and_then(|v| v.as_integer())
+            .unwrap_or(10)
+            .max(1) as usize;
+        let max_limit = table
+            .get("max_limit")
+            .and_then(|v| v.as_integer())
+            .unwrap_or(25)
+            .max(1) as usize;
 
         // Preferred form: one `[connector.engines.<name>]` table per search system,
         // each carrying its own settings. `enabled = false` keeps an engine declared
@@ -274,7 +303,10 @@ impl ConnectorFactory for SearchConnectorFactory {
             // Shorthand for a single-engine deployment: `backend = "ddg"` with its
             // settings inline on [connector].
             None => {
-                let name = table.get("backend").and_then(|v| v.as_str()).unwrap_or("ddg");
+                let name = table
+                    .get("backend")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("ddg");
                 engines.insert(name.to_string(), build_engine(name, table, timeout)?);
             }
         }
@@ -285,7 +317,11 @@ impl ConnectorFactory for SearchConnectorFactory {
         // Default engine: explicit, else the only/first one declared.
         let default_engine = match table.get("default_engine").and_then(|v| v.as_str()) {
             Some(name) => name.to_string(),
-            None => engines.keys().next().cloned().expect("non-empty checked above"),
+            None => engines
+                .keys()
+                .next()
+                .cloned()
+                .expect("non-empty checked above"),
         };
         if !engines.contains_key(&default_engine) {
             return Err(format!(
@@ -294,7 +330,13 @@ impl ConnectorFactory for SearchConnectorFactory {
             )
             .into());
         }
-        Ok(SearchConnector::new(id.as_str(), engines, default_engine, default_limit, max_limit))
+        Ok(SearchConnector::new(
+            id.as_str(),
+            engines,
+            default_engine,
+            default_limit,
+            max_limit,
+        ))
     }
 }
 
@@ -308,13 +350,15 @@ fn build_engine(
     match name {
         "ddg" => {
             // DDG's `kl` locale (region-language), e.g. "ru-ru" / "us-en"; optional.
-            let region = cfg.get("region").and_then(|v| v.as_str()).map(str::to_string);
+            let region = cfg
+                .get("region")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
             Ok(Arc::new(DdgBackend::new(timeout, region)?))
         }
-        other => Err(format!(
-            "search: unknown engine `{other}` (have: ddg; yandex planned)"
-        )
-        .into()),
+        other => {
+            Err(format!("search: unknown engine `{other}` (have: ddg; yandex planned)").into())
+        }
     }
 }
 
@@ -353,7 +397,10 @@ mod tests {
 
     #[tokio::test]
     async fn omitting_engine_uses_the_default() {
-        let out = connector("ddg").run_search(json!({ "query": "x" })).await.unwrap();
+        let out = connector("ddg")
+            .run_search(json!({ "query": "x" }))
+            .await
+            .unwrap();
         assert_eq!(out["engine"], "ddg");
     }
 
