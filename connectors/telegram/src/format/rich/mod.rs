@@ -12,6 +12,9 @@
 //!   worse than showing an angle bracket, so every raw-HTML run the parser reports
 //!   is escaped back to literal text. That keeps the pre-10.1 contract: markup the
 //!   model emits is content, not instructions to the renderer.
+//! - **Media blocks are the exception.** Telegram's `<tg-collage>` /
+//!   `<tg-slideshow>` with `<img src>` items stay live — see [`media`] for the
+//!   exact subset — so a reply can show several pictures side by side.
 //! - **The ceiling moved** from 4096 UTF-16 units to 32768 characters, with a
 //!   500-block structural limit beside it. Splitting therefore happens on
 //!   top-level block boundaries — cutting a table or a `<details>` in half would
@@ -26,6 +29,12 @@
 use std::{mem::take, ops::Range};
 
 use pulldown_cmark::{Event, Options, Parser};
+
+use self::media::is_media_html;
+
+mod media;
+
+pub(crate) use self::media::{has_media, media_as_links};
 
 /// The rich-message ceiling is 32768 characters. Gate on bytes — never fewer
 /// than characters, whichever way the API counts — and leave margin.
@@ -43,7 +52,8 @@ fn options() -> Options {
 }
 
 /// Escape the raw HTML the model emitted so Telegram shows it as text instead of
-/// parsing it — or, for a tag it doesn't support, swallowing it whole.
+/// parsing it — or, for a tag it doesn't support, swallowing it whole. Media-block
+/// HTML (a collage or slideshow of http(s) images) is the one kind left live.
 pub fn sanitize_rich(md: &str) -> String {
     let mut spans: Vec<Range<usize>> = Vec::new();
     for (ev, range) in Parser::new_ext(md, options()).into_offset_iter() {
@@ -63,7 +73,7 @@ pub fn sanitize_rich(md: &str) -> String {
     let mut out = String::with_capacity(md.len() + spans.len() * 8);
     let mut cut = 0;
     for span in spans {
-        if span.start < cut {
+        if span.start < cut || is_media_html(&md[span.start..span.end]) {
             continue;
         }
         out.push_str(&md[cut..span.start]);
@@ -208,6 +218,23 @@ mod tests {
             sanitize_rich("<details><summary>s</summary>body</details>"),
             "&lt;details&gt;&lt;summary&gt;s&lt;/summary&gt;body&lt;/details&gt;"
         );
+    }
+
+    #[test]
+    fn media_html_stays_live_and_the_rest_is_escaped() {
+        let collage = "<tg-collage><img src=\"https://a.org/1.jpg\"/><img src=\"https://a.org/2.jpg\"/><figcaption>Two</figcaption></tg-collage>";
+        assert_eq!(sanitize_rich(collage), collage);
+        let block = "<tg-slideshow>\n<img src=\"https://a.org/1.jpg\"/>\n</tg-slideshow>";
+        assert_eq!(sanitize_rich(block), block);
+        assert_eq!(
+            sanitize_rich(
+                "<tg-collage><img src=\"https://a.org/1.jpg\" onload=\"x\"/></tg-collage>"
+            ),
+            // One bad tag in a run escapes the whole run — never half a collage.
+            "&lt;tg-collage&gt;&lt;img src=\"https://a.org/1.jpg\" onload=\"x\"/&gt;&lt;/tg-collage&gt;"
+        );
+        let image = "Text.\n\n![](https://a.org/1.jpg \"Caption\")\n\nMore.";
+        assert_eq!(sanitize_rich(image), image);
     }
 
     #[test]

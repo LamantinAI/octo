@@ -18,4 +18,4 @@ mod html;
 mod rich;
 
 pub(crate) use html::{esc, split_for_telegram, strip_tags, to_telegram_html};
-pub(crate) use rich::{sanitize_rich, split_rich};
+pub(crate) use rich::{has_media, media_as_links, sanitize_rich, split_rich};

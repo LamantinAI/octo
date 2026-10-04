@@ -13,7 +13,10 @@ use teloxide::{
 
 use crate::{
     api::{is_unsupported, send_rich_markdown},
-    format::{sanitize_rich, split_for_telegram, split_rich, strip_tags, to_telegram_html},
+    format::{
+        has_media, media_as_links, sanitize_rich, split_for_telegram, split_rich, strip_tags,
+        to_telegram_html,
+    },
     fs::{load_outgoing, workspace_root},
 };
 
@@ -69,9 +72,28 @@ pub(super) async fn send_reply(bot: &Bot, chat: ChatId, text: &str, rich_message
                 if is_unsupported(&e) {
                     tracing::warn!(error = %e, "telegram: server has no rich messages; using the HTML renderer from here on");
                     *rich_messages = false;
-                } else {
-                    tracing::warn!(error = %e, "telegram rich send failed; falling back to HTML");
+                    send_html(bot, chat, &chunk).await;
+                    continue;
                 }
+                // Telegram fetches every media URL itself, and one it can't fetch
+                // fails the whole message. Try once more with the media as links,
+                // so the text still arrives rich and the pictures stay one tap away.
+                if has_media(&chunk) {
+                    tracing::warn!(error = %e, "telegram rich send with media failed; retrying with the media as links");
+                    let linked = media_as_links(&chunk);
+                    match send_rich_markdown(bot, chat, &sanitize_rich(&linked)).await {
+                        Ok(()) => {
+                            tracing::info!(%chat, "sent reply (rich, media as links)");
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "telegram rich send failed; falling back to HTML")
+                        }
+                    }
+                    send_html(bot, chat, &linked).await;
+                    continue;
+                }
+                tracing::warn!(error = %e, "telegram rich send failed; falling back to HTML");
                 send_html(bot, chat, &chunk).await;
             }
         }
