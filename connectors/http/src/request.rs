@@ -1,12 +1,16 @@
 use std::{sync::Arc, time::Duration};
 
 use octo_core::{ConnectorContext, Envelope, EventKind, TrailAction, TrailActor, TrailEntry};
+use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use serde_json::Value;
 
 use super::{
     EndpointSpec, HttpConnector, HttpError, envelope_field, json_escape_inner, navigate,
     render_json, urlencode,
 };
+
+/// The `User-Agent` sent when the manifest declares none.
+const DEFAULT_USER_AGENT: &str = concat!("octo-connector-http/", env!("CARGO_PKG_VERSION"));
 
 impl HttpConnector {
     pub(super) async fn handle(self: Arc<Self>, envelope: Arc<Envelope>, ctx: &ConnectorContext) {
@@ -232,7 +236,10 @@ impl HttpConnector {
         query: &[(String, String)],
         body: Option<&str>,
     ) -> Result<reqwest::Response, reqwest::Error> {
-        let mut req = self.client.request(endpoint.method.as_reqwest(), url);
+        let mut req = self
+            .client
+            .request(endpoint.method.as_reqwest(), url)
+            .headers(self.static_headers());
 
         if !query.is_empty() {
             req = req.query(query);
@@ -252,6 +259,18 @@ impl HttpConnector {
         }
 
         req.send().await
+    }
+
+    /// Headers every request carries: a default `User-Agent` naming this
+    /// connector (some APIs refuse a request without one — reqwest sends none),
+    /// then the manifest's `[connector.headers]`, which override it.
+    pub(super) fn static_headers(&self) -> HeaderMap {
+        let mut headers = HeaderMap::with_capacity(self.spec.headers.len() + 1);
+        headers.insert(USER_AGENT, HeaderValue::from_static(DEFAULT_USER_AGENT));
+        for (name, value) in &self.spec.headers {
+            headers.insert(name.clone(), value.clone());
+        }
+        headers
     }
 
     pub(super) fn should_retry(&self, status: u16) -> bool {
