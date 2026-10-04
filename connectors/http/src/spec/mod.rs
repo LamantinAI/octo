@@ -13,6 +13,7 @@ use std::{
 };
 
 use octo_core::EventKind;
+use reqwest::header::HeaderMap;
 mod parse;
 use self::parse::RawConfig;
 use crate::jsonpath::JsonPath;
@@ -52,6 +53,9 @@ pub enum SpecError {
         #[source]
         source: crate::jsonpath::ParseError,
     },
+
+    #[error("header '{name}': not a valid HTTP header name or value")]
+    BadHeader { name: String },
 
     #[error("reading model '{path}': {source}")]
     ModelIo {
@@ -177,6 +181,10 @@ pub struct HttpSpec {
     pub auth: Option<AuthSpec>,
     pub retry: Option<RetrySpec>,
     pub timeout_ms: Option<u64>,
+    /// Static headers sent on every request (`[connector.headers]`), e.g. an API
+    /// that refuses a request without a descriptive `User-Agent`. They override
+    /// the connector's default `User-Agent`; the auth header is set after them.
+    pub headers: HeaderMap,
     pub endpoints: Vec<EndpointSpec>,
     pub listeners: Vec<ListenerSpec>,
     pub secrets: HashMap<String, SecretSource>,
@@ -426,5 +434,20 @@ response_kind = "x.event.went"
             vec!["x".to_string(), "y".to_string()]
         );
         assert!(path_placeholders("/no/params").is_empty());
+    }
+
+    #[test]
+    fn a_bad_header_is_a_load_error() {
+        let toml = r#"
+[connector]
+id = "x"
+type = "http"
+base_url = "https://example.org"
+
+[connector.headers]
+"Bad Header" = "v"
+"#;
+        let err = HttpSpec::from_toml_str(toml, Path::new(".")).unwrap_err();
+        assert!(matches!(err, SpecError::BadHeader { ref name } if name == "Bad Header"));
     }
 }

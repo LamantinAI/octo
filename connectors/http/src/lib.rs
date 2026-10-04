@@ -19,6 +19,9 @@
 //! - Path/query parameters extracted from the command payload via a JSONPath
 //!   subset ([`jsonpath`]).
 //! - Header-based auth, per-request timeout, status-based retry.
+//! - Static headers on every request (`[connector.headers]`), over a default
+//!   `User-Agent: octo-connector-http/<version>` — reqwest sends none, and some
+//!   APIs (Wikimedia's among them) refuse a request without one.
 //!
 //! Inbound `[[connector.listener]]` webhooks are *parsed and validated* but not
 //! yet served (Petstore sends none) — see `petstore_case.md`.
@@ -427,5 +430,42 @@ response_kind = "notify.event.sent"
         let c = notifier();
         let out = c.render_template("${bogus.x}", &json!({}), &env(json!({})));
         assert_eq!(out, "${bogus.x}");
+    }
+    #[test]
+    fn requests_carry_a_default_user_agent() {
+        let headers = notifier().static_headers();
+        let ua = headers
+            .get("user-agent")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(ua.starts_with("octo-connector-http/"), "got {ua:?}");
+    }
+
+    #[test]
+    fn manifest_headers_override_the_default_and_add_their_own() {
+        let toml = r#"
+[connector]
+id = "wiki"
+type = "http"
+base_url = "https://example.org"
+
+[connector.headers]
+User-Agent = "ExampleBot/1.0 (https://example.org/bot)"
+Accept-Language = "en"
+
+[[connector.endpoint]]
+cmd_kind = "wiki.cmd.search"
+method = "GET"
+path = "/search"
+response_kind = "wiki.event.search"
+"#;
+        let c = HttpConnector::from_spec(HttpSpec::from_toml_str(toml, Path::new(".")).unwrap());
+        let headers = c.static_headers();
+        assert_eq!(headers.get_all("user-agent").iter().count(), 1);
+        assert_eq!(
+            headers["user-agent"],
+            "ExampleBot/1.0 (https://example.org/bot)"
+        );
+        assert_eq!(headers["accept-language"], "en");
     }
 }

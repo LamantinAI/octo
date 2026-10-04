@@ -1,6 +1,7 @@
 use std::{collections::HashMap, path::Path};
 
 use octo_core::EventKind;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 
 use super::{
@@ -29,6 +30,8 @@ pub(super) struct RawConnector {
     listener: Vec<RawListener>,
     #[serde(default)]
     secrets: HashMap<String, RawSecret>,
+    #[serde(default)]
+    headers: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -112,6 +115,17 @@ impl RawConnector {
             .map(|(k, v)| (k, SecretSource::Env(v.env)))
             .collect();
 
+        let mut headers = HeaderMap::with_capacity(self.headers.len());
+        for (name, value) in self.headers {
+            let parsed = HeaderName::from_bytes(name.as_bytes())
+                .ok()
+                .zip(HeaderValue::from_str(&resolve_env_templates(&value)).ok());
+            let Some((header, value)) = parsed else {
+                return Err(SpecError::BadHeader { name });
+            };
+            headers.insert(header, value);
+        }
+
         let mut endpoints = Vec::with_capacity(self.endpoint.len());
         for ep in self.endpoint {
             endpoints.push(build_endpoint(ep)?);
@@ -137,6 +151,7 @@ impl RawConnector {
             auth,
             retry,
             timeout_ms: self.timeout.map(|t| t.request_ms),
+            headers,
             endpoints,
             listeners,
             secrets,
