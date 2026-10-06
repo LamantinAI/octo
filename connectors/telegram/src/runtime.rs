@@ -21,11 +21,12 @@ use super::{
     ALLOW_CHAT, FLUSH_TICK, GROUP_MODE, LIST_CHATS, REMOVE_CHAT, SEND_FILE, STATUS, TYPING,
     TelegramConnector,
     control::{handle_control, migrate, outgoing_allowed, owner_chats, register_add},
+    delivery::handle_file,
     inbound::{
         caption_with_saved, coalesce_key, download_bytes, hms, image_document, inbox_name,
         publish_flush, reply_context, video_caption, video_media, voice_media, with_reply,
     },
-    outbound::{is_voice_blob, send_reply, send_workspace_file},
+    outbound::{is_voice_blob, send_reply},
 };
 use crate::{
     batch::{Batcher, Emit, Flush},
@@ -101,13 +102,12 @@ impl Connector for TelegramConnector {
                                 }
                                 continue;
                             }
-                            if !outgoing_allowed(&out_acl, &out_groups, &env) {
-                                tracing::warn!("telegram: outbound destination is not allowed");
+                            if env.kind.as_str() == SEND_FILE {
+                                handle_file(&out_bot, &out_workspace, &out_acl, &out_groups, &out_id, &env, &out_ctx).await;
                                 continue;
                             }
-                            // Send a file from the shared workspace (by reference).
-                            if env.kind.as_str() == SEND_FILE {
-                                send_workspace_file(&out_bot, &out_workspace, &env).await;
+                            if !outgoing_allowed(&out_acl, &out_groups, &env) {
+                                tracing::warn!("telegram: outbound destination is not allowed");
                                 continue;
                             }
                             // The chat id rides on the envelope's channel.

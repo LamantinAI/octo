@@ -23,4 +23,6 @@ toml = { workspace = true }
 pulldown-cmark = { version = "0.12", default-features = false }
 
 [dev-dependencies]
+axum.workspace = true
+tokio = { workspace = true, features = ["net"] }
 tempfile = "3"

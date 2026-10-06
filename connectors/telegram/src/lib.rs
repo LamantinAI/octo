@@ -47,6 +47,7 @@ use self::source::{CommandCatalog, GroupSettings};
 pub use acl::{Acl, AclEntry, GroupMode, Role};
 mod config;
 mod control;
+mod delivery;
 mod inbound;
 mod outbound;
 mod runtime;
@@ -83,6 +84,7 @@ const GROUP_MODE: &str = "octo.telegram.group_mode";
 /// (inline preview), everything else as a document; an optional `caption` rides along.
 /// Payload `{ path, chat?, filename? }` — chat falls back to the envelope channel.
 const SEND_FILE: &str = "chat.send_file";
+const SEND_FILE_RESULT: &str = "chat.send_file.result";
 
 /// Live-turn feedback kinds (see [`live`]): keep the "typing…" indicator alive
 /// while the cogitator thinks, and stream its tool-use trace into an in-place
@@ -110,7 +112,7 @@ const STATUS: &str = "chat.status";
 ///   them — see `catalog_is_static_and_holds_no_deployment_detail`.
 const CATALOG: &str = "A chat channel with a person — conversation, not a tool call. A reply is a \
 `chat.reply` envelope carrying the chat id on its channel; these commands are accepted too:
-- chat.send_file { path, chat?, filename?, caption? } -> send a file from the shared workspace (an image as a photo, anything else as a document)
+- chat.send_file { path, chat?, filename?, caption? } -> correlated chat.send_file.result with actual delivery status; destination is explicit chat or host-bound channel (images as photos, OGG as voice, others as documents)
 - chat.typing -> hold the \"typing…\" indicator while a turn runs
 - chat.status \"<line>\" -> append a line to the turn's progress trace, which is deleted when the reply lands
 
@@ -193,7 +195,10 @@ impl TelegramConnector {
         workspace: Option<PathBuf>,
     ) -> Arc<Self> {
         let capabilities = ConnectorCapabilities::bidirectional()
-            .with_emit_kinds([EventKind::from_static("chat.message")])
+            .with_emit_kinds([
+                EventKind::from_static("chat.message"),
+                EventKind::from_static(SEND_FILE_RESULT),
+            ])
             .with_accept_kinds([
                 EventKind::from_static("chat.reply"),
                 EventKind::from_static(SEND_FILE),

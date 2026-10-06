@@ -13,7 +13,11 @@
 //! let answer = agent.prompt(user).multi_turn(5).send().await?;
 //! ```
 
+mod file;
+pub use file::{SendFileArgs, SendFileTool};
+
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -50,6 +54,7 @@ pub struct OctoDispatchTool {
     /// it and aborts on a matching cancel. `None` → commands are not cancellable by
     /// scope. The host sets it per-turn to that turn's id.
     scope: Option<String>,
+    channels: HashMap<ConnectorId, ChannelId>,
 }
 
 impl OctoDispatchTool {
@@ -60,7 +65,15 @@ impl OctoDispatchTool {
             catalog: catalog.into(),
             timeout: DEFAULT_TIMEOUT,
             scope: None,
+            channels: HashMap::new(),
         }
+    }
+
+    /// Bind host-provided conversation context only to its own connector.
+    /// Other organs remain unchannelled unless the assembly explicitly binds them.
+    pub fn with_channel_for(mut self, target: ConnectorId, channel: ChannelId) -> Self {
+        self.channels.insert(target, channel);
+        self
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -122,6 +135,9 @@ impl Tool for OctoDispatchTool {
             args.payload,
         )
         .with_target(ConnectorId::new(args.target.clone()));
+        if let Some(channel) = self.channels.get(&ConnectorId::new(args.target.clone())) {
+            cmd = cmd.with_channel(channel.clone());
+        }
         // Stamp the turn's cancel scope so a later octo.control.cancel can reach any
         // long-running connector work this dispatch starts (e.g. a forkd script).
         if let Some(scope) = &self.scope {
@@ -135,95 +151,11 @@ impl Tool for OctoDispatchTool {
                 json!({ "kind": resp.kind.as_str(), "result": body })
             }
             // Return the error as data so the model reports it honestly.
-            Err(e) => json!({ "error": e.to_string() }),
+            Err(e) => {
+                json!({ "error": e.to_string(), "status":"unknown", "note":"The connector may have completed the action. Verify its state before retrying." })
+            }
         };
         Ok(out)
-    }
-}
-
-/// A rig tool that sends a workspace file to the user, by emitting a
-/// `chat.send_file { path, filename? }` envelope to the reply connector on a fixed
-/// channel. Unlike [`OctoDispatchTool`] this is **fire-and-forget** (no correlated
-/// response): the bytes move by reference through the shared workspace, never
-/// through the model. The host binds it per-turn with the reply target and the
-/// current channel, so the model only names a workspace-relative path.
-#[derive(Clone)]
-pub struct SendFileTool {
-    bus: Arc<InProcessBus>,
-    source: ConnectorId,
-    target: ConnectorId,
-    channel: String,
-}
-
-impl SendFileTool {
-    pub fn new(
-        bus: Arc<InProcessBus>,
-        source: ConnectorId,
-        target: ConnectorId,
-        channel: impl Into<String>,
-    ) -> Self {
-        Self {
-            bus,
-            source,
-            target,
-            channel: channel.into(),
-        }
-    }
-}
-
-/// Arguments the model fills when sending a file.
-#[derive(Debug, Deserialize)]
-pub struct SendFileArgs {
-    /// Workspace-relative path of the file to send.
-    pub path: String,
-    /// Optional display name shown to the user.
-    #[serde(default)]
-    pub filename: Option<String>,
-}
-
-impl Tool for SendFileTool {
-    const NAME: &'static str = "send_file";
-    type Error = std::convert::Infallible;
-    type Args = SendFileArgs;
-    type Output = Value;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Send a file from the workspace to the user in this chat. Give `path` \
-                          relative to the workspace (where the file tools and storage.checkout put \
-                          files); `filename` optionally overrides the shown name. The file is sent \
-                          by reference — never paste its bytes."
-                .to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "workspace-relative path to send" },
-                    "filename": { "type": "string", "description": "optional display name" }
-                },
-                "required": ["path"]
-            }),
-        }
-    }
-
-    async fn call(&self, args: SendFileArgs) -> Result<Value, Self::Error> {
-        let mut payload = json!({ "path": args.path });
-        if let Some(f) = &args.filename {
-            payload["filename"] = json!(f);
-        }
-        let env = Envelope::new(
-            self.source.clone(),
-            EventKind::from_static("chat.send_file"),
-            payload,
-        )
-        .with_target(self.target.clone())
-        .with_channel(ChannelId::new(self.channel.clone()));
-
-        tracing::info!(path = %args.path, target = %self.target, "rig tool → send_file");
-        match self.bus.publish(env).await {
-            Ok(()) => Ok(json!({ "ok": true, "sent": args.path })),
-            Err(e) => Ok(json!({ "ok": false, "error": e.to_string() })),
-        }
     }
 }
 
@@ -340,4 +272,146 @@ pub async fn carry_out_cancel(
     );
     tracing::info!(scope = %scope, "carrying out cancel");
     bus.publish(env).await.map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use octo_core::{Filter, SubscribeOptions};
+    use tokio::{spawn, time::timeout};
+
+    #[tokio::test]
+    async fn dispatch_binds_channels_only_to_their_connector_and_keeps_scope_and_payload() {
+        let bus = Arc::new(InProcessBus::new(16));
+        let target = ConnectorId::new("telegram-work");
+        let mut requests = bus
+            .subscribe(
+                Filter::by_source(ConnectorId::new("agent")),
+                SubscribeOptions::default(),
+            )
+            .await
+            .unwrap();
+        let tool = OctoDispatchTool::new(bus.clone(), ConnectorId::new("agent"), "")
+            .with_channel_for(target.clone(), ChannelId::new("-42"))
+            .with_scope("scope")
+            .with_timeout(Duration::from_secs(1));
+        let reply_bus = bus.clone();
+        let worker = spawn(async move {
+            for expected_channel in [Some("-42"), None] {
+                let req = timeout(Duration::from_secs(2), requests.next())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(req.channel.as_ref().map(|c| c.as_str()), expected_channel);
+                assert_eq!(
+                    req.tags.get(CANCEL_SCOPE_TAG).map(String::as_str),
+                    Some("scope")
+                );
+                assert_eq!(req.payload_as::<Value>().unwrap()["chat"], -77);
+                reply_bus
+                    .publish(
+                        Envelope::new(
+                            req.target.clone().unwrap(),
+                            EventKind::new("result"),
+                            json!({"ok":true}),
+                        )
+                        .with_correlation(req.id),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        for target in [target.as_str(), "robot-arm"] {
+            let response = tool
+                .call(DispatchArgs {
+                    target: target.into(),
+                    kind: "command".into(),
+                    payload: json!({"chat":-77}),
+                })
+                .await
+                .unwrap();
+            assert_eq!(response["result"]["ok"], true);
+        }
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn confirmed_file_tool_returns_the_actual_connector_result() {
+        let bus = Arc::new(InProcessBus::new(16));
+        let target = ConnectorId::new("telegram");
+        let mut requests = bus
+            .subscribe(
+                Filter::by_target(target.clone()),
+                SubscribeOptions::default(),
+            )
+            .await
+            .unwrap();
+        let worker = spawn({
+            let bus = bus.clone();
+            async move {
+                let req = timeout(Duration::from_secs(2), requests.next())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(req.channel.as_ref().unwrap().as_str(), "-42");
+                bus.publish(
+                    Envelope::new(
+                        target,
+                        EventKind::new("chat.send_file.result"),
+                        json!({"ok":false,"status":"not_sent","error":"denied"}),
+                    )
+                    .with_correlation(req.id),
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let tool = SendFileTool::new(
+            bus,
+            ConnectorId::new("agent"),
+            ConnectorId::new("telegram"),
+            "-42",
+        )
+        .with_confirmation_timeout(Duration::from_secs(1));
+        let result = tool
+            .call(SendFileArgs {
+                path: "image.png".into(),
+                filename: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["status"], "not_sent");
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_file_delivery_never_claims_it_was_sent() {
+        let bus = Arc::new(InProcessBus::new(8));
+        let tool = SendFileTool::new(
+            bus,
+            ConnectorId::new("agent"),
+            ConnectorId::new("legacy"),
+            "chat",
+        );
+        let queued = tool
+            .call(SendFileArgs {
+                path: "x".into(),
+                filename: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(queued["status"], "queued");
+        assert!(queued.get("sent").is_none());
+        let result = tool
+            .with_confirmation_timeout(Duration::from_millis(10))
+            .call(SendFileArgs {
+                path: "x".into(),
+                filename: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(result["status"], "unknown");
+        assert!(result.get("sent").is_none());
+    }
 }

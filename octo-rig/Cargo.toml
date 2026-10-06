@@ -20,3 +20,6 @@ tracing = { workspace = true }
 # Opt in the octo-code file tools (read/write/edit/list), re-exported here so a
 # rig agent gets them alongside the connector-dispatch bridge.
 code = ["dep:octo-code"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "time"] }

@@ -1,14 +1,10 @@
-use std::path::PathBuf;
-use teloxide::payloads::{
-    SendDocumentSetters, SendMessageSetters, SendPhotoSetters, SendVoiceSetters,
-};
+use teloxide::payloads::SendMessageSetters;
 
-use octo_core::{Blob, Envelope};
-use serde_json::Value;
+use octo_core::Blob;
 use teloxide::{
     Bot,
     requests::Requester,
-    types::{ChatId, InputFile, ParseMode},
+    types::{ChatId, ParseMode},
 };
 
 use crate::{
@@ -17,7 +13,6 @@ use crate::{
         has_media, media_as_links, sanitize_rich, split_for_telegram, split_rich, strip_tags,
         to_telegram_html,
     },
-    fs::{load_outgoing, workspace_root},
 };
 
 /// How an outgoing file is presented in Telegram.
@@ -120,83 +115,5 @@ pub(super) async fn send_html(bot: &Bot, chat: ChatId, text: &str) {
                 }
             }
         }
-    }
-}
-
-/// Handle `chat.send_file`: load a file from the shared workspace by its path and
-/// send it — a photo for images, a voice note for OGG/Opus audio, a document
-/// otherwise, with an optional `caption`.
-/// Chat id comes from the payload `chat`, else
-/// the envelope's channel. Bytes never pass through the model — the payload only
-/// names a path.
-pub(super) async fn send_workspace_file(bot: &Bot, workspace: &Option<PathBuf>, env: &Envelope) {
-    let params = env.payload_as::<Value>().cloned().unwrap_or(Value::Null);
-    let Some(path) = params.get("path").and_then(Value::as_str) else {
-        tracing::warn!("chat.send_file without a `path`; dropped");
-        return;
-    };
-    let chat = params.get("chat").and_then(Value::as_i64).or_else(|| {
-        env.channel
-            .as_ref()
-            .and_then(|c| c.as_str().parse::<i64>().ok())
-    });
-    let Some(chat) = chat else {
-        tracing::warn!("chat.send_file without a chat id; dropped");
-        return;
-    };
-    let root = match workspace_root(workspace) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(error = %e, "chat.send_file: workspace unavailable");
-            return;
-        }
-    };
-    let (bytes, name) = match load_outgoing(&root, path) {
-        Ok(x) => x,
-        Err(e) => {
-            tracing::warn!(error = %e, %path, "chat.send_file: cannot read workspace file");
-            return;
-        }
-    };
-    let filename = params
-        .get("filename")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or(name);
-    let caption = params
-        .get("caption")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    // An image goes as a photo (inline preview) and OGG/Opus as a voice note (the
-    // play-in-place bubble) rather than a document. Judge by extension — the workspace
-    // filename is ours, not a remote-controlled string.
-    let kind = outbound_kind(&filename);
-    let file = InputFile::memory(bytes).file_name(filename);
-    let sent = match kind {
-        Outbound::Photo => {
-            let mut req = bot.send_photo(ChatId(chat), file);
-            if let Some(c) = caption {
-                req = req.caption(c);
-            }
-            req.await.map(|_| ())
-        }
-        Outbound::Voice => {
-            let mut req = bot.send_voice(ChatId(chat), file);
-            if let Some(c) = caption {
-                req = req.caption(c);
-            }
-            req.await.map(|_| ())
-        }
-        Outbound::Document => {
-            let mut req = bot.send_document(ChatId(chat), file);
-            if let Some(c) = caption {
-                req = req.caption(c);
-            }
-            req.await.map(|_| ())
-        }
-    };
-    match sent {
-        Ok(_) => tracing::info!(chat, %path, kind = ?kind, "sent file"),
-        Err(e) => tracing::warn!(error = %e, "telegram send_file failed"),
     }
 }
