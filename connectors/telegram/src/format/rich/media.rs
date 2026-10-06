@@ -18,9 +18,6 @@ use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 /// Containers and their parts that may stay live. Lowercase, compared lowercase.
 const MEDIA_TAGS: [&str; 5] = ["tg-collage", "tg-slideshow", "img", "figcaption", "cite"];
 
-/// How an `<img>` source opens, double- or single-quoted.
-const IMG_SRC: [&str; 2] = ["src=\"", "src='"];
-
 /// Whether a run of raw HTML consists only of media-block tags — and so is safe
 /// to hand to Telegram as markup rather than escape. Text between the tags (a
 /// caption) is fine; a run with no tag at all is not media.
@@ -60,27 +57,45 @@ fn is_media_tag(inner: &str) -> bool {
     if closing || name != "img" {
         return attrs.is_empty();
     }
-    is_http_src(attrs)
+    http_src(attrs).is_some()
 }
 
 /// `src="https://…"` (or single-quoted), nothing else.
-fn is_http_src(attrs: &str) -> bool {
-    let Some(value) = attrs.strip_prefix("src") else {
-        return false;
-    };
-    let Some(value) = value.trim_start().strip_prefix('=') else {
-        return false;
-    };
-    let value = value.trim_start();
-    let Some(quote) = value.chars().next().filter(|c| *c == '"' || *c == '\'') else {
-        return false;
-    };
-    let Some(url) = value[1..].strip_suffix(quote) else {
-        return false;
-    };
-    !url.contains(quote)
+fn http_src(attrs: &str) -> Option<&str> {
+    let value = attrs
+        .strip_prefix("src")?
+        .trim_start()
+        .strip_prefix('=')?
+        .trim_start();
+    let quote = value.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+    let url = value[1..].strip_suffix(quote)?;
+    (!url.contains(quote)
         && !url.chars().any(char::is_whitespace)
-        && (url.starts_with("https://") || url.starts_with("http://"))
+        && (url.starts_with("https://") || url.starts_with("http://")))
+    .then_some(url)
+}
+
+/// Called only for validated media HTML. Preserve captions and source order.
+fn html_as_links(html: &str, out: &mut String) {
+    let mut rest = html;
+    while let Some(open) = rest.find('<') {
+        out.push_str(&rest[..open]);
+        let close = rest[open..].find('>').expect("validated media tag") + open;
+        let inner = rest[open + 1..close]
+            .trim()
+            .trim_end_matches('/')
+            .trim_end();
+        if let Some((name, attrs)) = inner.split_once(char::is_whitespace) {
+            if name.eq_ignore_ascii_case("img") {
+                if let Some(url) = http_src(attrs.trim()) {
+                    out.push_str(url);
+                    out.push('\n');
+                }
+            }
+        }
+        rest = &rest[close + 1..];
+    }
+    out.push_str(rest);
 }
 
 /// Whether the Markdown carries any media block — an image, or a live media tag.
@@ -122,16 +137,7 @@ pub(crate) fn media_as_links(md: &str) -> String {
             }
             Event::Html(h) | Event::InlineHtml(h) if is_media_html(&h) => {
                 out.push_str(&md[cut..range.start]);
-                for src in IMG_SRC {
-                    let mut rest: &str = &h;
-                    while let Some(i) = rest.find(src) {
-                        let tail = &rest[i + src.len()..];
-                        let quote = src.chars().last().unwrap_or('"');
-                        let end = tail.find(quote).unwrap_or(tail.len());
-                        out.push_str(&format!("{}\n", &tail[..end]));
-                        rest = &tail[end..];
-                    }
-                }
+                html_as_links(&h, &mut out);
                 cut = range.end;
             }
             _ => {}
@@ -139,62 +145,4 @@ pub(crate) fn media_as_links(md: &str) -> String {
     }
     out.push_str(&md[cut..]);
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn collage_tags_are_media() {
-        assert!(is_media_html(
-            "<tg-collage><img src=\"https://a.org/1.jpg\"/><img src='https://a.org/2.jpg'>"
-        ));
-        assert!(is_media_html("</figcaption></tg-collage>"));
-        assert!(is_media_html(
-            "<figcaption>Two vases<cite>Commons</cite></figcaption>"
-        ));
-        assert!(is_media_html("<tg-slideshow>"));
-    }
-
-    #[test]
-    fn anything_else_is_not() {
-        assert!(!is_media_html("<b>bold</b>"));
-        assert!(!is_media_html(
-            "<img src=\"https://a.org/1.jpg\" onerror=\"x\">"
-        ));
-        assert!(!is_media_html("<img src=\"javascript:alert(1)\">"));
-        assert!(!is_media_html("<img src=\"file:///etc/passwd\">"));
-        assert!(!is_media_html("<tg-collage class=\"x\">"));
-        assert!(!is_media_html("<tg-collage><script>x</script>"));
-        assert!(!is_media_html("plain text"));
-        assert!(!is_media_html("<img src=\"https://a.org/1.jpg\""));
-    }
-
-    #[test]
-    fn detects_media() {
-        assert!(has_media("text\n\n![](https://a.org/1.jpg \"cap\")\n"));
-        assert!(has_media(
-            "<tg-collage><img src=\"https://a.org/1.jpg\"/></tg-collage>"
-        ));
-        assert!(!has_media("just **text** and a [link](https://a.org)"));
-    }
-
-    #[test]
-    fn media_becomes_links() {
-        let md = "Intro.\n\n![](https://a.org/1.jpg \"Amphora\")\n\nAfter.";
-        assert_eq!(
-            media_as_links(md),
-            "Intro.\n\n[Amphora](https://a.org/1.jpg)\n\nAfter."
-        );
-        let bare = "![](https://a.org/1.jpg)";
-        assert_eq!(
-            media_as_links(bare),
-            "[https://a.org/1.jpg](https://a.org/1.jpg)"
-        );
-        let collage = "<tg-collage><img src=\"https://a.org/1.jpg\"/><img src=\"https://a.org/2.jpg\"/></tg-collage>\n";
-        let links = media_as_links(collage);
-        assert!(links.contains("https://a.org/1.jpg") && links.contains("https://a.org/2.jpg"));
-        assert!(!links.contains("<img"));
-    }
 }

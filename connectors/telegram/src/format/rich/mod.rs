@@ -283,4 +283,71 @@ mod tests {
         assert!(chunks.iter().all(|c| c.len() <= MAX_RICH_BYTES));
         assert_eq!(chunks.concat().len(), md.len());
     }
+    #[test]
+    fn media_fallback_preserves_valid_spaced_sources_and_captions() {
+        let md = "<tg-collage><img src = \"https://a.org/1.jpg\"/><figcaption>Diagnostic caption</figcaption></tg-collage>";
+        assert_eq!(sanitize_rich(md), md);
+        let linked = media_as_links(md);
+        assert!(
+            linked.contains("https://a.org/1.jpg"),
+            "media URL lost: {linked:?}"
+        );
+        assert!(
+            linked.contains("Diagnostic caption"),
+            "caption lost: {linked:?}"
+        );
+    }
+
+    #[test]
+    fn collage_tags_are_media() {
+        assert!(is_media_html(
+            "<tg-collage><img src=\"https://a.org/1.jpg\"/><img src='https://a.org/2.jpg'>"
+        ));
+        assert!(is_media_html("</figcaption></tg-collage>"));
+        assert!(is_media_html(
+            "<figcaption>Two vases<cite>Commons</cite></figcaption>"
+        ));
+        assert!(is_media_html("<tg-slideshow>"));
+    }
+
+    #[test]
+    fn anything_else_is_not() {
+        assert!(!is_media_html("<b>bold</b>"));
+        assert!(!is_media_html(
+            "<img src=\"https://a.org/1.jpg\" onerror=\"x\">"
+        ));
+        assert!(!is_media_html("<img src=\"javascript:alert(1)\">"));
+        assert!(!is_media_html("<img src=\"file:///etc/passwd\">"));
+        assert!(!is_media_html("<tg-collage class=\"x\">"));
+        assert!(!is_media_html("<tg-collage><script>x</script>"));
+        assert!(!is_media_html("plain text"));
+        assert!(!is_media_html("<img src=\"https://a.org/1.jpg\""));
+    }
+
+    #[test]
+    fn detects_media() {
+        assert!(has_media("text\n\n![](https://a.org/1.jpg \"cap\")\n"));
+        assert!(has_media(
+            "<tg-collage><img src=\"https://a.org/1.jpg\"/></tg-collage>"
+        ));
+        assert!(!has_media("just **text** and a [link](https://a.org)"));
+    }
+
+    #[test]
+    fn media_becomes_links() {
+        let md = "Intro.\n\n![](https://a.org/1.jpg \"Amphora\")\n\nAfter.";
+        assert_eq!(
+            media_as_links(md),
+            "Intro.\n\n[Amphora](https://a.org/1.jpg)\n\nAfter."
+        );
+        let bare = "![](https://a.org/1.jpg)";
+        assert_eq!(
+            media_as_links(bare),
+            "[https://a.org/1.jpg](https://a.org/1.jpg)"
+        );
+        let collage = "<tg-collage><img src=\"https://a.org/1.jpg\"/><img src=\"https://a.org/2.jpg\"/></tg-collage>\n";
+        let links = media_as_links(collage);
+        assert!(links.contains("https://a.org/1.jpg") && links.contains("https://a.org/2.jpg"));
+        assert!(!links.contains("<img"));
+    }
 }
