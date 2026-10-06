@@ -56,6 +56,10 @@ verification before another send to avoid duplicate photos/documents.
 
 Assemblies using `octo-rig` can bind conversation context with
 `OctoDispatchTool::with_channel_for(connector_id, channel_id)`. The binding is
-connector-specific, so another channel's IDs do not leak to unrelated organs.
+only a default for that connector. The dispatch tool's optional `channel` overrides
+it explicitly, so cross-channel and cross-connector delivery remains supported.
+`with_origin` separately attaches host-provided `origin.connector` / `origin.channel`
+provenance tags, regardless of the destination. Envelope `source` stays the actual
+publisher, and no sender ACL metadata is copied or conferred by provenance.
 `SendFileTool::with_confirmation_timeout` opts into acknowledgements for supporting
 connectors. Legacy fire-and-forget mode reports `queued`, never falsely `sent`.

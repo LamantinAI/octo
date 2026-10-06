@@ -18,6 +18,7 @@ pub struct SendFileTool {
     target: ConnectorId,
     channel: String,
     confirmation_timeout: Option<Duration>,
+    origin: Option<(ConnectorId, ChannelId)>,
 }
 
 impl SendFileTool {
@@ -33,8 +34,15 @@ impl SendFileTool {
             target,
             channel: channel.into(),
             confirmation_timeout: None,
+            origin: None,
         }
     }
+    /// Host-supplied provenance, independent of the file's destination.
+    pub fn with_origin(mut self, connector: ConnectorId, channel: ChannelId) -> Self {
+        self.origin = Some((connector, channel));
+        self
+    }
+
     /// Await actual delivery when the connector supports correlated results.
     pub fn with_confirmation_timeout(mut self, timeout: Duration) -> Self {
         self.confirmation_timeout = Some(timeout);
@@ -82,13 +90,19 @@ impl Tool for SendFileTool {
         if let Some(f) = &args.filename {
             payload["filename"] = json!(f);
         }
-        let env = Envelope::new(
+        let mut env = Envelope::new(
             self.source.clone(),
             EventKind::from_static("chat.send_file"),
             payload,
         )
         .with_target(self.target.clone())
         .with_channel(ChannelId::new(self.channel.clone()));
+
+        if let Some((connector, channel)) = &self.origin {
+            env = env
+                .with_tag("origin.connector", connector.as_str())
+                .with_tag("origin.channel", channel.as_str());
+        }
 
         tracing::info!(path = %args.path, target = %self.target, "rig tool → send_file");
         if let Some(timeout) = self.confirmation_timeout {

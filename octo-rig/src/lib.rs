@@ -55,6 +55,7 @@ pub struct OctoDispatchTool {
     /// scope. The host sets it per-turn to that turn's id.
     scope: Option<String>,
     channels: HashMap<ConnectorId, ChannelId>,
+    origin: Option<(ConnectorId, ChannelId)>,
 }
 
 impl OctoDispatchTool {
@@ -66,6 +67,7 @@ impl OctoDispatchTool {
             timeout: DEFAULT_TIMEOUT,
             scope: None,
             channels: HashMap::new(),
+            origin: None,
         }
     }
 
@@ -73,6 +75,13 @@ impl OctoDispatchTool {
     /// Other organs remain unchannelled unless the assembly explicitly binds them.
     pub fn with_channel_for(mut self, target: ConnectorId, channel: ChannelId) -> Self {
         self.channels.insert(target, channel);
+        self
+    }
+
+    /// Record where this turn originated, independently of its destination.
+    /// These provenance tags do not grant the originating sender's permissions.
+    pub fn with_origin(mut self, connector: ConnectorId, channel: ChannelId) -> Self {
+        self.origin = Some((connector, channel));
         self
     }
 
@@ -96,6 +105,9 @@ pub struct DispatchArgs {
     pub target: String,
     /// Command kind (e.g. `petstore.cmd.find_pets_by_status`).
     pub kind: String,
+    /// Explicit destination channel; otherwise use the host's binding for this target.
+    #[serde(default)]
+    pub channel: Option<String>,
     /// JSON payload for the command.
     #[serde(default)]
     pub payload: Value,
@@ -121,6 +133,7 @@ impl Tool for OctoDispatchTool {
                 "properties": {
                     "target": { "type": "string", "description": "connector id" },
                     "kind": { "type": "string", "description": "command kind" },
+                    "channel": { "type": "string", "description": "Explicit destination channel at the target connector. Omit to use its host-bound default; never confuse it with the source channel." },
                     "payload": { "type": "object", "description": "command payload fields" }
                 },
                 "required": ["target", "kind"]
@@ -135,8 +148,18 @@ impl Tool for OctoDispatchTool {
             args.payload,
         )
         .with_target(ConnectorId::new(args.target.clone()));
-        if let Some(channel) = self.channels.get(&ConnectorId::new(args.target.clone())) {
-            cmd = cmd.with_channel(channel.clone());
+        let destination = args.channel.map(ChannelId::new).or_else(|| {
+            self.channels
+                .get(&ConnectorId::new(args.target.clone()))
+                .cloned()
+        });
+        if let Some(channel) = destination {
+            cmd = cmd.with_channel(channel);
+        }
+        if let Some((connector, channel)) = &self.origin {
+            cmd = cmd
+                .with_tag("origin.connector", connector.as_str())
+                .with_tag("origin.channel", channel.as_str());
         }
         // Stamp the turn's cancel scope so a later octo.control.cancel can reach any
         // long-running connector work this dispatch starts (e.g. a forkd script).
@@ -293,11 +316,12 @@ mod tests {
             .unwrap();
         let tool = OctoDispatchTool::new(bus.clone(), ConnectorId::new("agent"), "")
             .with_channel_for(target.clone(), ChannelId::new("-42"))
+            .with_origin(target.clone(), ChannelId::new("-42"))
             .with_scope("scope")
             .with_timeout(Duration::from_secs(1));
         let reply_bus = bus.clone();
         let worker = spawn(async move {
-            for expected_channel in [Some("-42"), None] {
+            for expected_channel in [Some("-42"), None, Some("other-room"), Some("-99")] {
                 let req = timeout(Duration::from_secs(2), requests.next())
                     .await
                     .unwrap()
@@ -308,6 +332,10 @@ mod tests {
                     Some("scope")
                 );
                 assert_eq!(req.payload_as::<Value>().unwrap()["chat"], -77);
+                assert_eq!(req.tags["origin.connector"], "telegram-work");
+                assert_eq!(req.tags["origin.channel"], "-42");
+                assert_eq!(req.source.as_str(), "agent");
+                assert!(req.channel_metadata.is_none());
                 reply_bus
                     .publish(
                         Envelope::new(
@@ -321,11 +349,17 @@ mod tests {
                     .unwrap();
             }
         });
-        for target in [target.as_str(), "robot-arm"] {
+        for (target, channel) in [
+            (target.as_str(), None),
+            ("robot-arm", None),
+            ("another-chat-service", Some("other-room")),
+            (target.as_str(), Some("-99")),
+        ] {
             let response = tool
                 .call(DispatchArgs {
                     target: target.into(),
                     kind: "command".into(),
+                    channel: channel.map(str::to_string),
                     payload: json!({"chat":-77}),
                 })
                 .await
