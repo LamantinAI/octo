@@ -52,6 +52,7 @@ repository = "https://github.com/lamantinai/octo"
 rust-version = "1.85"
 
 [workspace.dependencies]
+axum = "0.8"
 tokio = { version = "1.40", features = ["sync", "rt", "macros", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 async-trait = "0.1"

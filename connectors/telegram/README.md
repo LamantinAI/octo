@@ -39,3 +39,23 @@ is irrelevant to scheduled deliveries. A deterministic host acknowledgement may
 use envelope tag `control_reply=true` with original sender/chat metadata to answer
 bootstrap commands or confirm revocation. It cannot target a different chat.
 No ACL configured retains the standalone connector's allow-all behavior.
+
+## File delivery results
+
+`chat.send_file` is a request/reply operation. The connector advertises
+`chat.send_file.result` and emits one result correlated to the request ID on every
+path, including ACL denial and invalid input. Destination is the payload's explicit
+numeric `chat`, otherwise the envelope's host-bound channel; explicit invalid
+values are rejected rather than falling back to another destination.
+
+Results contain `ok` and `status`: `sent` includes `chat_id`, `message_id` and
+`sent` (workspace path), `not_sent` indicates validation or a definite Telegram
+rejection, and `unknown` indicates an unconfirmed transport outcome. Uploads have
+a 90-second timeout and are not retried automatically. An unknown outcome needs
+verification before another send to avoid duplicate photos/documents.
+
+Assemblies using `octo-rig` can bind conversation context with
+`OctoDispatchTool::with_channel_for(connector_id, channel_id)`. The binding is
+connector-specific, so another channel's IDs do not leak to unrelated organs.
+`SendFileTool::with_confirmation_timeout` opts into acknowledgements for supporting
+connectors. Legacy fire-and-forget mode reports `queued`, never falsely `sent`.
