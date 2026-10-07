@@ -21,15 +21,26 @@ Alice ◀── {"response":{"text":…}} ──── alice ◀── chat.repl
   list items become sentences) and split into ≤ `max_chars` pieces. `chat.typing`,
   `chat.status` and `chat.send_file` are ignored.
 
-## Timing: «дальше»
+## Timing: fillers and the speaker's own voice
 
 Alice waits about 3 seconds for a webhook. A request that starts a turn waits up
-to `reply_wait_ms`; if the reply is not in yet it answers «Думаю. Скажите
-«дальше»…». The reply is parked per speaker and spoken when they say one of
-`continue_words`. Long replies are handed out one piece per «дальше». Continue
-words never reach the bus — a new message would interrupt the running turn.
-An uncorrelated reply (e.g. a reminder) to the channel is parked the same way;
-the next launch mentions it.
+to `reply_wait_ms`; a reply that is in by then is spoken right away.
+
+**With `[connector.push]`** (recommended): otherwise the request answers with a
+random `fillers` phrase and ends the session; when the reply comes, the speaker
+says it by itself through the Yandex smart-home cloud ("произнести текст" in a
+scenario — the same mechanism the Home Assistant integration AlexxIT/YandexStation
+uses). That path is not a public API: it needs an x-token of the Yandex account
+that owns the speaker (one-time QR login: `tools/yandex_qr_login.py`), takes at most
+100 characters per utterance (longer text is said in a row of pieces, paced by an
+estimate — the cloud reports no playback state), and may change without notice.
+Unsolicited replies (a reminder firing) are spoken the same way. If the cloud
+call fails, the text is parked as below.
+
+**Without it**: the filler is the `thinking` phrase and the reply is parked per
+speaker until they say one of `continue_words` («дальше»); long replies come one
+piece per «дальше». Continue words never reach the bus — a new message would
+interrupt the running turn.
 
 ## Access
 
@@ -45,7 +56,11 @@ the next launch mentions it.
 2. Copy [`alice.toml`](alice.toml) into the connectors dir, set
    `ALICE_WEBHOOK_SECRET`.
 3. Expose `listen` through an HTTPS proxy with a valid certificate.
-4. In the [Yandex Dialogs console](https://dialogs.yandex.ru/developer) create an
+4. Optional, for the speaker's own voice: `uv run tools/yandex_qr_login.py
+   --env-file <your .env>` (or `--ssh user@host:/path/.env`), scan the QR with the
+   Yandex app, add `[connector.push]` to the manifest. The connector logs the
+   account's speakers at startup; set `device` if there is more than one.
+5. In the [Yandex Dialogs console](https://dialogs.yandex.ru/developer) create an
    Alice skill, set the webhook URL `https://<host>/alice/<secret>`, mark it
    private, and test. Say something to it, then copy your `user_id` from the
    connector's log into `allowed_users`.

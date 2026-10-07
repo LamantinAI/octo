@@ -15,7 +15,7 @@ use octo_core::{
 };
 
 use crate::{
-    CHAT_MESSAGE,
+    AliceConnector, CHAT_MESSAGE,
     config::{Settings, normalize},
     dialog::Dialogs,
     protocol::{AliceRequest, AliceResponse, Identity},
@@ -27,6 +27,8 @@ pub struct App {
     pub settings: Arc<Settings>,
     pub dialogs: Arc<Dialogs>,
     pub ctx: ConnectorContext,
+    /// For handing the rest of a reply to the speaker's cloud voice.
+    pub connector: Arc<AliceConnector>,
 }
 
 pub fn router(app: App) -> Router {
@@ -136,10 +138,40 @@ async fn webhook(State(app): State<Arc<App>>, Path(secret): Path<String>, body: 
                 tracing::warn!(error = %e, "alice: publish failed");
                 return Json(AliceResponse::say(&phrases.still_thinking, &version)).into_response();
             }
-            speak_next(&app, &channel, &phrases.thinking, &version)
+            if app.connector.voice.is_some() {
+                handed_over(&app, &channel, &version)
+            } else {
+                speak_next(&app, &channel, &phrases.thinking, &version)
+            }
         }
     };
     Json(answer).into_response()
+}
+
+/// With the cloud voice: speak what is ready (the rest follows by push once
+/// this answer has been said), or answer with a filler and let the speaker say
+/// the reply by itself when it comes.
+fn handed_over(app: &App, channel: &str, version: &str) -> AliceResponse {
+    match app.dialogs.take_or_hand_over(channel) {
+        Some((piece, more)) => {
+            if more {
+                let rest = app.dialogs.drain(channel);
+                app.connector
+                    .push(channel, rest, crate::quasar::speaking_time(&piece));
+            }
+            AliceResponse::say(piece, version)
+        }
+        None => {
+            let filler = app.settings.filler();
+            let end = app.settings.push.as_ref().is_none_or(|p| p.end_session);
+            tracing::info!(channel, "alice: turn handed over to the cloud voice");
+            if end {
+                AliceResponse::bye(filler, version)
+            } else {
+                AliceResponse::say(filler, version)
+            }
+        }
+    }
 }
 
 fn allowed(settings: &Settings, identity: &Identity<'_>) -> bool {
