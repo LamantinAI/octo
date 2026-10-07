@@ -57,13 +57,13 @@ impl SqliteHistory {
             return Err(HistoryError::Db("Empty compact refused".into()));
         }
         // A single conditional INSERT is atomic even across independent processes.
-        // The boundary must belong to this channel, advance the prior checkpoint,
+        // The boundary must belong to this channel, not precede the prior checkpoint,
         // and the previously observed checkpoint must still be the latest.
         let result = query("INSERT INTO compacts (channel, through_id, previous_id, content)
             SELECT ?1, ?2, ?3, ?4
             WHERE EXISTS (SELECT 1 FROM turns WHERE channel = ?1 AND id = ?2)
             AND (SELECT id FROM compacts WHERE channel = ?1 ORDER BY id DESC LIMIT 1) IS ?3
-            AND ?2 > COALESCE((SELECT through_id FROM compacts WHERE channel = ?1 ORDER BY id DESC LIMIT 1), 0)")
+            AND ?2 >= COALESCE((SELECT through_id FROM compacts WHERE channel = ?1 ORDER BY id DESC LIMIT 1), 0)")
             .bind(channel).bind(through).bind(previous).bind(content)
             .execute(&self.pool).await.map_err(db)?;
         Ok(result.rows_affected() == 1)

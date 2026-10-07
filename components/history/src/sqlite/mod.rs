@@ -228,5 +228,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count.0, 2);
+        let last = h.context("a").await.unwrap().compact.unwrap();
+        assert!(
+            h.save_compact("a", Some(last.id), last.through_id, "smaller summary")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            h.context("a").await.unwrap().compact.unwrap().content,
+            "smaller summary"
+        );
+        assert_eq!(h.load("a").await.len(), 3);
     }
 }
