@@ -1,0 +1,25 @@
+[package]
+name = "octo-connector-alice"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Yandex Alice (Yandex Dialogs) skill webhook connector for the Octo runtime: a spoken request → chat.message, the agent's chat.reply → speech, with a «дальше» hand-off for turns slower than Alice's ~3 s budget."
+
+[dependencies]
+octo-core = { path = "../../octo-core" }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "net"] }
+async-trait = { workspace = true }
+axum = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+parking_lot = { workspace = true }
+regex = "1"
+
+[dev-dependencies]
+tokio-util = { workspace = true }
+tower = { version = "0.5", features = ["util"] }

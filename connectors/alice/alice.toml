@@ -1,0 +1,38 @@
+# Yandex Alice skill webhook — example manifest (`type = "alice"`).
+# Copy to <config>/connectors/alice/alice.toml in the assembly.
+
+[connector]
+id = "alice"
+type = "alice"
+
+# Where the webhook server binds. Put a TLS-terminating proxy in front:
+# Yandex Dialogs only calls https:// URLs with a valid certificate.
+listen = "0.0.0.0:8790"
+
+# Env var with the secret path segment: the skill's webhook URL is
+#   https://<your-host>/alice/<secret>
+# At least 16 characters of [A-Za-z0-9_-]. Yandex does not sign requests.
+secret_env = "ALICE_WEBHOOK_SECRET"
+
+# Your skill's id from the Dialogs console; requests for other skills → 403.
+# skill_id = "00000000-0000-0000-0000-000000000000"
+
+# Who may talk. Speakers not listed are refused, and their ids are logged
+# (`alice: speaker not on the allow-list`) so you can copy them here.
+allowed_users = []          # session.user.user_id (signed-in Yandex account)
+allowed_applications = []   # session.application.application_id (a device)
+
+# ACL role stamped on every message: owner | trusted | guest. A smart speaker
+# hears whoever is in the room — `trusted` is the sensible default.
+role = "trusted"
+
+# How long a request waits for the agent before answering with a placeholder
+# (Alice gives up at ~3 s end to end, so keep a margin).
+reply_wait_ms = 2500
+# Longest piece spoken per answer; longer replies are split («дальше»).
+max_chars = 900
+
+# Optional overrides of what the connector says on its own:
+# [connector.phrases]
+# greeting = "Слушаю."
+# thinking = "Думаю. Скажите «дальше», и я отвечу."
