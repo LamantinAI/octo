@@ -1,6 +1,6 @@
 //! Config-driven construction (`type = "alice"` manifest).
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::Path, sync::Arc, time::Duration};
 
 use octo_core::{Connector, ConnectorFactory, ConnectorId, FactoryContext, TrustLevel};
 use serde::Deserialize;
@@ -56,6 +56,10 @@ struct AliceConfig {
     /// What to say while the agent thinks (a random one each time).
     #[serde(default = "default_fillers")]
     fillers: Vec<String>,
+    /// A text file of fillers, one per line (`#` comments and blank lines are
+    /// skipped), relative to the manifest. Replaces `fillers` when set — for
+    /// a long list that would clutter the manifest.
+    fillers_file: Option<String>,
     /// The speaker's own cloud voice, so slow replies arrive by themselves.
     push: Option<PushConfig>,
 }
@@ -235,6 +239,36 @@ fn default_exit_words() -> Vec<String> {
         .to_vec()
 }
 
+/// Fillers from a text file: one per line, `#` comments and blanks skipped.
+/// Lines longer than the cloud voice takes are refused, not clipped mid-word.
+fn read_fillers(path: &Path) -> Result<Vec<String>, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("alice: fillers_file {}: {e}", path.display()))?;
+    let mut out = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.chars().count() > crate::quasar::SAY_LIMIT {
+            return Err(format!(
+                "alice: fillers_file {} line {}: longer than {} characters",
+                path.display(),
+                n + 1,
+                crate::quasar::SAY_LIMIT
+            ));
+        }
+        out.push(line.to_string());
+    }
+    if out.is_empty() {
+        return Err(format!(
+            "alice: fillers_file {} has no fillers",
+            path.display()
+        ));
+    }
+    Ok(out)
+}
+
 /// Lower-case, `ё`→`е`, punctuation dropped, spaces collapsed — the form both
 /// Alice's `command` and the configured trigger words are compared in.
 pub fn normalize(s: &str) -> String {
@@ -249,7 +283,11 @@ pub fn normalize(s: &str) -> String {
 }
 
 impl AliceConfig {
-    fn into_settings(self) -> Result<Settings, String> {
+    fn into_settings(self, base_dir: &Path) -> Result<Settings, String> {
+        let fillers = match &self.fillers_file {
+            Some(file) => read_fillers(&base_dir.join(file))?,
+            None => self.fillers.clone(),
+        };
         let listen: SocketAddr = self
             .listen
             .parse()
@@ -299,7 +337,7 @@ impl AliceConfig {
             phrases: self.phrases,
             continue_words: words(self.continue_words),
             exit_words: words(self.exit_words),
-            fillers: self.fillers.into_iter().filter(|f| !f.trim().is_empty()).collect(),
+            fillers: fillers.into_iter().filter(|f| !f.trim().is_empty()).collect(),
             push: self.push.and_then(|p| match std::env::var(&p.x_token_env) {
                 Ok(x_token) if !x_token.trim().is_empty() => Some(PushSettings {
                     x_token: x_token.trim().to_string(),
@@ -333,10 +371,11 @@ impl ConnectorFactory for AliceConnectorFactory {
         &self,
         id: ConnectorId,
         config: &toml::Value,
-        _ctx: FactoryContext<'_>,
+        ctx: FactoryContext<'_>,
     ) -> Result<Arc<dyn Connector>, Box<dyn std::error::Error + Send + Sync>> {
         let file: ConnectorFile = config.clone().try_into()?;
-        let settings = file.connector.into_settings()?;
+        let settings = file.connector.into_settings(ctx.base_dir)?;
+        tracing::info!(connector = %id, fillers = settings.fillers.len(), "alice: fillers loaded");
         if settings.allowed_users.is_empty() && settings.allowed_applications.is_empty() {
             tracing::warn!(
                 connector = %id,
@@ -355,6 +394,22 @@ pub fn factory() -> Arc<dyn ConnectorFactory> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fillers_file_skips_comments_and_refuses_overlong_lines() {
+        let dir = std::env::temp_dir().join(format!("alice-fillers-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ok = dir.join("ok.txt");
+        std::fs::write(&ok, "# шутки\nПервая.\n\n  Вторая.  \n").unwrap();
+        assert_eq!(read_fillers(&ok).unwrap(), vec!["Первая.", "Вторая."]);
+        let long = dir.join("long.txt");
+        std::fs::write(&long, "я".repeat(crate::quasar::SAY_LIMIT + 1)).unwrap();
+        assert!(read_fillers(&long).unwrap_err().contains("line 1"));
+        let empty = dir.join("empty.txt");
+        std::fs::write(&empty, "# пусто\n").unwrap();
+        assert!(read_fillers(&empty).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn normalize_matches_alice_command_form() {
