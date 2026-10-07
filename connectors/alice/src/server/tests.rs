@@ -38,6 +38,7 @@ fn settings() -> Settings {
 #[derive(Default)]
 struct FakeVoice {
     said: parking_lot::Mutex<Vec<String>>,
+    commands: parking_lot::Mutex<Vec<String>>,
     fail: bool,
 }
 
@@ -51,8 +52,27 @@ impl Voice for FakeVoice {
         Ok(())
     }
 
+    async fn command(&self, command: &str) -> Result<(), String> {
+        if self.fail {
+            return Err("offline".into());
+        }
+        self.commands.lock().push(command.to_string());
+        Ok(())
+    }
+
     async fn check(&self) -> Result<String, String> {
         Ok("fake".into())
+    }
+}
+
+fn push_settings(relaunch: Option<&str>, gap_ms: u64) -> PushSettings {
+    PushSettings {
+        x_token: String::new(),
+        device: None,
+        end_session: true,
+        relaunch: relaunch.map(String::from),
+        filler_gap: Duration::from_millis(gap_ms),
+        max_fillers: 12,
     }
 }
 
@@ -73,16 +93,24 @@ async fn harness_with(
     reply: fn(&str) -> String,
     voice: Option<Arc<dyn Voice>>,
 ) -> Harness {
+    let push = voice.as_ref().map(|_| push_settings(None, 5000));
+    harness_push(delay, reply, voice, push).await
+}
+
+async fn harness_push(
+    delay: Duration,
+    reply: fn(&str) -> String,
+    voice: Option<Arc<dyn Voice>>,
+    push: Option<PushSettings>,
+) -> Harness {
     let bus = Arc::new(InProcessBus::new(64));
     let ctx = ConnectorContext::new(CancellationToken::new(), bus.clone());
     let mut settings = settings();
-    if voice.is_some() {
-        settings.push = Some(PushSettings {
-            x_token: String::new(),
-            device: None,
-            end_session: true,
-        });
+    settings.fillers = vec!["Чешу бульдожьи усы.".into(), "Бегу за пончиком.".into()];
+    if push.as_ref().is_some_and(|p| p.relaunch.is_some()) {
+        settings.max_chars = 900; // the production default: a reply goes out whole
     }
+    settings.push = push;
     let connector = AliceConnector::with_voice(ConnectorId::new("alice"), settings, voice);
 
     let mut outbound = ctx
@@ -171,6 +199,10 @@ async fn post(h: &Harness, secret: &str, body: &Value) -> (StatusCode, Value) {
         status,
         serde_json::from_slice(&bytes).unwrap_or(Value::Null),
     )
+}
+
+fn is_filler(text: &str) -> bool {
+    text == "Чешу бульдожьи усы." || text == "Бегу за пончиком."
 }
 
 fn said(v: &Value) -> &str {
@@ -328,7 +360,7 @@ async fn with_voice_a_slow_reply_gets_a_filler_then_is_spoken_by_the_speaker() {
         ),
     )
     .await;
-    assert_eq!(said(&v), "Чешу бульдожьи усы.");
+    assert!(is_filler(said(&v)), "{}", said(&v));
     assert_eq!(
         v["response"]["end_session"], true,
         "the speaker goes idle until the push"
@@ -414,10 +446,78 @@ async fn when_the_voice_fails_the_reply_waits_for_dalshe() {
     });
     let h = harness_with(Duration::from_millis(400), |_| "Ответ.".into(), Some(voice)).await;
     let (_, v) = post(&h, SECRET, &request(Some("U"), false, "вопрос", "Вопрос")).await;
-    assert_eq!(said(&v), "Чешу бульдожьи усы.");
+    assert!(is_filler(said(&v)), "{}", said(&v));
     tokio::time::sleep(Duration::from_millis(500)).await;
     let (_, v) = post(&h, SECRET, &request(Some("U"), true, "", "")).await;
-    assert_eq!(said(&v), Phrases::default().greeting_pending);
-    let (_, v) = post(&h, SECRET, &request(Some("U"), false, "дальше", "дальше")).await;
-    assert_eq!(said(&v), "Ответ.");
+    assert_eq!(said(&v), "Ответ.", "the next launch says the parked reply");
+}
+
+#[tokio::test(start_paused = true)]
+async fn fillers_keep_coming_until_the_reply() {
+    let voice = Arc::new(FakeVoice::default());
+    let h = harness_push(
+        Duration::from_secs(20),
+        |_| "Готово.".into(),
+        Some(voice.clone()),
+        Some(push_settings(None, 1000)),
+    )
+    .await;
+    let (_, v) = post(&h, SECRET, &request(Some("U"), false, "вопрос", "Вопрос")).await;
+    let first = said(&v).to_string();
+    assert!(first == "Чешу бульдожьи усы." || first == "Бегу за пончиком.");
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    let spoken = voice.said.lock().clone();
+    let (fillers, rest): (Vec<_>, Vec<_>) = spoken.iter().partition(|p| p.as_str() != "Готово.");
+    assert!(fillers.len() >= 3, "kept joking while thinking: {spoken:?}");
+    assert!(
+        fillers.windows(2).all(|w| w[0] != w[1]),
+        "no filler twice in a row: {spoken:?}"
+    );
+    assert_eq!(rest, vec!["Готово."]);
+    assert_eq!(
+        spoken.last().unwrap(),
+        "Готово.",
+        "no filler after the reply: {spoken:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn with_relaunch_the_reply_comes_whole_as_the_skill_answer() {
+    let voice = Arc::new(FakeVoice::default());
+    let long = "Римская глиняная ваза стоила несколько ассов, а расписная греческая — уже десятки денариев. ".repeat(4);
+    let h = harness_push(
+        Duration::from_secs(8),
+        |_| "Римская глиняная ваза стоила несколько ассов, а расписная греческая — уже десятки денариев. ".repeat(4),
+        Some(voice.clone()),
+        Some(push_settings(Some("запусти навык Помощник Альберт"), 1000)),
+    )
+    .await;
+    post(
+        &h,
+        SECRET,
+        &request(
+            Some("U"),
+            false,
+            "сколько стоили вазы",
+            "Сколько стоили вазы?",
+        ),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert_eq!(
+        voice.commands.lock().clone(),
+        vec!["запусти навык Помощник Альберт".to_string()]
+    );
+    assert!(
+        voice.said.lock().iter().all(|p| !p.contains("ассов")),
+        "the reply itself is not read out by the cloud voice"
+    );
+
+    // The speaker reopens the skill: its launch request gets the whole reply.
+    let (_, v) = post(&h, SECRET, &request(Some("U"), true, "", "")).await;
+    assert_eq!(said(&v), long.trim());
+    assert_eq!(
+        v["response"]["end_session"], false,
+        "the conversation stays open"
+    );
 }

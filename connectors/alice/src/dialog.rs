@@ -149,6 +149,17 @@ impl Dialogs {
             .unwrap_or_default()
     }
 
+    /// Has the running turn been handed over to push and is it still
+    /// unanswered (the fillers keep going while this holds)?
+    pub fn awaiting_push(&self, channel: &str) -> bool {
+        let map = self.map.lock();
+        map.get(channel).is_some_and(|d| {
+            d.push
+                && d.pending
+                    .is_some_and(|(_, since)| since.elapsed() < self.turn_ttl)
+        })
+    }
+
     pub fn has_queued(&self, channel: &str) -> bool {
         self.map
             .lock()
@@ -227,6 +238,18 @@ mod tests {
             Delivery::Queued
         );
         assert_eq!(d.take_or_hand_over("c"), Some(("Успел.".into(), false)));
+    }
+
+    #[test]
+    fn awaiting_push_holds_until_the_reply() {
+        let d = dialogs(60_000);
+        let id = EventId::new();
+        d.start_turn("c", id);
+        assert!(!d.awaiting_push("c"));
+        d.take_or_hand_over("c");
+        assert!(d.awaiting_push("c"));
+        d.deliver("c", Some(id), "Ответ.".into(), true);
+        assert!(!d.awaiting_push("c"));
     }
 
     #[test]
