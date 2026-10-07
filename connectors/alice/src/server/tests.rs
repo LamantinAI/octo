@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
 use super::*;
-use crate::{AliceConnector, Phrases};
+use crate::{AliceConnector, Phrases, PushSettings, Voice};
 
 const SECRET: &str = "s3cret-path-0123456789";
 
@@ -29,20 +29,61 @@ fn settings() -> Settings {
         phrases: Phrases::default(),
         continue_words: vec!["дальше".into()],
         exit_words: vec!["хватит".into()],
+        fillers: vec!["Чешу бульдожьи усы.".into()],
+        push: None,
+    }
+}
+
+/// A cloud voice that records what it was asked to say (or fails).
+#[derive(Default)]
+struct FakeVoice {
+    said: parking_lot::Mutex<Vec<String>>,
+    fail: bool,
+}
+
+#[async_trait::async_trait]
+impl Voice for FakeVoice {
+    async fn say(&self, pieces: &[String]) -> Result<(), String> {
+        if self.fail {
+            return Err("offline".into());
+        }
+        self.said.lock().extend(pieces.iter().cloned());
+        Ok(())
+    }
+
+    async fn check(&self) -> Result<String, String> {
+        Ok("fake".into())
     }
 }
 
 struct Harness {
     router: Router,
     bus: Arc<InProcessBus>,
+    ctx: ConnectorContext,
 }
 
 /// Wire a connector's webhook and reply loop to a fresh bus; `agent` answers
 /// every `chat.message` with `reply(text)` after `delay`.
 async fn harness(delay: Duration, reply: fn(&str) -> String) -> Harness {
+    harness_with(delay, reply, None).await
+}
+
+async fn harness_with(
+    delay: Duration,
+    reply: fn(&str) -> String,
+    voice: Option<Arc<dyn Voice>>,
+) -> Harness {
     let bus = Arc::new(InProcessBus::new(64));
     let ctx = ConnectorContext::new(CancellationToken::new(), bus.clone());
-    let connector = AliceConnector::new(ConnectorId::new("alice"), settings());
+    let mut settings = settings();
+    if voice.is_some() {
+        settings.push = Some(PushSettings {
+            x_token: String::new(),
+            device: None,
+            end_session: true,
+        });
+    }
+    let connector = AliceConnector::with_voice(ConnectorId::new("alice"), settings, voice);
 
     let mut outbound = ctx
         .subscribe(
@@ -95,9 +136,10 @@ async fn harness(delay: Duration, reply: fn(&str) -> String) -> Harness {
         id: connector.id.clone(),
         settings: connector.settings.clone(),
         dialogs: connector.dialogs.clone(),
-        ctx,
+        ctx: ctx.clone(),
+        connector: connector.clone(),
     });
-    Harness { router, bus }
+    Harness { router, bus, ctx }
 }
 
 fn request(user: Option<&str>, new: bool, command: &str, original: &str) -> Value {
@@ -264,4 +306,118 @@ async fn strangers_wrong_secret_ping_and_exit() {
             .is_err(),
         "nothing above may reach the agent"
     );
+}
+
+#[tokio::test]
+async fn with_voice_a_slow_reply_gets_a_filler_then_is_spoken_by_the_speaker() {
+    let voice = Arc::new(FakeVoice::default());
+    let h = harness_with(
+        Duration::from_millis(500),
+        |_| "Завтра в 11 созвон с Артёмом, в 15 спортзал, а вечером ужин у родителей, не забудьте торт.".into(),
+        Some(voice.clone()),
+    )
+    .await;
+    let (_, v) = post(
+        &h,
+        SECRET,
+        &request(
+            Some("U"),
+            true,
+            "что у меня завтра",
+            "попроси помощника что у меня завтра",
+        ),
+    )
+    .await;
+    assert_eq!(said(&v), "Чешу бульдожьи усы.");
+    assert_eq!(
+        v["response"]["end_session"], true,
+        "the speaker goes idle until the push"
+    );
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let spoken = voice.said.lock().clone();
+    assert!(
+        !spoken.is_empty()
+            && spoken
+                .iter()
+                .all(|p| p.chars().count() <= crate::quasar::SAY_LIMIT),
+        "{spoken:?}"
+    );
+    assert!(spoken.join(" ").contains("не забудьте торт"));
+}
+
+#[tokio::test]
+async fn with_voice_a_fast_reply_is_said_directly_and_reminders_are_pushed() {
+    let voice = Arc::new(FakeVoice::default());
+    let h = harness_with(
+        Duration::from_millis(10),
+        |_| "Готово.".into(),
+        Some(voice.clone()),
+    )
+    .await;
+    let (_, v) = post(
+        &h,
+        SECRET,
+        &request(Some("U"), false, "включи режим", "Включи режим"),
+    )
+    .await;
+    assert_eq!(said(&v), "Готово.");
+    assert_eq!(v["response"]["end_session"], false);
+
+    let reminder = Envelope::new(
+        ConnectorId::new("brain"),
+        EventKind::from_static("chat.reply"),
+        "Пора пить воду!".to_string(),
+    )
+    .with_target(ConnectorId::new("alice"))
+    .with_channel(ChannelId::new("alice:U"));
+    h.ctx.publish(reminder).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        voice.said.lock().clone(),
+        vec!["Пора пить воду!".to_string()]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn with_voice_a_long_fast_reply_continues_by_push_after_the_first_piece() {
+    let voice = Arc::new(FakeVoice::default());
+    let h = harness_with(
+        Duration::from_millis(10),
+        |_| "Это длинное предложение номер один. ".repeat(8),
+        Some(voice.clone()),
+    )
+    .await;
+    let (_, v) = post(
+        &h,
+        SECRET,
+        &request(Some("U"), false, "расскажи", "Расскажи"),
+    )
+    .await;
+    assert!(
+        !said(&v).contains("дальше"),
+        "no «дальше» with a voice: {}",
+        said(&v)
+    );
+    assert!(
+        voice.said.lock().is_empty(),
+        "the rest waits until the first piece is said"
+    );
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert!(!voice.said.lock().is_empty());
+}
+
+#[tokio::test]
+async fn when_the_voice_fails_the_reply_waits_for_dalshe() {
+    let voice = Arc::new(FakeVoice {
+        fail: true,
+        ..Default::default()
+    });
+    let h = harness_with(Duration::from_millis(400), |_| "Ответ.".into(), Some(voice)).await;
+    let (_, v) = post(&h, SECRET, &request(Some("U"), false, "вопрос", "Вопрос")).await;
+    assert_eq!(said(&v), "Чешу бульдожьи усы.");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (_, v) = post(&h, SECRET, &request(Some("U"), true, "", "")).await;
+    assert_eq!(said(&v), Phrases::default().greeting_pending);
+    let (_, v) = post(&h, SECRET, &request(Some("U"), false, "дальше", "дальше")).await;
+    assert_eq!(said(&v), "Ответ.");
 }

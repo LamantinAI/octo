@@ -32,6 +32,16 @@ reply_wait_ms = 2500
 # Longest piece spoken per answer; longer replies are split («дальше»).
 max_chars = 900
 
+# What to say while the agent thinks (random each time).
+# fillers = ["Думаю. Сейчас отвечу.", "Секунду, соображаю."]
+
+# The speaker's own voice for replies that miss the ~3 s window (and for
+# reminders). Needs the account's x-token: uv run tools/yandex_qr_login.py.
+# [connector.push]
+# x_token_env = "YANDEX_X_TOKEN"
+# device = "Яндекс Станция"   # name or id; omit if the account has one speaker
+# end_session = true          # the speaker goes idle after the filler
+
 # Optional overrides of what the connector says on its own:
 # [connector.phrases]
 # greeting = "Слушаю."

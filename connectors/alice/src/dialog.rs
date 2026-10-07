@@ -1,9 +1,11 @@
 //! Per-speaker conversation state that outlives a single HTTP request.
 //!
 //! Alice waits ~3 s for an answer, an agent turn usually takes longer. So the
-//! request that started a turn often returns a placeholder, and the reply —
-//! arriving later on the bus — is parked here until the speaker says «дальше».
-//! Long replies are split into pieces and handed out one per request.
+//! request that started a turn often returns a filler, and the reply — arriving
+//! later on the bus — is either spoken by the speaker on its own (when the cloud
+//! voice is configured: the turn is *handed over to push*) or parked here until
+//! the speaker says «дальше». Parked replies are split into pieces, one per
+//! request.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -15,15 +17,29 @@ use octo_core::EventId;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
+use crate::speech;
+
 #[derive(Default)]
 struct Dialog {
     /// The turn we are waiting on: the id of the `chat.message` that started
     /// it (the assembly correlates its `chat.reply` to it) and when it started.
     pending: Option<(EventId, Instant)>,
+    /// The request that started the turn has already answered with a filler:
+    /// its reply goes to the speaker's own voice instead of the queue.
+    push: bool,
     /// Spoken pieces not yet delivered, oldest first.
     queue: VecDeque<String>,
     /// Woken whenever something lands in `queue`.
     notify: Arc<Notify>,
+}
+
+/// Where an arriving reply should go.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Delivery {
+    /// Parked; a waiting or later request will speak it.
+    Queued,
+    /// Say it through the speaker's cloud voice now.
+    Push(String),
 }
 
 pub struct Dialogs {
@@ -31,13 +47,16 @@ pub struct Dialogs {
     /// A turn not answered within this window is treated as lost (an
     /// interrupted turn sends no reply) — stop saying «ещё думаю».
     turn_ttl: Duration,
+    /// Longest piece a webhook answer carries.
+    max_chars: usize,
 }
 
 impl Dialogs {
-    pub fn new(turn_ttl: Duration) -> Self {
+    pub fn new(turn_ttl: Duration, max_chars: usize) -> Self {
         Self {
             map: Mutex::new(HashMap::new()),
             turn_ttl,
+            max_chars,
         }
     }
 
@@ -58,18 +77,59 @@ impl Dialogs {
         let mut map = self.map.lock();
         let dialog = map.entry(channel.to_string()).or_default();
         dialog.pending = Some((id, Instant::now()));
+        dialog.push = false;
         dialog.queue.clear();
     }
 
-    /// A reply arrived. A reply to the pending turn closes it; an uncorrelated
-    /// one (a reminder firing) is queued all the same.
-    pub fn deliver(&self, channel: &str, correlation: Option<EventId>, pieces: Vec<String>) {
+    /// The request ran out of time: take what is already parked, or — when
+    /// nothing is — hand the turn over to push. Atomic with [`deliver`], so a
+    /// reply racing in is either returned here or pushed, never lost.
+    pub fn take_or_hand_over(&self, channel: &str) -> Option<(String, bool)> {
         let mut map = self.map.lock();
         let dialog = map.entry(channel.to_string()).or_default();
-        if correlation.is_some() && dialog.pending.map(|(id, _)| id) == correlation {
+        match dialog.queue.pop_front() {
+            Some(piece) => Some((piece, !dialog.queue.is_empty())),
+            None => {
+                dialog.push = true;
+                None
+            }
+        }
+    }
+
+    /// A reply arrived (already converted to speech). It is pushed when its
+    /// turn was handed over, or when it is unsolicited (a reminder) and
+    /// `push_available`; otherwise it is chunked and parked. A reply to the
+    /// pending turn closes it.
+    pub fn deliver(
+        &self,
+        channel: &str,
+        correlation: Option<EventId>,
+        spoken: String,
+        push_available: bool,
+    ) -> Delivery {
+        let mut map = self.map.lock();
+        let dialog = map.entry(channel.to_string()).or_default();
+        let is_pending = correlation.is_some() && dialog.pending.map(|(id, _)| id) == correlation;
+        if is_pending {
             dialog.pending = None;
         }
-        dialog.queue.extend(pieces);
+        let push = push_available && ((is_pending && dialog.push) || correlation.is_none());
+        if is_pending {
+            dialog.push = false;
+        }
+        if push {
+            return Delivery::Push(spoken);
+        }
+        dialog.queue.extend(speech::chunk(&spoken, self.max_chars));
+        dialog.notify.notify_waiters();
+        Delivery::Queued
+    }
+
+    /// Park text whose push failed, so «дальше» / the next launch still has it.
+    pub fn park(&self, channel: &str, spoken: &str) {
+        let mut map = self.map.lock();
+        let dialog = map.entry(channel.to_string()).or_default();
+        dialog.queue.extend(speech::chunk(spoken, self.max_chars));
         dialog.notify.notify_waiters();
     }
 
@@ -79,6 +139,14 @@ impl Dialogs {
         let dialog = map.get_mut(channel)?;
         let piece = dialog.queue.pop_front()?;
         Some((piece, !dialog.queue.is_empty()))
+    }
+
+    /// Everything still parked, as one text (for handing to push).
+    pub fn drain(&self, channel: &str) -> String {
+        let mut map = self.map.lock();
+        map.get_mut(channel)
+            .map(|d| d.queue.drain(..).collect::<Vec<_>>().join(" "))
+            .unwrap_or_default()
     }
 
     pub fn has_queued(&self, channel: &str) -> bool {
@@ -109,32 +177,92 @@ impl Dialogs {
 mod tests {
     use super::*;
 
+    fn dialogs(ttl_ms: u64) -> Dialogs {
+        Dialogs::new(Duration::from_millis(ttl_ms), 20)
+    }
+
     #[test]
     fn correlated_reply_closes_turn_and_queues_pieces() {
-        let d = Dialogs::new(Duration::from_secs(60));
+        let d = dialogs(60_000);
         let id = EventId::new();
         d.start_turn("c", id);
         assert!(d.is_thinking("c"));
-        d.deliver("c", Some(id), vec!["раз".into(), "два".into()]);
+        let r = d.deliver(
+            "c",
+            Some(id),
+            "Раз два три. Четыре пять шесть.".into(),
+            true,
+        );
+        assert_eq!(
+            r,
+            Delivery::Queued,
+            "not handed over → parked even with push"
+        );
         assert!(!d.is_thinking("c"));
-        assert_eq!(d.next_piece("c"), Some(("раз".into(), true)));
-        assert_eq!(d.next_piece("c"), Some(("два".into(), false)));
+        assert_eq!(d.next_piece("c"), Some(("Раз два три.".into(), true)));
+        assert_eq!(
+            d.next_piece("c"),
+            Some(("Четыре пять шесть.".into(), false))
+        );
         assert_eq!(d.next_piece("c"), None);
     }
 
     #[test]
-    fn foreign_reply_queues_but_keeps_turn_open() {
-        let d = Dialogs::new(Duration::from_secs(60));
-        d.start_turn("c", EventId::new());
-        d.deliver("c", None, vec!["напоминание".into()]);
-        assert!(d.is_thinking("c"));
+    fn handed_over_turn_is_pushed_and_race_is_returned_instead() {
+        let d = dialogs(60_000);
+        let id = EventId::new();
+        d.start_turn("c", id);
+        assert_eq!(d.take_or_hand_over("c"), None);
+        assert_eq!(
+            d.deliver("c", Some(id), "Ответ.".into(), true),
+            Delivery::Push("Ответ.".into())
+        );
+        assert!(!d.has_queued("c"));
+
+        // Reply landed before the request gave up: it is returned, not pushed.
+        let id = EventId::new();
+        d.start_turn("c", id);
+        assert_eq!(
+            d.deliver("c", Some(id), "Успел.".into(), true),
+            Delivery::Queued
+        );
+        assert_eq!(d.take_or_hand_over("c"), Some(("Успел.".into(), false)));
+    }
+
+    #[test]
+    fn unsolicited_reply_is_pushed_only_when_available() {
+        let d = dialogs(60_000);
+        assert_eq!(
+            d.deliver("c", None, "Напоминание.".into(), true),
+            Delivery::Push("Напоминание.".into())
+        );
+        assert_eq!(
+            d.deliver("c", None, "Напоминание.".into(), false),
+            Delivery::Queued
+        );
         assert!(d.has_queued("c"));
+        assert_eq!(d.drain("c"), "Напоминание.");
+        assert!(!d.has_queued("c"));
+    }
+
+    #[test]
+    fn handed_over_without_push_parks() {
+        let d = dialogs(60_000);
+        let id = EventId::new();
+        d.start_turn("c", id);
+        d.take_or_hand_over("c");
+        assert_eq!(
+            d.deliver("c", Some(id), "x".into(), false),
+            Delivery::Queued
+        );
+        d.park("c", "y");
+        assert_eq!(d.drain("c"), "x y");
     }
 
     #[test]
     fn new_turn_drops_stale_queue_and_ttl_expires() {
-        let d = Dialogs::new(Duration::from_millis(0));
-        d.deliver("c", None, vec!["старое".into()]);
+        let d = dialogs(0);
+        d.park("c", "старое");
         d.start_turn("c", EventId::new());
         assert!(!d.has_queued("c"));
         assert!(
@@ -145,12 +273,12 @@ mod tests {
 
     #[tokio::test]
     async fn enabled_waiter_sees_reply_delivered_before_await() {
-        let d = Dialogs::new(Duration::from_secs(60));
+        let d = dialogs(60_000);
         let notify = d.notify("c");
         let notified = notify.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        d.deliver("c", None, vec!["x".into()]);
+        d.park("c", "x");
         tokio::time::timeout(Duration::from_millis(50), notified)
             .await
             .expect("wake-up must not be lost");

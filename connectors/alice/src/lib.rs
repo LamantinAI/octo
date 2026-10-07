@@ -10,10 +10,11 @@
 //! into speech (Markdown stripped, split into ≤ `max_chars` pieces).
 //!
 //! Alice waits only ~3 s for a webhook answer, an agent turn takes longer. The
-//! request that starts a turn waits `reply_wait_ms` and, if the reply is not
-//! there yet, answers with a placeholder; the reply is parked per speaker and
-//! handed out when they say «дальше». «дальше» itself never reaches the bus —
-//! a new message would interrupt the turn still running.
+//! request that starts a turn waits `reply_wait_ms`; if the reply is not there
+//! yet it answers with a filler. With `[push]` the speaker then says the reply
+//! by itself through the Yandex cloud voice ([`quasar`]); without it the reply
+//! is parked per speaker until they say «дальше» (which never reaches the bus —
+//! a new message would interrupt the turn still running).
 //!
 //! Deliberately not handled: `chat.typing` / `chat.status` (nothing to show on
 //! a speaker) and `chat.send_file` (no way to deliver a file by voice).
@@ -21,10 +22,11 @@
 mod config;
 mod dialog;
 mod protocol;
+mod quasar;
 mod server;
 mod speech;
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use octo_core::{
@@ -32,8 +34,33 @@ use octo_core::{
     Filter, OctoResult, SubscribeOptions,
 };
 
-pub use config::{AliceConnectorFactory, Phrases, Settings, factory};
-use dialog::Dialogs;
+pub use config::{AliceConnectorFactory, Phrases, PushSettings, Settings, factory};
+use dialog::{Delivery, Dialogs};
+use quasar::Quasar;
+
+/// Something that can make the speaker talk on its own (the cloud voice; a
+/// fake in tests).
+#[async_trait]
+pub(crate) trait Voice: Send + Sync + 'static {
+    /// Say the pieces in order.
+    async fn say(&self, pieces: &[String]) -> Result<(), String>;
+    /// A one-line readiness report for the startup log.
+    async fn check(&self) -> Result<String, String>;
+}
+
+#[async_trait]
+impl Voice for Quasar {
+    async fn say(&self, pieces: &[String]) -> Result<(), String> {
+        Quasar::say(self, pieces).await.map_err(|e| e.to_string())
+    }
+
+    async fn check(&self) -> Result<String, String> {
+        self.speakers()
+            .await
+            .map(|list| format!("speakers on the account (name, id): {list:?}"))
+            .map_err(|e| e.to_string())
+    }
+}
 
 const CHAT_MESSAGE: &str = "chat.message";
 const CHAT_REPLY: &str = "chat.reply";
@@ -43,23 +70,41 @@ pub struct AliceConnector {
     capabilities: ConnectorCapabilities,
     settings: Arc<Settings>,
     dialogs: Arc<Dialogs>,
+    /// The speaker's cloud voice, when `[push]` is configured.
+    voice: Option<Arc<dyn Voice>>,
 }
 
 impl AliceConnector {
     pub fn new(id: ConnectorId, settings: Settings) -> Arc<Self> {
+        let voice = settings.push.as_ref().and_then(|p| {
+            Quasar::new(p.x_token.clone(), p.device.clone())
+                .map_err(|e| tracing::warn!(error = %e, "alice: cloud voice unavailable"))
+                .ok()
+                .map(|q| Arc::new(q) as Arc<dyn Voice>)
+        });
+        Self::with_voice(id, settings, voice)
+    }
+
+    pub(crate) fn with_voice(
+        id: ConnectorId,
+        settings: Settings,
+        voice: Option<Arc<dyn Voice>>,
+    ) -> Arc<Self> {
         let capabilities = ConnectorCapabilities::bidirectional()
             .with_emit_kinds([EventKind::from_static(CHAT_MESSAGE)])
             .with_accept_kinds([EventKind::from_static(CHAT_REPLY)]);
-        let dialogs = Arc::new(Dialogs::new(settings.turn_ttl));
+        let dialogs = Arc::new(Dialogs::new(settings.turn_ttl, settings.max_chars));
         Arc::new(Self {
             id,
             capabilities,
             settings: Arc::new(settings),
             dialogs,
+            voice,
         })
     }
 
-    /// Park an outbound reply for the speaker it is addressed to.
+    /// Route an outbound reply: pushed to the speaker's voice when its turn was
+    /// handed over (or it is an unsolicited reminder), otherwise parked.
     fn on_outbound(&self, env: &Envelope) {
         if env.kind.as_str() != CHAT_REPLY {
             return;
@@ -75,16 +120,43 @@ impl AliceConnector {
         } else {
             return;
         };
-        let room = self.settings.max_chars;
-        let pieces = speech::chunk(&spoken, room);
+        if spoken.is_empty() {
+            return;
+        }
+        let delivery = self.dialogs.deliver(
+            channel.as_str(),
+            env.correlation_id,
+            spoken,
+            self.voice.is_some(),
+        );
         tracing::info!(
             channel = channel.as_str(),
-            pieces = pieces.len(),
             correlated = env.correlation_id.is_some(),
-            "alice: reply parked"
+            pushed = matches!(delivery, Delivery::Push(_)),
+            "alice: reply arrived"
         );
-        self.dialogs
-            .deliver(channel.as_str(), env.correlation_id, pieces);
+        if let Delivery::Push(text) = delivery {
+            self.push(channel.as_str(), text, Duration::ZERO);
+        }
+    }
+
+    /// Say `text` through the speaker's cloud voice after `delay`, in pieces
+    /// it accepts. On failure the text is parked for «дальше» instead.
+    fn push(&self, channel: &str, text: String, delay: Duration) {
+        let Some(voice) = self.voice.clone() else {
+            self.dialogs.park(channel, &text);
+            return;
+        };
+        let dialogs = self.dialogs.clone();
+        let channel = channel.to_string();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let pieces = speech::chunk(&text, quasar::SAY_LIMIT);
+            if let Err(e) = voice.say(&pieces).await {
+                tracing::warn!(error = %e, "alice: cloud voice failed; reply parked for «дальше»");
+                dialogs.park(&channel, &text);
+            }
+        });
     }
 }
 
@@ -107,6 +179,15 @@ impl Connector for AliceConnector {
             )
             .await?;
 
+        if let Some(voice) = self.voice.clone() {
+            tokio::spawn(async move {
+                match voice.check().await {
+                    Ok(report) => tracing::info!("alice: cloud voice ready; {report}"),
+                    Err(e) => tracing::warn!(error = %e, "alice: cloud voice check failed"),
+                }
+            });
+        }
+
         let listener = tokio::net::TcpListener::bind(self.settings.listen).await?;
         tracing::info!(addr = %self.settings.listen, "alice: webhook listening");
         let app = server::router(server::App {
@@ -114,6 +195,7 @@ impl Connector for AliceConnector {
             settings: self.settings.clone(),
             dialogs: self.dialogs.clone(),
             ctx: ctx.clone(),
+            connector: self.clone(),
         });
         let shutdown = ctx.shutdown.clone();
         let serve = axum::serve(listener, app)

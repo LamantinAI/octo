@@ -53,6 +53,34 @@ struct AliceConfig {
     continue_words: Vec<String>,
     #[serde(default = "default_exit_words")]
     exit_words: Vec<String>,
+    /// What to say while the agent thinks (a random one each time).
+    #[serde(default = "default_fillers")]
+    fillers: Vec<String>,
+    /// The speaker's own cloud voice, so slow replies arrive by themselves.
+    push: Option<PushConfig>,
+}
+
+/// `[connector.push]` — speak late replies through the Yandex cloud voice.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PushConfig {
+    /// Env var with the Yandex x-token (one-time QR login, see README).
+    #[serde(default = "default_x_token_env")]
+    x_token_env: String,
+    /// Speaker name or id; omit when the account has one speaker.
+    device: Option<String>,
+    /// End the skill session after the filler, so the speaker is idle when
+    /// the reply is pushed (default true).
+    #[serde(default = "default_true")]
+    end_session: bool,
+}
+
+/// Resolved push settings.
+#[derive(Debug, Clone)]
+pub struct PushSettings {
+    pub x_token: String,
+    pub device: Option<String>,
+    pub end_session: bool,
 }
 
 /// Everything the connector says on its own (not the agent's words).
@@ -106,8 +134,40 @@ pub struct Settings {
     pub phrases: Phrases,
     pub continue_words: Vec<String>,
     pub exit_words: Vec<String>,
+    pub fillers: Vec<String>,
+    pub push: Option<PushSettings>,
 }
 
+impl Settings {
+    /// A filler for this moment — any of them, cheap pseudo-randomness.
+    pub fn filler(&self) -> &str {
+        if self.fillers.is_empty() {
+            return "Думаю.";
+        }
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as usize)
+            .unwrap_or(0);
+        &self.fillers[(nanos / 1000) % self.fillers.len()]
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_x_token_env() -> String {
+    "YANDEX_X_TOKEN".into()
+}
+fn default_fillers() -> Vec<String> {
+    [
+        "Думаю. Сейчас отвечу.",
+        "Секунду, соображаю.",
+        "Хороший вопрос. Минутку.",
+        "Ищу ответ, не уходите.",
+    ]
+    .map(String::from)
+    .to_vec()
+}
 fn default_listen() -> String {
     "0.0.0.0:8790".into()
 }
@@ -210,6 +270,21 @@ impl AliceConfig {
             phrases: self.phrases,
             continue_words: words(self.continue_words),
             exit_words: words(self.exit_words),
+            fillers: self.fillers.into_iter().filter(|f| !f.trim().is_empty()).collect(),
+            push: self.push.and_then(|p| match std::env::var(&p.x_token_env) {
+                Ok(x_token) if !x_token.trim().is_empty() => Some(PushSettings {
+                    x_token: x_token.trim().to_string(),
+                    device: p.device.filter(|d| !d.is_empty()),
+                    end_session: p.end_session,
+                }),
+                _ => {
+                    tracing::warn!(
+                        env = %p.x_token_env,
+                        "alice: [push] configured but the x-token env var is empty — late replies wait for «дальше»"
+                    );
+                    None
+                }
+            }),
         })
     }
 }
