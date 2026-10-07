@@ -110,6 +110,16 @@ async fn webhook(State(app): State<Arc<App>>, Path(secret): Path<String>, body: 
         return Json(AliceResponse::bye(&phrases.denied, &version)).into_response();
     };
     let channel = identity.channel();
+    if !matches!(intent, Intent::Say(_)) {
+        tracing::info!(
+            channel = %channel,
+            intent = ?intent,
+            new_session = req.session.new,
+            command = %req.request.command,
+            parked = app.dialogs.has_queued(&channel),
+            "alice: request"
+        );
+    }
 
     let answer = match intent {
         Intent::Ping => unreachable!("answered above"),
