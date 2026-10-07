@@ -2418,6 +2418,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "octo-connector-alice"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "octo-core",
+ "parking_lot",
+ "regex",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "octo-connector-browser"
 version = "0.2.0"
 dependencies = [

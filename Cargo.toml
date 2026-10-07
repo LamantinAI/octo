@@ -19,6 +19,7 @@ members = [
     "connectors/speak",
     "connectors/imagegen",
     "connectors/browser",
+    "connectors/alice",
     "octo-rig",
     "octo-code",
 ]
@@ -40,6 +41,7 @@ default-members = [
     "connectors/transcribe",
     "connectors/imagegen",
     "connectors/mail",
+    "connectors/alice",
     "octo-code",
 ]
 
