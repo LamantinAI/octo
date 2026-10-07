@@ -115,12 +115,9 @@ async fn webhook(State(app): State<Arc<App>>, Path(secret): Path<String>, body: 
         Intent::Ping => unreachable!("answered above"),
         Intent::Exit => AliceResponse::bye(&phrases.bye, &version),
         Intent::Launch => {
-            let greeting = if app.dialogs.has_queued(&channel) {
-                &phrases.greeting_pending
-            } else {
-                &phrases.greeting
-            };
-            AliceResponse::say(greeting, &version)
+            // A parked reply is said right away — this is also how the speaker
+            // reopens the skill to deliver a reply (`relaunch`).
+            speak_next(&app, &channel, &phrases.greeting, &version)
         }
         Intent::Continue => {
             if app.dialogs.has_queued(&channel) || !app.dialogs.is_thinking(&channel) {
@@ -163,6 +160,7 @@ fn handed_over(app: &App, channel: &str, version: &str) -> AliceResponse {
         }
         None => {
             let filler = app.settings.filler();
+            app.connector.start_fillers(channel, filler.to_string());
             let end = app.settings.push.as_ref().is_none_or(|p| p.end_session);
             tracing::info!(channel, "alice: turn handed over to the cloud voice");
             if end {

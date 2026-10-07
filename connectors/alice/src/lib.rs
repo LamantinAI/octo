@@ -44,6 +44,8 @@ use quasar::Quasar;
 pub(crate) trait Voice: Send + Sync + 'static {
     /// Say the pieces in order.
     async fn say(&self, pieces: &[String]) -> Result<(), String>;
+    /// Have the speaker execute a command as if it had been said to Alice.
+    async fn command(&self, command: &str) -> Result<(), String>;
     /// A one-line readiness report for the startup log.
     async fn check(&self) -> Result<String, String>;
 }
@@ -52,6 +54,12 @@ pub(crate) trait Voice: Send + Sync + 'static {
 impl Voice for Quasar {
     async fn say(&self, pieces: &[String]) -> Result<(), String> {
         Quasar::say(self, pieces).await.map_err(|e| e.to_string())
+    }
+
+    async fn command(&self, command: &str) -> Result<(), String> {
+        Quasar::command(self, command)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     async fn check(&self) -> Result<String, String> {
@@ -140,21 +148,60 @@ impl AliceConnector {
         }
     }
 
-    /// Say `text` through the speaker's cloud voice after `delay`, in pieces
-    /// it accepts. On failure the text is parked for «дальше» instead.
+    /// Deliver a finished reply through the speaker. With `relaunch` the reply
+    /// is parked and the speaker reopens the skill, whose launch request then
+    /// gets the whole reply as an ordinary answer (and the conversation stays
+    /// open); otherwise the cloud voice reads it out in pieces. `delay` lets
+    /// what the speaker is saying now finish first. On failure the reply stays
+    /// parked for the next launch / «дальше».
     fn push(&self, channel: &str, text: String, delay: Duration) {
         let Some(voice) = self.voice.clone() else {
             self.dialogs.park(channel, &text);
             return;
         };
+        let relaunch = self.settings.push.as_ref().and_then(|p| p.relaunch.clone());
         let dialogs = self.dialogs.clone();
         let channel = channel.to_string();
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
+            if let Some(command) = relaunch {
+                dialogs.park(&channel, &text);
+                if let Err(e) = voice.command(&command).await {
+                    tracing::warn!(error = %e, "alice: could not reopen the skill; reply parked for the next launch");
+                }
+                return;
+            }
             let pieces = speech::chunk(&text, quasar::SAY_LIMIT);
             if let Err(e) = voice.say(&pieces).await {
                 tracing::warn!(error = %e, "alice: cloud voice failed; reply parked for «дальше»");
                 dialogs.park(&channel, &text);
+            }
+        });
+    }
+
+    /// Keep the speaker joking while the turn handed over to it is unanswered:
+    /// a fresh filler every `filler_gap` after the previous one is said, up to
+    /// `max_fillers`. `first` is the filler the webhook already answered with.
+    fn start_fillers(&self, channel: &str, first: String) {
+        let (Some(voice), Some(push)) = (self.voice.clone(), self.settings.push.clone()) else {
+            return;
+        };
+        let settings = self.settings.clone();
+        let dialogs = self.dialogs.clone();
+        let channel = channel.to_string();
+        tokio::spawn(async move {
+            let mut last = first;
+            for _ in 0..push.max_fillers {
+                tokio::time::sleep(quasar::speaking_time(&last) + push.filler_gap).await;
+                if !dialogs.awaiting_push(&channel) {
+                    return;
+                }
+                let next = settings.filler_except(&last).to_string();
+                if let Err(e) = voice.say(std::slice::from_ref(&next)).await {
+                    tracing::warn!(error = %e, "alice: filler failed; stopping fillers");
+                    return;
+                }
+                last = next;
             }
         });
     }

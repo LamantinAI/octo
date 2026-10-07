@@ -90,13 +90,29 @@ impl Quasar {
     /// Say `pieces` (each ≤ [`SAY_LIMIT`]) one after another on the speaker.
     /// Serialised: concurrent calls queue behind each other.
     pub async fn say(&self, pieces: &[String]) -> Result<()> {
+        for piece in pieces {
+            self.run(Action::Say(piece), speaking_time(piece)).await?;
+        }
+        Ok(())
+    }
+
+    /// Have the speaker execute `command` as if it had been said to Alice
+    /// ("запусти навык …"). Queued behind anything still being said.
+    pub async fn command(&self, command: &str) -> Result<()> {
+        self.run(Action::Command(command), Duration::from_secs(2))
+            .await
+    }
+
+    /// Rewrite the speaker's scenario with `action` and launch it, after the
+    /// previous utterance; `busy` estimates how long this one keeps it busy.
+    async fn run(&self, action: Action<'_>, busy: Duration) -> Result<()> {
         let mut state = self.state.lock().await;
         let target = self.target(&mut state).await?;
-        for piece in pieces {
+        {
             if let Some(until) = state.busy_until {
                 tokio::time::sleep_until(until.into()).await;
             }
-            let scenario = tts_scenario(&target.device_id, piece);
+            let scenario = scenario(&target.device_id, action);
             self.call(
                 &mut state,
                 reqwest::Method::PUT,
@@ -111,7 +127,7 @@ impl Quasar {
                 None,
             )
             .await?;
-            state.busy_until = Some(Instant::now() + speaking_time(piece));
+            state.busy_until = Some(Instant::now() + busy);
         }
         Ok(())
     }
@@ -168,7 +184,7 @@ impl Quasar {
                         state,
                         reqwest::Method::POST,
                         &format!("{QUASAR}/v4/user/scenarios"),
-                        Some(&tts_scenario(&device_id, "пустышка")),
+                        Some(&scenario(&device_id, Action::Say("пустышка"))),
                     )
                     .await?;
                 created["scenario_id"]
@@ -363,7 +379,26 @@ fn pick(all: &[(String, String)], wanted: Option<&str>) -> Result<String> {
     }
 }
 
-fn tts_scenario(device_id: &str, text: &str) -> Value {
+/// What the speaker's scenario does when launched.
+#[derive(Debug, Clone, Copy)]
+enum Action<'a> {
+    /// Say the text (cloud TTS, ≤ [`SAY_LIMIT`] characters).
+    Say(&'a str),
+    /// Execute the text as a spoken command to Alice.
+    Command(&'a str),
+}
+
+fn scenario(device_id: &str, action: Action<'_>) -> Value {
+    let capability = match action {
+        Action::Say(text) => json!({
+            "type": "devices.capabilities.quasar",
+            "state": {"instance": "tts", "value": {"text": text}},
+        }),
+        Action::Command(text) => json!({
+            "type": "devices.capabilities.quasar.server_action",
+            "state": {"instance": "text_action", "value": text},
+        }),
+    };
     json!({
         "name": format!("octo alice {device_id}"),
         "icon": "home",
@@ -376,10 +411,7 @@ fn tts_scenario(device_id: &str, text: &str) -> Value {
                 "value": {
                     "id": device_id,
                     "item_type": "device",
-                    "capabilities": [{
-                        "type": "devices.capabilities.quasar",
-                        "state": {"instance": "tts", "value": {"text": text}},
-                    }],
+                    "capabilities": [capability],
                 },
             }]},
         }],
@@ -389,6 +421,15 @@ fn tts_scenario(device_id: &str, text: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_scenario_uses_text_action() {
+        let s = scenario("ab", Action::Command("запусти навык Помощник Альберт"));
+        let cap = &s["steps"][0]["parameters"]["items"][0]["value"]["capabilities"][0];
+        assert_eq!(cap["type"], "devices.capabilities.quasar.server_action");
+        assert_eq!(cap["state"]["instance"], "text_action");
+        assert_eq!(cap["state"]["value"], "запусти навык Помощник Альберт");
+    }
 
     #[test]
     fn encodes_device_id_in_russian_letters() {
@@ -413,7 +454,7 @@ mod tests {
 
     #[test]
     fn scenario_carries_text_and_trigger() {
-        let s = tts_scenario("ab", "привет");
+        let s = scenario("ab", Action::Say("привет"));
         assert_eq!(s["triggers"][0]["trigger"]["value"], "км");
         assert_eq!(
             s["steps"][0]["parameters"]["items"][0]["value"]["capabilities"][0]["state"]["value"]["text"],

@@ -41,6 +41,9 @@ max_chars = 900
 # x_token_env = "YANDEX_X_TOKEN"
 # device = "Яндекс Станция"   # name or id; omit if the account has one speaker
 # end_session = true          # the speaker goes idle after the filler
+# relaunch = "запусти навык <skill name>"   # deliver the reply whole by reopening the skill
+# filler_every_secs = 5       # pause between fillers while the agent thinks
+# max_fillers = 12
 
 # Optional overrides of what the connector says on its own:
 # [connector.phrases]

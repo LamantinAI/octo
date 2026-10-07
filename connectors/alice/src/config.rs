@@ -73,6 +73,17 @@ struct PushConfig {
     /// the reply is pushed (default true).
     #[serde(default = "default_true")]
     end_session: bool,
+    /// The command that opens this skill on the speaker ("запусти навык
+    /// <name>"). When set, a finished reply is not read out piecewise by the
+    /// cloud voice: the speaker reopens the skill and the reply comes back
+    /// whole as the skill's answer, with the conversation still open.
+    relaunch: Option<String>,
+    /// Seconds of silence between fillers while the agent is still thinking.
+    #[serde(default = "default_filler_every_secs")]
+    filler_every_secs: u64,
+    /// Stop joking after this many fillers (the reply still comes).
+    #[serde(default = "default_max_fillers")]
+    max_fillers: usize,
 }
 
 /// Resolved push settings.
@@ -81,6 +92,9 @@ pub struct PushSettings {
     pub x_token: String,
     pub device: Option<String>,
     pub end_session: bool,
+    pub relaunch: Option<String>,
+    pub filler_gap: Duration,
+    pub max_fillers: usize,
 }
 
 /// Everything the connector says on its own (not the agent's words).
@@ -141,6 +155,11 @@ pub struct Settings {
 impl Settings {
     /// A filler for this moment — any of them, cheap pseudo-randomness.
     pub fn filler(&self) -> &str {
+        self.filler_except("")
+    }
+
+    /// A filler other than `previous` (when there is more than one).
+    pub fn filler_except(&self, previous: &str) -> &str {
         if self.fillers.is_empty() {
             return "Думаю.";
         }
@@ -148,10 +167,20 @@ impl Settings {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos() as usize)
             .unwrap_or(0);
-        &self.fillers[(nanos / 1000) % self.fillers.len()]
+        let mut i = (nanos / 1000) % self.fillers.len();
+        if self.fillers.len() > 1 && self.fillers[i] == previous {
+            i = (i + 1) % self.fillers.len();
+        }
+        &self.fillers[i]
     }
 }
 
+fn default_filler_every_secs() -> u64 {
+    5
+}
+fn default_max_fillers() -> usize {
+    12
+}
 fn default_true() -> bool {
     true
 }
@@ -276,6 +305,9 @@ impl AliceConfig {
                     x_token: x_token.trim().to_string(),
                     device: p.device.filter(|d| !d.is_empty()),
                     end_session: p.end_session,
+                    relaunch: p.relaunch.filter(|r| !r.trim().is_empty()),
+                    filler_gap: Duration::from_secs(p.filler_every_secs.clamp(1, 60)),
+                    max_fillers: p.max_fillers,
                 }),
                 _ => {
                     tracing::warn!(

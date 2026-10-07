@@ -27,10 +27,14 @@ Alice waits about 3 seconds for a webhook. A request that starts a turn waits up
 to `reply_wait_ms`; a reply that is in by then is spoken right away.
 
 **With `[connector.push]`** (recommended): otherwise the request answers with a
-random `fillers` phrase and ends the session; when the reply comes, the speaker
-says it by itself through the Yandex smart-home cloud ("произнести текст" in a
-scenario — the same mechanism the Home Assistant integration AlexxIT/YandexStation
-uses). That path is not a public API: it needs an x-token of the Yandex account
+random `fillers` phrase and ends the session, and the speaker keeps joking — a new
+filler every `filler_every_secs` after the previous one, up to `max_fillers` — until
+the reply is in. Then, with `relaunch = "запусти навык <name>"`, the speaker reopens
+the skill by itself and the launch request gets the **whole** reply as the skill's
+answer, conversation still open; without `relaunch` the reply is read out by the
+cloud voice in ≤ 100-character pieces. Both go through the Yandex smart-home cloud
+(a scenario whose action is "произнести текст" or a text command — the mechanism
+the Home Assistant integration AlexxIT/YandexStation uses). That path is not a public API: it needs an x-token of the Yandex account
 that owns the speaker (one-time QR login: `tools/yandex_qr_login.py`), takes at most
 100 characters per utterance (longer text is said in a row of pieces, paced by an
 estimate — the cloud reports no playback state), and may change without notice.
