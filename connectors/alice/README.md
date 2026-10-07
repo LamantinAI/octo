@@ -29,9 +29,11 @@ to `reply_wait_ms`; a reply that is in by then is spoken right away.
 **With `[connector.push]`** (recommended): otherwise the request answers with a
 random `fillers` phrase and ends the session, and the speaker keeps joking — a new
 filler every `filler_every_secs` after the previous one, up to `max_fillers` — until
-the reply is in. Then, with `relaunch = "запусти навык <name>"`, the speaker reopens
-the skill by itself and the launch request gets the **whole** reply as the skill's
-answer, conversation still open; without `relaunch` the reply is read out by the
+the reply is in. Then, with `relaunch`, the speaker reopens the skill by itself and the
+request gets the **whole** reply as the skill's answer, conversation still open.
+Phrase it as an activation *with a request* — `"попроси <name> дальше"` — so the
+skill opens straight on «дальше» (which hands over the parked reply); a bare
+`"запусти навык <name>"` makes Alice announce «Запускаю навык…» first; without `relaunch` the reply is read out by the
 cloud voice in ≤ 100-character pieces. Both go through the Yandex smart-home cloud
 (a scenario whose action is "произнести текст" or a text command — the mechanism
 the Home Assistant integration AlexxIT/YandexStation uses). That path is not a public API: it needs an x-token of the Yandex account
@@ -45,6 +47,10 @@ call fails, the text is parked as below.
 speaker until they say one of `continue_words` («дальше»); long replies come one
 piece per «дальше». Continue words never reach the bus — a new message would
 interrupt the running turn.
+
+Long filler lists go in a text file next to the manifest — `fillers_file =
+"fillers.txt"`, one per line, `#` comments allowed, each ≤ 100 characters (the cloud
+voice's limit; a longer line fails the manifest).
 
 ## Access
 

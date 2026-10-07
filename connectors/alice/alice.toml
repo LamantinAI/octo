@@ -34,6 +34,7 @@ max_chars = 900
 
 # What to say while the agent thinks (random each time).
 # fillers = ["Думаю. Сейчас отвечу.", "Секунду, соображаю."]
+# fillers_file = "fillers.txt"   # or a file next to this manifest, one per line
 
 # The speaker's own voice for replies that miss the ~3 s window (and for
 # reminders). Needs the account's x-token: uv run tools/yandex_qr_login.py.
@@ -41,7 +42,8 @@ max_chars = 900
 # x_token_env = "YANDEX_X_TOKEN"
 # device = "Яндекс Станция"   # name or id; omit if the account has one speaker
 # end_session = true          # the speaker goes idle after the filler
-# relaunch = "запусти навык <skill name>"   # deliver the reply whole by reopening the skill
+# relaunch = "попроси <skill name> дальше"  # deliver the reply whole by reopening the skill
+#                                           # (not "запусти навык …": Alice announces that)
 # filler_every_secs = 5       # pause between fillers while the agent thinks
 # max_fillers = 12
 
