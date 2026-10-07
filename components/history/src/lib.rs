@@ -9,6 +9,9 @@
 //! on any model library. Converting a `Turn` into a particular chat-message type
 //! (e.g. `rig::completion::Message`) belongs in the binding layer, not here.
 
+mod context;
+pub use context::{Compact, ContextWindow, StoredTurn};
+
 use std::{collections::HashMap, path::PathBuf, sync::Mutex};
 
 use async_trait::async_trait;
@@ -32,6 +35,9 @@ pub enum HistoryError {
 
     #[error("history db: {0}")]
     Db(String),
+
+    #[error("history backend does not support retained context")]
+    ContextUnsupported,
 }
 
 pub type Result<T> = std::result::Result<T, HistoryError>;
@@ -69,6 +75,23 @@ impl Turn {
 /// Pluggable per-channel history backend (in-memory / file / redis / …).
 #[async_trait]
 pub trait HistoryStore: Send + Sync {
+    fn retains_context(&self) -> bool {
+        false
+    }
+    async fn context(&self, _channel: &str) -> Result<ContextWindow> {
+        Err(HistoryError::ContextUnsupported)
+    }
+    /// Compare-and-swap the previous checkpoint; messages appended after the
+    /// snapshot boundary remain visible. False means a competing compact won.
+    async fn save_compact(
+        &self,
+        _channel: &str,
+        _previous_id: Option<i64>,
+        _through_id: i64,
+        _content: &str,
+    ) -> Result<bool> {
+        Err(HistoryError::ContextUnsupported)
+    }
     /// All stored turns for a channel, oldest → newest.
     async fn load(&self, channel: &str) -> Vec<Turn>;
     /// Append turns to a channel, trimming to the backend's cap.
