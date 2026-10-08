@@ -19,8 +19,8 @@
 //!
 //! # Runtime: a Chrome binary
 //!
-//! With no `executable` in the manifest, the `fetcher` feature downloads a pinned
-//! Chrome-for-Testing on first fetch into `data_dir` (NOT the default `~/.cache`, which
+//! With no `executable` in the manifest, the `fetcher` feature downloads a managed
+//! stable Chrome-for-Testing on first fetch into `data_dir` (NOT the default `~/.cache`, which
 //! systemd `ProtectHome` blocks). Chrome's profile lives under `data_dir` too. Set
 //! `executable` to point at a pre-provisioned Chrome instead.
 //!
@@ -31,7 +31,11 @@
 //! systemd `ProtectHome`) makes Chrome crash on startup with `SIGTRAP`. Point the
 //! service's `HOME` at a writable dir (the deploy sets `Environment=HOME=…`).
 
+mod provisioning;
+
 use std::{path::PathBuf, sync::Arc, time::Duration};
+
+use provisioning::{ChromeCache, ChromeSettings};
 
 use async_trait::async_trait;
 use octo_core::{
@@ -40,8 +44,9 @@ use octo_core::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
-use zendriver::{Browser, Fetcher};
+use tokio::{sync::Mutex, time::timeout};
+use tracing::{info, warn};
+use zendriver::Browser;
 
 const FETCH: &str = "browser.fetch";
 
@@ -61,6 +66,7 @@ pub struct BrowserConnector {
     data_dir: PathBuf,
     /// Explicit Chrome binary; `None` → download via the fetcher into `data_dir`.
     executable: Option<PathBuf>,
+    chrome: ChromeCache,
     headless: bool,
     /// `false` passes `--no-sandbox` (Chrome's own sandbox needs privileges the service
     /// doesn't have; the OS/systemd is the outer boundary).
@@ -88,8 +94,9 @@ impl BrowserConnector {
         Arc::new(Self {
             id: ConnectorId::new(id),
             capabilities,
-            data_dir,
+            data_dir: data_dir.clone(),
             executable,
+            chrome: ChromeCache::new(data_dir.join("chrome"), ChromeSettings::default()),
             headless,
             sandbox,
             default_timeout,
@@ -113,13 +120,27 @@ impl BrowserConnector {
     async fn launch(&self) -> Result<Browser, String> {
         let exe = match &self.executable {
             Some(path) => path.clone(),
-            None => Fetcher::new()
-                .cache_dir(self.data_dir.join("chrome"))
-                .ensure_chrome()
-                .await
-                .map_err(|e| format!("chrome download failed: {e}"))?,
+            None => self.chrome.executable().await?,
         };
-        tracing::info!(connector = %self.id, exe = %exe.display(), "browser: launching chrome");
+        info!(connector = %self.id, exe = %exe.display(), "browser: launching chrome");
+        let browser = match self.launch_binary(exe).await {
+            Ok(browser) => browser,
+            Err(error) => {
+                let Some(previous) = self.chrome.fallback().filter(|_| self.executable.is_none())
+                else {
+                    return Err(error);
+                };
+                warn!(%error, "new Chrome failed to launch; retrying previous working build");
+                self.launch_binary(previous).await?
+            }
+        };
+        if self.executable.is_none() {
+            self.chrome.prune().await;
+        }
+        Ok(browser)
+    }
+
+    async fn launch_binary(&self, exe: PathBuf) -> Result<Browser, String> {
         Browser::builder()
             .executable(exe)
             .headless(self.headless)
@@ -136,7 +157,10 @@ impl BrowserConnector {
     /// Drop the cached browser so the next fetch relaunches (called after a fetch error,
     /// which usually means Chrome died).
     async fn reset(&self) {
-        *self.browser.lock().await = None;
+        let browser = self.browser.lock().await.take();
+        if let Some(browser) = browser {
+            let _ = timeout(Duration::from_secs(5), browser.close()).await;
+        }
     }
 
     async fn run_fetch(&self, params: Value) -> Value {
@@ -148,7 +172,7 @@ impl BrowserConnector {
         if url.is_empty() {
             return json!({ "status": "error", "error": "`url` is required" });
         }
-        let timeout = args
+        let deadline = args
             .timeout_secs
             .map(|s| Duration::from_secs(s.max(1)))
             .unwrap_or(self.default_timeout)
@@ -159,17 +183,22 @@ impl BrowserConnector {
             Err(e) => return json!({ "status": "error", "url": url, "error": e }),
         };
 
-        match tokio::time::timeout(timeout, fetch_page(&browser, url, args.html)).await {
-            Ok(Ok(mut page)) => {
+        match fetch_page(&browser, url, args.html, deadline).await {
+            Ok(mut page) => {
                 page["status"] = json!("ok");
                 page
             }
-            Ok(Err(e)) => {
-                self.reset().await; // a failed fetch usually means Chrome died — relaunch next time
-                json!({ "status": "error", "url": url, "error": e })
-            }
-            Err(_) => {
-                json!({ "status": "timeout", "url": url, "error": format!("no load in {}s", timeout.as_secs()) })
+            Err(e) => {
+                if e == "open tab timeout"
+                    || e.starts_with("close tab:")
+                    || !matches!(
+                        timeout(Duration::from_secs(5), browser.version()).await,
+                        Ok(Ok(_))
+                    )
+                {
+                    self.reset().await;
+                }
+                json!({ "status": if e.ends_with("timeout") { "timeout" } else { "error" }, "url": url, "error": e })
             }
         }
     }
@@ -183,12 +212,12 @@ impl BrowserConnector {
         let url = out.get("url").and_then(|v| v.as_str()).unwrap_or("");
         let status = out.get("status").and_then(|v| v.as_str()).unwrap_or("");
         if status == "ok" {
-            tracing::info!(url, status, "browser fetch done");
+            info!(url, status, "browser fetch done");
         } else {
             // Surface WHY: a failed launch/navigate would otherwise be invisible here
             // (the reason only rides in the result payload back to the model).
             let error = out.get("error").and_then(|v| v.as_str()).unwrap_or("");
-            tracing::warn!(url, status, error, "browser fetch failed");
+            warn!(url, status, error, "browser fetch failed");
         }
         let resp = Envelope::new(
             self.id.clone(),
@@ -197,7 +226,7 @@ impl BrowserConnector {
         )
         .with_correlation(env.id);
         if let Err(e) = ctx.publish(resp).await {
-            tracing::warn!(error = %e, "browser failed to publish result");
+            warn!(error = %e, "browser failed to publish result");
         }
     }
 }
@@ -213,18 +242,26 @@ struct FetchArgs {
 
 /// Render one page in a fresh tab and pull out title / visible text / (optional) HTML.
 /// The tab is always closed, even on error.
-async fn fetch_page(browser: &Browser, url: &str, want_html: bool) -> Result<Value, String> {
-    let tab = browser
-        .new_tab()
+async fn fetch_page(
+    browser: &Browser,
+    url: &str,
+    want_html: bool,
+    deadline: Duration,
+) -> Result<Value, String> {
+    let tab = timeout(deadline, browser.new_tab())
         .await
+        .map_err(|_| "open tab timeout".to_owned())?
         .map_err(|e| format!("open tab: {e}"))?;
-    let extracted = async {
+    let extracted = timeout(deadline, async {
         tab.goto(url).await.map_err(|e| format!("navigate: {e}"))?;
+        tab.wait_for_load()
+            .await
+            .map_err(|e| format!("load: {e}"))?;
         let title: String = tab.evaluate("document.title").await.unwrap_or_default();
         let text: String = tab
             .evaluate("document.body ? document.body.innerText : ''")
             .await
-            .unwrap_or_default();
+            .map_err(|e| format!("extract text: {e}"))?;
         let final_url: String = tab
             .evaluate("location.href")
             .await
@@ -235,16 +272,20 @@ async fn fetch_page(browser: &Browser, url: &str, want_html: bool) -> Result<Val
             None
         };
         Ok::<_, String>((title, text, final_url, html))
-    }
+    })
     .await;
-    let _ = tab.close().await; // best-effort; don't mask the real error
+    timeout(Duration::from_secs(5), tab.close())
+        .await
+        .map_err(|_| "close tab: timeout".to_owned())?
+        .map_err(|e| format!("close tab: {e}"))?;
 
-    let (title, text, final_url, html) = extracted?;
+    let (title, text, final_url, html) = extracted.map_err(|_| "page timeout".to_owned())??;
     let mut out = json!({
         "url": url,
         "final_url": final_url,
         "title": collapse_ws(&title),
         "text": text.trim(),
+        "extraction_status": if text.trim().is_empty() { "empty" } else { "text" },
     });
     if let Some(html) = html {
         out["html"] = json!(html);
@@ -275,7 +316,7 @@ impl Connector for BrowserConnector {
             .await?;
         // Chrome is launched lazily on the first fetch (the download, if any, happens
         // then), so startup stays fast and a browser is only paid for when used.
-        tracing::info!(connector = %self.id, data_dir = %self.data_dir.display(), "browser ready (chrome launches on first fetch)");
+        info!(connector = %self.id, data_dir = %self.data_dir.display(), "browser ready (chrome launches on first fetch)");
         loop {
             tokio::select! {
                 next = cmds.next() => match next {
@@ -356,7 +397,9 @@ impl ConnectorFactory for BrowserConnectorFactory {
                 .unwrap_or(90)
                 .max(1) as u64,
         );
-        Ok(BrowserConnector::new(
+        let settings: ChromeSettings = table.clone().try_into()?;
+        settings.validate()?;
+        let mut connector = BrowserConnector::new(
             id.as_str(),
             data_dir,
             executable,
@@ -364,7 +407,10 @@ impl ConnectorFactory for BrowserConnectorFactory {
             sandbox,
             default_timeout,
             max_timeout,
-        ))
+        );
+        let cache = ChromeCache::new(connector.data_dir.join("chrome"), settings);
+        Arc::get_mut(&mut connector).unwrap().chrome = cache;
+        Ok(connector)
     }
 }
 
@@ -394,20 +440,60 @@ mod tests {
             Duration::from_secs(90),
         );
         let out = conn
-            .run_fetch(json!({ "url": "https://example.com" }))
+            .run_fetch(json!({ "url": "data:text/html,<title>Browser fixture</title><body><script>document.body.append('rendered evidence')</script>" }))
             .await;
         println!("{}", serde_json::to_string_pretty(&out).unwrap());
         assert_eq!(out["status"], "ok", "fetch should succeed");
         assert!(
-            out["title"].as_str().unwrap_or("").contains("Example"),
+            out["title"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Browser fixture"),
             "title: {out}"
         );
         assert!(
             out["text"]
                 .as_str()
                 .unwrap_or("")
-                .contains("Example Domain"),
+                .contains("rendered evidence"),
             "text should carry the page body"
         );
+
+        let browser = conn.browser().await.unwrap();
+        let before: Vec<_> = browser
+            .tabs()
+            .await
+            .iter()
+            .map(|t| t.target_id().to_owned())
+            .collect();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let timed = conn.run_fetch(json!({"url":url,"timeout_secs":1})).await;
+        assert_eq!(timed["status"], "timeout", "{timed}");
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if browser
+                    .tabs()
+                    .await
+                    .iter()
+                    .all(|t| before.iter().any(|id| id == t.target_id()))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timeout must close its new tab");
+        assert!(
+            conn.browser.lock().await.is_some(),
+            "page timeout must preserve healthy Chrome"
+        );
+        server.abort();
+        let _ = browser.close().await;
     }
 }
