@@ -157,7 +157,10 @@ impl BrowserConnector {
     /// Drop the cached browser so the next fetch relaunches (called after a fetch error,
     /// which usually means Chrome died).
     async fn reset(&self) {
-        *self.browser.lock().await = None;
+        let browser = self.browser.lock().await.take();
+        if let Some(browser) = browser {
+            let _ = timeout(Duration::from_secs(5), browser.close()).await;
+        }
     }
 
     async fn run_fetch(&self, params: Value) -> Value {
@@ -186,13 +189,16 @@ impl BrowserConnector {
                 page
             }
             Err(e) => {
-                if !matches!(
-                    timeout(Duration::from_secs(5), browser.version()).await,
-                    Ok(Ok(_))
-                ) {
+                if e == "open tab timeout"
+                    || e.starts_with("close tab:")
+                    || !matches!(
+                        timeout(Duration::from_secs(5), browser.version()).await,
+                        Ok(Ok(_))
+                    )
+                {
                     self.reset().await;
                 }
-                json!({ "status": if e == "page timeout" { "timeout" } else { "error" }, "url": url, "error": e })
+                json!({ "status": if e.ends_with("timeout") { "timeout" } else { "error" }, "url": url, "error": e })
             }
         }
     }
@@ -244,7 +250,7 @@ async fn fetch_page(
 ) -> Result<Value, String> {
     let tab = timeout(deadline, browser.new_tab())
         .await
-        .map_err(|_| "page timeout".to_owned())?
+        .map_err(|_| "open tab timeout".to_owned())?
         .map_err(|e| format!("open tab: {e}"))?;
     let extracted = timeout(deadline, async {
         tab.goto(url).await.map_err(|e| format!("navigate: {e}"))?;
@@ -268,7 +274,10 @@ async fn fetch_page(
         Ok::<_, String>((title, text, final_url, html))
     })
     .await;
-    let _ = timeout(Duration::from_secs(5), tab.close()).await; // best-effort; don't mask the real error
+    timeout(Duration::from_secs(5), tab.close())
+        .await
+        .map_err(|_| "close tab: timeout".to_owned())?
+        .map_err(|e| format!("close tab: {e}"))?;
 
     let (title, text, final_url, html) = extracted.map_err(|_| "page timeout".to_owned())??;
     let mut out = json!({
