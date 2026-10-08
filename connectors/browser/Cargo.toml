@@ -17,6 +17,11 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 toml = { workspace = true }
+reqwest = { workspace = true }
+fs2 = "0.4"
 # zendriver — Rust-native stealth browser over CDP (drives real Chrome). `fetcher`
-# auto-provisions a pinned Chrome-for-Testing so no system chromium is required.
+# auto-provisions a managed Chrome-for-Testing so no system chromium is required.
 zendriver = { version = "0.4", features = ["fetcher"] }
+
+[dev-dependencies]
+tempfile = "3"
