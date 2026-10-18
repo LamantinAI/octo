@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "octo-core",
     "components/history",
+    "components/approval",
     "components/http-auth",
     "components/workspace",
     "components/openai-auth",
@@ -12,6 +13,7 @@ members = [
     "connectors/scheduler",
     "connectors/caldav",
     "connectors/storage",
+    "connectors/sql",
     "connectors/forkd",
     "connectors/mail",
     "connectors/search",
@@ -69,3 +71,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 toml = "0.8"
 teloxide = "0.17"
 base64 = "0.22"
+
+# SQLite connector: one native SQLite binding version shared with SQLx.
+sqlx = { version = "=0.8.6", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "sqlite-preupdate-hook"] }
+libsqlite3-sys = { version = "=0.30.1", features = ["bundled", "preupdate_hook"] }
+sqlparser = "=0.63.0"
+rand = "0.8"
+sha2 = "0.10"

@@ -10,6 +10,7 @@ description = "A rig Tool bridging rig's native tool-calling to the Octo connect
 
 [dependencies]
 octo-core = { path = "../octo-core" }
+octo-approval = { path = "../components/approval" }
 octo-code = { path = "../octo-code", optional = true }
 rig-core = "0.35"
 serde = { workspace = true }

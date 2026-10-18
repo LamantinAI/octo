@@ -27,6 +27,7 @@
 
 mod acl;
 mod api;
+mod approval;
 mod batch;
 mod commands;
 mod format;
@@ -39,9 +40,10 @@ use std::{
     time::Duration,
 };
 
+use octo_approval::Authority;
 use octo_core::{ConnectorCapabilities, ConnectorId, EventKind};
 
-use crate::commands::SET_COMMANDS;
+use crate::{approval::CardSettings, commands::SET_COMMANDS};
 
 use self::source::{CommandCatalog, GroupSettings};
 pub use acl::{Acl, AclEntry, GroupMode, Role};
@@ -60,7 +62,7 @@ use self::{
     },
     outbound::{Outbound, is_voice_blob, outbound_kind},
 };
-pub use config::{TelegramConnectorFactory, factory};
+pub use config::{TelegramConnectorFactory, factory, factory_with_authority};
 
 /// Default quiet window before a coalescing burst (album / forward) is flushed.
 /// Short, because these bursts arrive machine-fast; single typed messages are
@@ -153,6 +155,9 @@ pub struct TelegramConnector {
     workspace: Option<PathBuf>,
     groups: GroupSettings,
     commands: Arc<RwLock<CommandCatalog>>,
+    authority: Option<Authority>,
+    approval_timeout: Duration,
+    approval_cards: CardSettings,
 }
 
 impl TelegramConnector {
@@ -221,6 +226,9 @@ impl TelegramConnector {
             workspace,
             groups: GroupSettings::default(),
             commands: Arc::new(RwLock::new(CommandCatalog::default())),
+            authority: None,
+            approval_timeout: Duration::from_secs(30),
+            approval_cards: CardSettings::default(),
         })
     }
 }

@@ -13,6 +13,7 @@
 //! See `runtime_architecture` and `envelope_decision` vault drafts.
 
 pub mod blob;
+mod context;
 pub mod kind;
 pub mod message;
 pub mod metadata;
@@ -22,6 +23,7 @@ pub mod stream;
 pub mod trail;
 
 pub use blob::Blob;
+pub use context::EnvelopeContext;
 pub use kind::EventKind;
 pub use message::InboundMessage;
 pub use metadata::{ChannelMetadata, Priority, ReplyChannel, TrustLevel};
@@ -88,6 +90,9 @@ pub struct Envelope {
     /// tells the subscriber where in the sequence the chunk sits.
     /// See [`stream`] module docs for the full protocol.
     pub stream: Option<StreamFrame>,
+
+    /// In-process host extensions. These values have no JSON representation.
+    pub context: EnvelopeContext,
 }
 
 impl Envelope {
@@ -112,6 +117,7 @@ impl Envelope {
             tags: HashMap::new(),
             channel_metadata: None,
             stream: None,
+            context: EnvelopeContext::default(),
         }
     }
 
@@ -132,11 +138,17 @@ impl Envelope {
             tags: HashMap::new(),
             channel_metadata: None,
             stream: None,
+            context: EnvelopeContext::default(),
         }
     }
 
     pub fn with_target(mut self, target: ConnectorId) -> Self {
         self.target = Some(target);
+        self
+    }
+
+    pub fn with_context<T: Any + Send + Sync>(mut self, value: T) -> Self {
+        self.context.insert(value);
         self
     }
 

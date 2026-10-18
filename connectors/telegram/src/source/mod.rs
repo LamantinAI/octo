@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use octo_approval::Ingress;
 use octo_core::{ChannelMetadata, Envelope, TrustLevel};
 use serde_json::Value;
 use teloxide::types::{Message, MessageEntityKind, UserId};
@@ -43,6 +44,7 @@ impl CommandCatalog {
 #[derive(Clone, Debug, Default)]
 pub(super) struct MessageSource {
     pub tags: HashMap<String, String>,
+    pub proof: Option<Ingress>,
 }
 
 impl MessageSource {
@@ -52,10 +54,22 @@ impl MessageSource {
             .get_or_insert_with(ChannelMetadata::new)
             .tags
             .extend(self.tags);
+        if let Some(proof) = self.proof {
+            envelope = envelope.with_context(proof);
+        }
         envelope
     }
 
     pub fn merge(&mut self, next: Self) {
+        self.proof = match (&self.proof, &next.proof) {
+            (Some(previous), Some(current))
+                if previous.origin().principal == current.origin().principal
+                    && previous.origin().conversation == current.origin().conversation =>
+            {
+                next.proof.clone()
+            }
+            _ => None,
+        };
         // Album captions may mention the bot only on the first photo.
         let addressed = self.tags.get("addressed").is_some_and(|s| s == "true")
             || next.tags.get("addressed").is_some_and(|s| s == "true");
@@ -250,7 +264,7 @@ pub(super) fn perceive(
             acl.group_mode(message.chat.id.0).as_str().into(),
         );
     }
-    Some((trust, MessageSource { tags }))
+    Some((trust, MessageSource { tags, proof: None }))
 }
 
 #[cfg(test)]

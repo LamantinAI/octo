@@ -29,6 +29,7 @@ use super::{
     outbound::{is_voice_blob, send_reply},
 };
 use crate::{
+    approval::{Cards, handle_decision, message_proof},
     batch::{Batcher, Emit, Flush},
     commands::{SET_COMMANDS, set_commands},
     fs::{save_incoming, workspace_root},
@@ -57,6 +58,8 @@ impl Connector for TelegramConnector {
         let username = me.username().to_string();
         let bot_id = me.user.id;
 
+        let cards = Cards::new(self.approval_cards.clone());
+        let out_cards = cards.clone();
         // ── Outbound: chat.reply → Telegram message ──────────────────────────
         let mut replies = ctx
             .subscribe(
@@ -132,6 +135,8 @@ impl Connector for TelegramConnector {
                                 _ => {}
                             }
 
+                            if out_cards.present(&out_bot,&out_id,&out_acl,&env).await {continue;}
+
                             // The turn's reply is going out — stop typing, delete
                             // the status trace.
                             live.end_turn(&out_bot, chat_id);
@@ -170,7 +175,11 @@ impl Connector for TelegramConnector {
         flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut listener = Polling::builder(bot.clone())
             .timeout(Duration::from_secs(10))
-            .allowed_updates(vec![AllowedUpdate::Message, AllowedUpdate::MyChatMember])
+            .allowed_updates(vec![
+                AllowedUpdate::Message,
+                AllowedUpdate::MyChatMember,
+                AllowedUpdate::CallbackQuery,
+            ])
             .delete_webhook()
             .await
             .build();
@@ -190,6 +199,10 @@ impl Connector for TelegramConnector {
                         if let UpdateKind::MyChatMember(change) = &update.kind {
                             register_add(&self.acl, &groups, change);
                         }
+                        if let UpdateKind::CallbackQuery(query)=update.kind {
+                            cards.callback(&bot,&self.id,&self.acl,&self.authority,query,&ctx,self.approval_timeout).await;
+                            continue;
+                        }
                         if let UpdateKind::Message(msg) = update.kind {
                             if migrate(&self.acl, &msg) { continue; }
                             let chat = msg.chat.id.0.to_string();
@@ -197,10 +210,14 @@ impl Connector for TelegramConnector {
                                 let acl = self.acl.as_ref().map(|state| state.acl.read().unwrap());
                                 perceive(&msg, acl.as_deref(), &groups, bot_id, &username, &self.commands.read().unwrap())
                             };
-                            let Some((trust, source)) = perception else {
+                            let Some((trust, mut source)) = perception else {
                                 tracing::warn!(%chat, "telegram: chat or sender denied");
                                 continue;
                             };
+                            source.proof = self.authority.as_ref().and_then(|authority|
+                                message_proof(authority, &self.id, &msg, trust.map(|t| t.0)));
+                            if handle_decision(&self.authority, source.proof.as_ref(), &bot,
+                                &self.id, &msg, &username, &ctx, self.approval_timeout).await { continue; }
                             let now = Instant::now();
                             // Coalesce only what Telegram groups: an album shares a
                             // media_group_id; a forward burst carries forward_origin
