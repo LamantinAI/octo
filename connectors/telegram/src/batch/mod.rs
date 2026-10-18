@@ -375,6 +375,7 @@ mod tests {
                         ("sender_id".into(), "7".into()),
                         ("addressed".into(), called.into()),
                     ]),
+                    proof: None,
                 },
             );
         }

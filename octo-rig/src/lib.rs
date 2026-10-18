@@ -22,6 +22,7 @@ use std::{
     time::Duration,
 };
 
+use octo_approval::{Authority, Ingress};
 use octo_core::{
     ChannelId, ConnectorId, Envelope, EventBus, EventKind, InProcessBus,
     control::{CANCEL, CANCEL_SCOPE_TAG, RESTART_CONNECTOR, RESTART_PROCESS},
@@ -56,6 +57,7 @@ pub struct OctoDispatchTool {
     scope: Option<String>,
     channels: HashMap<ConnectorId, ChannelId>,
     origin: Option<(ConnectorId, ChannelId)>,
+    authority: Option<(Authority, Ingress, Vec<ConnectorId>)>,
 }
 
 impl OctoDispatchTool {
@@ -68,6 +70,7 @@ impl OctoDispatchTool {
             scope: None,
             channels: HashMap::new(),
             origin: None,
+            authority: None,
         }
     }
 
@@ -82,6 +85,17 @@ impl OctoDispatchTool {
     /// These provenance tags do not grant the originating sender's permissions.
     pub fn with_origin(mut self, connector: ConnectorId, channel: ChannelId) -> Self {
         self.origin = Some((connector, channel));
+        self
+    }
+
+    /// Attach host-only grants to protected targets, independently of tool arguments.
+    pub fn with_authority(
+        mut self,
+        authority: Authority,
+        ingress: Ingress,
+        protected_targets: Vec<ConnectorId>,
+    ) -> Self {
+        self.authority = Some((authority, ingress, protected_targets));
         self
     }
 
@@ -165,6 +179,15 @@ impl Tool for OctoDispatchTool {
         // long-running connector work this dispatch starts (e.g. a forkd script).
         if let Some(scope) = &self.scope {
             cmd = cmd.with_tag(CANCEL_SCOPE_TAG, scope.clone());
+        }
+        if let Some((authority, ingress, targets)) = &self.authority {
+            if targets.iter().any(|target| target.as_str() == args.target) {
+                let proof = match authority.bind(ingress, &cmd) {
+                    Ok(proof) => proof,
+                    Err(error) => return Ok(json!({"error":error})),
+                };
+                cmd = cmd.with_context(proof);
+            }
         }
 
         tracing::info!(target = %args.target, kind = %args.kind, "rig tool → dispatch");
