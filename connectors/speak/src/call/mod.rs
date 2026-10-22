@@ -196,14 +196,12 @@ pub(crate) fn drive_call(
                 }
                 Output::Event(Event::ChannelOpen(cid, label)) => {
                     info!(%label, "speak-lab: channel open");
-                    let kick = std::env::var("SPEAK_KICK").unwrap_or_default();
-                    let mut msgs: Vec<String> = Vec::new();
-                    if kick.contains("item") {
-                        msgs.push(r#"{"type":"conversation.item.create","item":{"type":"message","role":"user","content":[{"type":"input_text","text":"Start now."}]}}"#.into());
-                    }
-                    if kick.contains("response") {
-                        msgs.push(r#"{"type":"response.create"}"#.into());
-                    }
+                    let msgs: Vec<String> = std::env::var("SPEAK_KICK_JSON")
+                        .unwrap_or_default()
+                        .split("\n")
+                        .filter(|l| !l.trim().is_empty())
+                        .map(str::to_string)
+                        .collect();
                     for m in msgs {
                         if let Some(mut ch) = rtc.channel(cid) {
                             let r = ch.write(false, m.as_bytes());
@@ -212,7 +210,7 @@ pub(crate) fn drive_call(
                     }
                 }
                 Output::Event(Event::ChannelData(d)) => match {
-                    info!(data = %String::from_utf8_lossy(&d.data).chars().take(600).collect::<String>(), "speak-lab: channel data");
+                    info!(data = %String::from_utf8_lossy(&d.data).chars().take(3000).collect::<String>(), "speak-lab: channel data");
                     parse_oai(&d.data)
                 } {
                     Oai::TurnDone(t) => {
