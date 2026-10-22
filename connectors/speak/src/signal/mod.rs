@@ -24,12 +24,29 @@ pub(crate) const ORIGINATOR: &str = "Codex Desktop";
 /// The call-API alpha header the desktop sends for a client-owned call.
 pub(crate) const OPENAI_ALPHA: &str = "quicksilver=v2";
 
-/// Frozen session instructions: the call starts speaking on its own, so "read this
-/// verbatim" turns it into a TTS engine. The text is appended after `TEXT:\n`.
+/// Frozen session instructions: once the turn starts (see [`start_turn_event`]), "read
+/// this verbatim" turns the voice into a TTS engine. The text is appended after `TEXT:\n`.
 pub(crate) const INSTRUCTIONS: &str = "You are a text-to-speech engine. As soon as the session starts, \
     read the following text aloud verbatim, word for word, in its original language, with \
     natural intonation. Read ALL of it to the very end, then stay silent. Do not add \
     anything, do not greet, do not comment, do not summarize.\n\nTEXT:\n";
+
+/// What the client says to start the turn. The voice used to speak as soon as the call
+/// connected; since 2026-10 it waits for input (a live call then streams only silence and
+/// never sends `turn.done`). One line of session context is that input — the frozen
+/// instructions make the voice answer it by reading the text. (`response.create` needs a
+/// Responses-delegation session and `conversation.item.create` is gone; a context line on
+/// the `speakable` channel is accepted but not answered.)
+pub(crate) const START_TURN: &str = "Read the text now.";
+
+/// The `oai-events` message that starts the turn, sent once the channel opens.
+pub(crate) fn start_turn_event() -> String {
+    json!({
+        "type": "session.context.append",
+        "content": [{ "type": "input_text", "text": START_TURN }],
+    })
+    .to_string()
+}
 
 /// The `session` object of the call request. `delegation: client` is what the desktop
 /// sends for a client-owned call.
@@ -151,7 +168,9 @@ pub(crate) fn explain_http(code: u16, body: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{MODEL, explain_http, session_payload};
+    use serde_json::{Value, from_str};
+
+    use super::{MODEL, START_TURN, explain_http, session_payload, start_turn_event};
 
     #[test]
     fn session_names_the_voice_and_model() {
@@ -164,6 +183,18 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .ends_with("TEXT:\nhello")
+        );
+    }
+
+    #[test]
+    fn the_turn_starts_with_one_line_of_session_context() {
+        let event: Value = from_str(&start_turn_event()).unwrap();
+        assert_eq!(event["type"], "session.context.append");
+        assert_eq!(event["content"][0]["type"], "input_text");
+        assert_eq!(event["content"][0]["text"], START_TURN);
+        assert!(
+            event.get("channel").is_none(),
+            "a speakable line is not answered"
         );
     }
 

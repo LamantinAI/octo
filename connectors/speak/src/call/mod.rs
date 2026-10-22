@@ -1,5 +1,5 @@
 //! The call itself: the SDP offer/answer POST to ChatGPT Voice, then the sans-IO loop that
-//! pumps the outbound "microphone" and records the inbound Opus frames.
+//! starts the turn, pumps the outbound "microphone" and records the inbound Opus frames.
 
 use std::{
     io::ErrorKind,
@@ -23,7 +23,7 @@ use self::speech::{NO_SPEECH_TIMEOUT, SpeechWatch, TAIL_KEEP_FRAMES, Verdict};
 use crate::{
     net::{NetStats, feed, routable_ip, rtp_seq},
     ogg::{MAX_FILL_FRAMES, Recorder, finish},
-    signal::{CallError, post_call},
+    signal::{CallError, post_call, start_turn_event},
 };
 
 mod speech;
@@ -193,6 +193,19 @@ pub(crate) fn drive_call(
                     rec.last_seq = Some(last);
                     speech.observe(&m.data, Instant::now());
                     rec.push(m.time.numer(), &m.data);
+                }
+                // The voice waits for input before it speaks: start the turn as soon as
+                // the events channel is up.
+                Output::Event(Event::ChannelOpen(cid, _)) => {
+                    let event = start_turn_event();
+                    match rtc
+                        .channel(cid)
+                        .map(|mut ch| ch.write(false, event.as_bytes()))
+                    {
+                        Some(Ok(_)) => debug!("speak: turn started"),
+                        Some(Err(e)) => return Err(format!("start the voice turn: {e}")),
+                        None => return Err("the events channel vanished on open".into()),
+                    }
                 }
                 Output::Event(Event::ChannelData(d)) => match parse_oai(&d.data) {
                     Oai::TurnDone(t) => {
