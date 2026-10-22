@@ -9,11 +9,21 @@
 
 use std::time::{Duration, Instant};
 
+use str0m::channel::ChannelId;
+
 use crate::ogg::is_speech;
 
-/// Fail the turn if this long passes after the first frame with no speech in it. A working
-/// call starts talking within half a second of its first frame.
-pub(crate) const NO_SPEECH_TIMEOUT: Duration = Duration::from_secs(15);
+/// Fail the turn if this long passes after the first frame with no speech in it. A started
+/// turn talks within a second; this leaves room for [`MAX_TURN_STARTS`] attempts.
+pub(crate) const NO_SPEECH_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Re-send the start if the voice is still silent this long after the last one. Measured
+/// live, a start is often acknowledged and then not answered; a later one is, and an
+/// answered start is heard within a second.
+pub(crate) const RESTART_TURN_AFTER: Duration = Duration::from_secs(3);
+
+/// How many times the turn is started before the call is left to the no-speech timeout.
+pub(crate) const MAX_TURN_STARTS: u32 = 4;
 
 /// After speech, this much silence without `turn.done` ends the recording.
 pub(crate) const END_OF_SPEECH_SILENCE: Duration = Duration::from_secs(3);
@@ -62,12 +72,65 @@ impl SpeechWatch {
     }
 }
 
+/// When to send the start-turn event: as soon as the events channel opens, then again
+/// every [`RESTART_TURN_AFTER`] while the voice is silent, at most [`MAX_TURN_STARTS`]
+/// times. The caller stops asking once speech is heard.
+pub(crate) struct TurnStart<C: Copy = ChannelId> {
+    pub(crate) channel: Option<C>,
+    pub(crate) starts: u32,
+    last: Option<Instant>,
+}
+
+impl<C: Copy> Default for TurnStart<C> {
+    fn default() -> Self {
+        Self {
+            channel: None,
+            starts: 0,
+            last: None,
+        }
+    }
+}
+
+impl<C: Copy> TurnStart<C> {
+    /// The channel to send the start on, if one is due now.
+    pub(crate) fn due(&self, now: Instant) -> Option<C> {
+        let channel = self.channel?;
+        if self.starts >= MAX_TURN_STARTS {
+            return None;
+        }
+        self.last
+            .is_none_or(|at| now.duration_since(at) >= RESTART_TURN_AFTER)
+            .then_some(channel)
+    }
+
+    pub(crate) fn sent(&mut self, now: Instant) {
+        self.starts += 1;
+        self.last = Some(now);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const SILENT: [u8; 3] = [0xd8, 0xff, 0xfe];
     const SPOKEN: [u8; 4] = [0xd8, 0x01, 0x02, 0x03];
+
+    #[test]
+    fn the_turn_starts_at_once_and_restarts_while_silent() {
+        let t0 = Instant::now();
+        let mut turn = TurnStart::<u8>::default();
+        assert_eq!(turn.due(t0), None, "no channel yet");
+        turn.channel = Some(7);
+        assert_eq!(turn.due(t0), Some(7));
+        turn.sent(t0);
+        assert_eq!(turn.due(t0 + Duration::from_secs(1)), None);
+        assert_eq!(turn.due(t0 + RESTART_TURN_AFTER), Some(7));
+        for k in 1..MAX_TURN_STARTS {
+            turn.sent(t0 + RESTART_TURN_AFTER * k);
+        }
+        assert_eq!(turn.due(t0 + RESTART_TURN_AFTER * 10), None, "capped");
+    }
 
     #[test]
     fn a_quiet_start_is_not_yet_a_failure() {
