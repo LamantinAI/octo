@@ -4,6 +4,15 @@
 /// Fill at most one second of lost packets; a longer hole is a dead link or a pause.
 pub(crate) const MAX_FILL_FRAMES: u64 = 50;
 
+/// The voice's silence frame is 3 bytes (TOC + a 2-byte near-silent CELT frame); a lost
+/// packet's filler is a lone TOC byte. Anything longer carries speech.
+pub(crate) const SILENCE_MAX_BYTES: usize = 3;
+
+/// Whether an inbound Opus frame carries speech rather than the voice's silence.
+pub(crate) fn is_speech(frame: &[u8]) -> bool {
+    frame.len() > SILENCE_MAX_BYTES
+}
+
 /// The inbound Opus frames, in order. A hole left by a lost packet (str0m negotiates NACK
 /// only for video, so audio loss is not retransmitted) is filled with zero-length frames:
 /// per RFC 6716 §3.2.1 the decoder treats those as lost and conceals them, so the timeline
@@ -37,6 +46,15 @@ impl Recorder {
         }
         self.next_ts = Some(ts + opus_frame_samples_48k(frame));
         self.frames.push(frame.to_vec());
+    }
+
+    /// Drop the silence after the last spoken frame, keeping `keep` frames of it so the
+    /// voice doesn't end on a cut. A recording with no speech at all is left as is.
+    pub(crate) fn trim_silent_tail(&mut self, keep: usize) {
+        if let Some(last) = self.frames.iter().rposition(|f| is_speech(f)) {
+            self.frames
+                .truncate((last + 1 + keep).min(self.frames.len()));
+        }
     }
 }
 
@@ -141,6 +159,29 @@ mod tests {
         assert_eq!(opus_frame_samples_48k(&[0x18]), 2880); // config 3 -> SILK NB 60 ms
         assert_eq!(opus_frame_samples_48k(&[0x01]), 960); // config 0 (480), count code 1 -> 2 frames
         assert_eq!(opus_frame_samples_48k(&[]), 0);
+    }
+
+    #[test]
+    fn the_silent_tail_is_trimmed_after_the_last_spoken_frame() {
+        let mut rec = Recorder {
+            frames: vec![vec![0xd8, 0xff, 0xfe]; 2],
+            ..Default::default()
+        };
+        rec.frames.push(vec![0xd8, 1, 2, 3, 4]);
+        rec.frames.extend(vec![vec![0xd8, 0xff, 0xfe]; 500]);
+        rec.trim_silent_tail(15);
+        assert_eq!(rec.frames.len(), 3 + 15);
+
+        let mut silent = Recorder {
+            frames: vec![vec![0xd8, 0xff, 0xfe]; 40],
+            ..Default::default()
+        };
+        silent.trim_silent_tail(15);
+        assert_eq!(
+            silent.frames.len(),
+            40,
+            "no speech: nothing to anchor a trim on"
+        );
     }
 
     #[test]
