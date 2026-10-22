@@ -194,7 +194,27 @@ pub(crate) fn drive_call(
                     speech.observe(&m.data, Instant::now());
                     rec.push(m.time.numer(), &m.data);
                 }
-                Output::Event(Event::ChannelData(d)) => match parse_oai(&d.data) {
+                Output::Event(Event::ChannelOpen(cid, label)) => {
+                    info!(%label, "speak-lab: channel open");
+                    let kick = std::env::var("SPEAK_KICK").unwrap_or_default();
+                    let mut msgs: Vec<String> = Vec::new();
+                    if kick.contains("item") {
+                        msgs.push(r#"{"type":"conversation.item.create","item":{"type":"message","role":"user","content":[{"type":"input_text","text":"Start now."}]}}"#.into());
+                    }
+                    if kick.contains("response") {
+                        msgs.push(r#"{"type":"response.create"}"#.into());
+                    }
+                    for m in msgs {
+                        if let Some(mut ch) = rtc.channel(cid) {
+                            let r = ch.write(false, m.as_bytes());
+                            info!(?r, msg = %m, "speak-lab: sent");
+                        }
+                    }
+                }
+                Output::Event(Event::ChannelData(d)) => match {
+                    info!(data = %String::from_utf8_lossy(&d.data).chars().take(600).collect::<String>(), "speak-lab: channel data");
+                    parse_oai(&d.data)
+                } {
                     Oai::TurnDone(t) => {
                         transcript = t;
                         stop_at.get_or_insert(Instant::now() + TAIL_GRACE);
