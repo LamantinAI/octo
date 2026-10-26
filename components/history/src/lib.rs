@@ -1,4 +1,8 @@
-//! Per-channel conversation history — a pluggable backend, the way teloxide's
+//! Neutral session catalogs and conversation journals, with compatible legacy history.
+//! [`SessionStore`] owns stable identities and root/child journals; authentication,
+//! user identity verification and channel selection belong to the assembly.
+//!
+//! Per-channel conversation history remains a pluggable backend, the way teloxide's
 //! `Storage` is pluggable. **Not** agentic memory (that's a different thing);
 //! this is just the rolling transcript of a channel that gets fed back to the
 //! model each turn.
@@ -11,6 +15,22 @@
 
 mod context;
 pub use context::{Compact, ContextWindow, StoredTurn};
+mod aliases;
+mod journal;
+pub use journal::{
+    AppendReceipt, AppendRequest, DEFAULT_PAGE_SIZE, JournalKeyInventory, JournalPage,
+    JournalRecord, KeyRemap, MAX_PAGE_SIZE, PageRequest, RemapReceipt, RequestAlias,
+};
+mod session;
+pub use session::{
+    CreateSession, LegacySessionImport, LegacySessionReceipt, Persistence, RequestBinding, Session,
+    SessionAccess, SessionFilter, SessionId, SessionJournal, SessionKind, SessionOrigin,
+    SessionPage, SessionState, SessionStore, SessionUpdate,
+};
+mod retained;
+pub use retained::{MemoryLimits, RetainedMemoryHistory};
+mod snapshot;
+pub use snapshot::{DiscardReceipt, PromotionReceipt, SessionSnapshot};
 
 use std::{collections::HashMap, path::PathBuf, sync::Mutex};
 
@@ -38,6 +58,42 @@ pub enum HistoryError {
 
     #[error("history backend does not support retained context")]
     ContextUnsupported,
+
+    #[error("history backend does not support {0}")]
+    Unsupported(&'static str),
+
+    #[error("invalid history request: {0}")]
+    InvalidRequest(String),
+
+    #[error("idempotency key already binds a different request or batch")]
+    IdempotencyConflict,
+
+    #[error("native request identity is bound to multiple session journals")]
+    RequestAmbiguous,
+
+    #[error("native request receipt has no authoritative session binding")]
+    RequestUnbound,
+
+    #[error("history migration conflict: {0}")]
+    MigrationConflict(String),
+
+    #[error("history key {source_key:?} was migrated to {target_key:?}")]
+    KeyRemapped {
+        source_key: String,
+        target_key: String,
+    },
+
+    #[error("unknown session")]
+    SessionNotFound,
+
+    #[error("session identity or immutable binding conflicts")]
+    SessionConflict,
+
+    #[error("session revision conflict: expected {expected}, actual {actual}")]
+    RevisionConflict { expected: i64, actual: i64 },
+
+    #[error("retained memory quota exhausted")]
+    QuotaExceeded,
 }
 
 pub type Result<T> = std::result::Result<T, HistoryError>;
@@ -96,6 +152,16 @@ pub trait HistoryStore: Send + Sync {
     async fn load(&self, channel: &str) -> Vec<Turn>;
     /// Append turns to a channel, trimming to the backend's cap.
     async fn append(&self, channel: &str, turns: &[Turn]) -> Result<()>;
+
+    /// Strict timestamped journal pages. Legacy capped backends do not fabricate IDs.
+    async fn journal_page(&self, _key: &str, _request: PageRequest) -> Result<JournalPage> {
+        Err(HistoryError::Unsupported("strict journal pages"))
+    }
+
+    /// Atomically append a batch or return its original receipt on an identical retry.
+    async fn append_journal(&self, _key: &str, _request: &AppendRequest) -> Result<AppendReceipt> {
+        Err(HistoryError::Unsupported("idempotent journal append"))
+    }
 }
 
 /// In-memory backend (default). Lost on restart.

@@ -17,6 +17,7 @@ mod file;
 pub use file::{SendFileArgs, SendFileTool};
 
 use std::{
+    any::Any,
     collections::HashMap,
     sync::{Arc, Mutex},
     time::Duration,
@@ -24,7 +25,7 @@ use std::{
 
 use octo_approval::{Authority, Ingress};
 use octo_core::{
-    ChannelId, ConnectorId, Envelope, EventBus, EventKind, InProcessBus,
+    ChannelId, ConnectorId, Envelope, EnvelopeContext, EventBus, EventKind, InProcessBus,
     control::{CANCEL, CANCEL_SCOPE_TAG, RESTART_CONNECTOR, RESTART_PROCESS},
 };
 use rig::{completion::ToolDefinition, tool::Tool};
@@ -58,6 +59,7 @@ pub struct OctoDispatchTool {
     channels: HashMap<ConnectorId, ChannelId>,
     origin: Option<(ConnectorId, ChannelId)>,
     authority: Option<(Authority, Ingress, Vec<ConnectorId>)>,
+    context: EnvelopeContext,
 }
 
 impl OctoDispatchTool {
@@ -71,7 +73,15 @@ impl OctoDispatchTool {
             channels: HashMap::new(),
             origin: None,
             authority: None,
+            context: EnvelopeContext::default(),
         }
+    }
+
+    /// Attach host-only values independently of model arguments. The actual
+    /// authority proof is inserted after these values when a command is bound.
+    pub fn with_context<T: Any + Send + Sync>(mut self, value: T) -> Self {
+        self.context.insert(value);
+        self
     }
 
     /// Bind host-provided conversation context only to its own connector.
@@ -162,6 +172,7 @@ impl Tool for OctoDispatchTool {
             args.payload,
         )
         .with_target(ConnectorId::new(args.target.clone()));
+        cmd.context = self.context.clone();
         let destination = args.channel.map(ChannelId::new).or_else(|| {
             self.channels
                 .get(&ConnectorId::new(args.target.clone()))
@@ -338,6 +349,8 @@ mod tests {
             .await
             .unwrap();
         let tool = OctoDispatchTool::new(bus.clone(), ConnectorId::new("agent"), "")
+            .with_context("host-only scope".to_owned())
+            .with_context(42u32)
             .with_channel_for(target.clone(), ChannelId::new("-42"))
             .with_origin(target.clone(), ChannelId::new("-42"))
             .with_scope("scope")
@@ -359,6 +372,11 @@ mod tests {
                 assert_eq!(req.tags["origin.channel"], "-42");
                 assert_eq!(req.source.as_str(), "agent");
                 assert!(req.channel_metadata.is_none());
+                assert_eq!(
+                    req.context.get::<String>().map(String::as_str),
+                    Some("host-only scope")
+                );
+                assert_eq!(req.context.get::<u32>(), Some(&42));
                 reply_bus
                     .publish(
                         Envelope::new(
@@ -411,6 +429,10 @@ mod tests {
                     .unwrap()
                     .unwrap();
                 assert_eq!(req.channel.as_ref().unwrap().as_str(), "-42");
+                assert_eq!(
+                    req.context.get::<String>().map(String::as_str),
+                    Some("file scope")
+                );
                 bus.publish(
                     Envelope::new(
                         target,
@@ -430,6 +452,7 @@ mod tests {
             "-42",
         )
         .with_confirmation_timeout(Duration::from_secs(1));
+        let tool = tool.with_context("file scope".to_owned());
         let result = tool
             .call(SendFileArgs {
                 path: "image.png".into(),

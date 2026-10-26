@@ -13,21 +13,33 @@ use tracing::warn;
 
 use super::{
     Cards,
+    delivery::CardDelivery,
     registry::{Action, Card, Registry, Reject, State},
     render::{BUSY, EXPIRED, FORBIDDEN, UNAVAILABLE, details, keyboard, text},
     request::{current_owner, request, response},
 };
-use crate::AclState;
+use crate::{AclState, policy::delivery::Delivery};
 
 impl Cards {
     /// A native context is mandatory. Invalid trusted routing is suppressed,
     /// rather than falling through to a raw technical String on the main card.
+    #[cfg(test)]
     pub async fn present(
         &self,
         bot: &Bot,
         id: &ConnectorId,
         acl: &Option<Arc<AclState>>,
         envelope: &Envelope,
+    ) -> bool {
+        self.present_scoped(bot, id, acl, envelope, None).await
+    }
+    pub async fn present_scoped(
+        &self,
+        bot: &Bot,
+        id: &ConnectorId,
+        acl: &Option<Arc<AclState>>,
+        envelope: &Envelope,
+        delivery: Option<&Delivery<'_>>,
     ) -> bool {
         if envelope.context.get::<ApprovalPresentation>().is_none() {
             return false;
@@ -41,7 +53,7 @@ impl Cards {
         if !current_owner(acl, chat as u64, chat) {
             return true;
         }
-        let card = match self
+        let mut card = match self
             .registry
             .lock()
             .unwrap()
@@ -50,11 +62,22 @@ impl Cards {
             Ok(card) => card,
             Err(_) => return true,
         };
-        match bot
+        card.delivery = delivery.map(|delivery| Arc::new(CardDelivery::new(delivery)));
+        if let Some(stored) = self.registry.lock().unwrap().cards.get_mut(&card.token) {
+            stored.delivery = card.delivery.clone();
+        }
+        if card.delivery.as_ref().is_some_and(|d| !d.allowed(bot)) {
+            self.registry.lock().unwrap().cards.remove(&card.token);
+            return true;
+        }
+        let result = bot
             .send_message(ChatId(card.chat), text(&card))
             .reply_markup(keyboard(&card, Utc::now().timestamp()))
-            .await
-        {
+            .await;
+        if let Some(delivery) = &card.delivery {
+            delivery.report(bot, card.chat, &result).await;
+        }
+        match result {
             Ok(message) if message.chat.is_private() && message.chat.id.0 == card.chat => self
                 .registry
                 .lock()
@@ -185,28 +208,36 @@ impl Cards {
             edit(bot, &updated).await;
         }
         if action == Action::Details {
+            if card.delivery.as_ref().is_some_and(|d| !d.allowed(bot)) {
+                return;
+            }
             let limit = self.registry.lock().unwrap().settings.max_detail_bytes;
-            match details(&body, limit) {
-                Ok(text) if text.len() <= 3000 => {
-                    let _ = bot.send_message(ChatId(card.chat), text).await;
-                }
+            let result = match details(&body, limit) {
+                Ok(text) if text.len() <= 3000 => bot.send_message(ChatId(card.chat), text).await,
                 Ok(text) => {
                     let file =
                         InputFile::memory(text.into_bytes()).file_name("operation-details.txt");
-                    let _ = bot.send_document(ChatId(card.chat), file).await;
+                    bot.send_document(ChatId(card.chat), file).await
                 }
-                Err(message) => {
-                    let _ = bot.send_message(ChatId(card.chat), message).await;
-                }
+                Err(message) => bot.send_message(ChatId(card.chat), message).await,
+            };
+            if let Some(delivery) = &card.delivery {
+                delivery.report(bot, card.chat, &result).await;
             }
         }
     }
 }
 async fn edit(bot: &Bot, card: &Card) {
+    if card.delivery.as_ref().is_some_and(|d| !d.allowed(bot)) {
+        return;
+    }
     if let Some(message) = card.message {
-        let _ = bot
+        let result = bot
             .edit_message_text(ChatId(card.chat), message, text(card))
             .reply_markup(keyboard(card, Utc::now().timestamp()))
             .await;
+        if let Some(delivery) = &card.delivery {
+            delivery.report(bot, card.chat, &result).await;
+        }
     }
 }

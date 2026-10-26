@@ -134,6 +134,9 @@ impl Database {
             reject_unregistered(&store, &objects)?;
             // Out-of-band schema drift invalidates semantic assumptions. Record
             // the new schema/revision, then require a fresh prepared operation.
+            self.authority
+                .check_scope(invocation.scope_binding.as_ref())
+                .map_err(SqlError::Authority)?;
             invalidate_semantics(&mut store)?;
             reconcile(conn, &mut store, &[], true).await?;
             return Err(SqlError::Stale);
@@ -193,6 +196,9 @@ impl Database {
         }
         let id = Uuid::now_v7().simple().to_string();
         let fingerprint = format!("{:x}", Sha256::digest([]));
+        self.authority
+            .check_scope(invocation.scope_binding.as_ref())
+            .map_err(SqlError::Authority)?;
         query("INSERT INTO __octo_sql_stores(id,owner,name,purpose,tags,revision,fingerprint,metadata) VALUES(?,?,?,?,?,1,?,'[]')")
             .bind(&id).bind(&invocation.origin.principal).bind(&request.name).bind(&request.purpose)
             .bind(json!(request.tags).to_string()).bind(fingerprint).execute(&mut *transaction).await?;
@@ -276,6 +282,9 @@ impl Database {
         let (fingerprint, objects) = snapshot(conn, &store).await?;
         if fingerprint != store.fingerprint {
             reject_unregistered(&store, &objects)?;
+            self.authority
+                .check_scope(invocation.scope_binding.as_ref())
+                .map_err(SqlError::Authority)?;
             invalidate_semantics(&mut store)?;
             reconcile(conn, &mut store, &[], true).await?;
         }
@@ -321,6 +330,9 @@ impl Database {
                 invocation,
             )
             .await?;
+        self.authority
+            .check_scope(invocation.scope_binding.as_ref())
+            .map_err(SqlError::Authority)?;
         reconcile(&mut transaction, &mut store, &request.metadata, true).await?;
         if store.metadata.to_string().len() > self.limits.max_bytes {
             return Err(SqlError::Limit("semantic catalog bytes".into()));
@@ -383,6 +395,9 @@ impl Database {
                 invocation,
             )
             .await?;
+        self.authority
+            .check_scope(invocation.scope_binding.as_ref())
+            .map_err(SqlError::Authority)?;
         query("UPDATE __octo_sql_stores SET archived=1,revision=revision+1 WHERE id=?")
             .bind(&store.id)
             .execute(&mut *transaction)

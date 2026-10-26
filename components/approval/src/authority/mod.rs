@@ -11,6 +11,8 @@ use rand::{RngCore, rngs::OsRng};
 use serde_json::{Value, to_vec};
 use sha2::{Digest, Sha256};
 
+use crate::{ScopeBinding, ScopeValidator};
+
 #[derive(Clone, Debug)]
 pub struct Origin {
     pub principal: String,
@@ -60,6 +62,7 @@ pub struct Ingress {
     access: Access,
     expires: Instant,
     delegated: bool,
+    scope_binding: Option<ScopeBinding>,
 }
 impl Debug for Ingress {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
@@ -67,6 +70,9 @@ impl Debug for Ingress {
     }
 }
 impl Ingress {
+    pub fn scope(&self) -> Option<&ScopeBinding> {
+        self.scope_binding.as_ref()
+    }
     pub fn origin(&self) -> &Origin {
         &self.origin
     }
@@ -127,6 +133,7 @@ pub struct VerifiedInvocation {
     pub access: Access,
     pub delegated: bool,
     pub remaining: Duration,
+    pub scope_binding: Option<ScopeBinding>,
 }
 
 #[derive(Clone, Debug)]
@@ -141,6 +148,7 @@ struct Inner {
     ttl: Duration,
     capacity: usize,
     pending: Mutex<HashMap<[u8; 32], Instant>>,
+    scope_validator: Mutex<Option<Arc<dyn ScopeValidator>>>,
 }
 impl Authority {
     pub fn new(ttl: Duration, capacity: usize) -> Self {
@@ -152,8 +160,54 @@ impl Authority {
                 ttl,
                 capacity,
                 pending: Mutex::new(HashMap::new()),
+                scope_validator: Mutex::new(None),
             }),
         }
+    }
+    pub fn with_scope_validator(self, validator: Arc<dyn ScopeValidator>) -> Self {
+        *self
+            .inner
+            .scope_validator
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(validator);
+        self
+    }
+
+    pub fn check_scope(&self, binding: Option<&ScopeBinding>) -> Result<(), String> {
+        let Some(binding) = binding else {
+            return Ok(());
+        };
+        binding.validate()?;
+        let validator = self
+            .inner
+            .scope_validator
+            .lock()
+            .map_err(|_| "Scope validator unavailable")?
+            .clone();
+        if validator.is_some_and(|validator| validator.allows(binding)) {
+            Ok(())
+        } else {
+            Err("Authority scope is unknown, closed or expired".into())
+        }
+    }
+
+    /// Host attachment only. Existing immutable scope cannot be exchanged for a
+    /// fresh permanent identity by an adapter or delegated tool.
+    pub fn bind_scope(&self, ingress: &Ingress, binding: ScopeBinding) -> Result<Ingress, String> {
+        if ingress.authority != self.inner.id || Instant::now() >= ingress.expires {
+            return Err("Invalid or expired database ingress".into());
+        }
+        if ingress
+            .scope_binding
+            .as_ref()
+            .is_some_and(|existing| existing != &binding)
+        {
+            return Err("Cannot rebind database ingress scope".into());
+        }
+        self.check_scope(Some(&binding))?;
+        let mut scoped = ingress.clone();
+        scoped.scope_binding = Some(binding);
+        Ok(scoped)
     }
     /// Only transport ingress/assembly code receives this authority handle.
     pub fn issue(&self, origin: Origin, access: Access) -> Ingress {
@@ -163,12 +217,14 @@ impl Authority {
             access,
             expires: Instant::now() + self.inner.ttl,
             delegated: false,
+            scope_binding: None,
         }
     }
     pub fn bind(&self, ingress: &Ingress, envelope: &Envelope) -> Result<Invocation, String> {
         if ingress.authority != self.inner.id || Instant::now() >= ingress.expires {
             return Err("Invalid or expired database ingress".into());
         }
+        self.check_scope(ingress.scope_binding.as_ref())?;
         let digest = call_digest(envelope)?;
         let mut pending = self.inner.pending.lock().unwrap();
         pending.retain(|_, expires| *expires > Instant::now());
@@ -223,6 +279,7 @@ impl Authority {
         {
             return Err("Invocation identity or payload mismatch".into());
         }
+        self.check_scope(proof.ingress.scope_binding.as_ref())?;
         if self
             .inner
             .pending
@@ -241,10 +298,13 @@ impl Authority {
                 .ingress
                 .expires
                 .saturating_duration_since(Instant::now()),
+            scope_binding: proof.ingress.scope_binding.clone(),
         })
     }
     pub fn recognizes(&self, ingress: &Ingress) -> bool {
-        ingress.authority == self.inner.id && Instant::now() < ingress.expires
+        ingress.authority == self.inner.id
+            && Instant::now() < ingress.expires
+            && self.check_scope(ingress.scope_binding.as_ref()).is_ok()
     }
 }
 
@@ -324,5 +384,47 @@ mod tests {
         assert!(child.attenuate(vec!["s2".into()], true, false).is_err());
         assert!(child.attenuate(vec!["s1".into()], false, true).is_err());
         assert_eq!(child.access().stores, Stores::Only(vec!["s1".into()]));
+    }
+    #[test]
+    fn scoped_proofs_are_immutable_inherited_and_closed_at_consumption() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        use crate::{ScopeBinding, ScopeValidator};
+
+        struct Live(AtomicBool);
+        impl ScopeValidator for Live {
+            fn allows(&self, _: &ScopeBinding) -> bool {
+                self.0.load(Ordering::SeqCst)
+            }
+        }
+        let live = Arc::new(Live(AtomicBool::new(true)));
+        let authority = Authority::new(Duration::from_secs(60), 8);
+        let ingress = authority.issue(origin(), Access::owner());
+        let binding = ScopeBinding::new("opaque", "epoch").unwrap();
+        assert!(authority.bind_scope(&ingress, binding.clone()).is_err());
+        let authority = authority.with_scope_validator(live.clone());
+        let scoped = authority.bind_scope(&ingress, binding.clone()).unwrap();
+        assert!(
+            authority
+                .bind_scope(&scoped, ScopeBinding::new("other", "epoch").unwrap())
+                .is_err()
+        );
+        let child = scoped.attenuate(vec!["s1".into()], true, false).unwrap();
+        assert_eq!(child.scope(), Some(&binding));
+        let admitted = call();
+        let proof = authority.bind(&child, &admitted).unwrap();
+        let verified = authority.consume(&admitted.with_context(proof)).unwrap();
+        assert_eq!(verified.scope_binding, Some(binding));
+        let queued = call();
+        let proof = authority.bind(&scoped, &queued).unwrap();
+        live.0.store(false, Ordering::SeqCst);
+        assert!(authority.consume(&queued.with_context(proof)).is_err());
+        assert!(authority.bind(&scoped, &call()).is_err());
+        assert!(!authority.recognizes(&scoped));
+        // None remains an independent legacy principal, never a scoped revival.
+        assert!(authority.bind(&ingress, &call()).is_ok());
     }
 }

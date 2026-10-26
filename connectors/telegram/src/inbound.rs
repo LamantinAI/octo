@@ -1,11 +1,25 @@
+use std::{
+    any::Any,
+    error::Error,
+    path::Path,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
 use octo_core::{
     ChannelId, ChannelMetadata, ConnectorContext, ConnectorId, Envelope, EventKind, ReplyChannel,
     TrustLevel,
 };
-use teloxide::{Bot, net::Download, requests::Requester};
+use teloxide::{
+    Bot,
+    net::Download,
+    requests::Requester,
+    types::{Document, FileId, Message, PhotoSize},
+};
+use tracing::warn;
 
 use crate::{
-    Role,
+    Role, TelegramHostPolicy,
     batch::{Emit, Flush},
 };
 
@@ -14,7 +28,7 @@ use crate::{
 /// Telegram groups an album under one `media_group_id`; a forwarded burst has no
 /// batch id, so forwarded messages are grouped per chat. A plain typed message
 /// (the common case) returns `None` and is published with zero added latency.
-pub(super) fn coalesce_key(msg: &teloxide::types::Message, chat: &str) -> Option<String> {
+pub(super) fn coalesce_key(msg: &Message, chat: &str) -> Option<String> {
     if let Some(group) = msg.media_group_id() {
         Some(format!("mg:{chat}:{}:{}", sender_key(msg), group.0))
     } else if msg.forward_origin().is_some() {
@@ -24,7 +38,7 @@ pub(super) fn coalesce_key(msg: &teloxide::types::Message, chat: &str) -> Option
     }
 }
 
-fn sender_key(msg: &teloxide::types::Message) -> String {
+fn sender_key(msg: &Message) -> String {
     if let Some(chat) = &msg.sender_chat {
         return format!("chat-{}", chat.id);
     }
@@ -35,7 +49,12 @@ fn sender_key(msg: &teloxide::types::Message) -> String {
 }
 
 /// Publish a flushed batch as one `chat.message` envelope.
-pub(super) async fn publish_flush(id: &ConnectorId, ctx: &ConnectorContext, flush: Flush) {
+pub(super) async fn publish_flush(
+    id: &ConnectorId,
+    ctx: &ConnectorContext,
+    flush: Flush,
+    policy: Option<&Arc<dyn TelegramHostPolicy>>,
+) {
     let Flush {
         chat,
         trust,
@@ -68,15 +87,23 @@ pub(super) async fn publish_flush(id: &ConnectorId, ctx: &ConnectorContext, flus
         Some(source) => source.apply(env),
         None => env,
     };
+    if env
+        .channel_metadata
+        .as_ref()
+        .is_some_and(|m| m.tags.get("scope_invalid").is_some_and(|v| v == "true"))
+        || policy.is_some_and(|p| !p.allow_publish(&env))
+    {
+        return;
+    }
     if let Err(e) = ctx.publish(env).await {
-        tracing::warn!(error = %e, "failed to publish chat.message");
+        warn!(error = %e, "failed to publish chat.message");
     }
 }
 
 /// Build an inbound `chat.message` envelope: the payload is the text (a `String`)
 /// or the image (a `Blob`); the `chat_id` rides on both the channel and the
 /// reply recommendation, and a non-empty caption is attached as a `caption` tag.
-pub(super) fn chat_envelope<P: std::any::Any + Send + Sync>(
+pub(super) fn chat_envelope<P: Any + Send + Sync>(
     id: &ConnectorId,
     chat: &str,
     payload: P,
@@ -104,7 +131,7 @@ pub(super) fn chat_envelope<P: std::any::Any + Send + Sync>(
 /// An inbound voice note or audio file: what's needed to fetch it and label the
 /// resulting [`Blob`].
 pub(super) struct VoiceMedia<'a> {
-    pub(super) file_id: &'a teloxide::types::FileId,
+    pub(super) file_id: &'a FileId,
     /// MIME as declared by the sender, defaulted per kind when absent.
     pub(super) mime: String,
     pub(super) filename: String,
@@ -113,7 +140,7 @@ pub(super) struct VoiceMedia<'a> {
 
 /// Inbound audio: a voice note (`voice`) or an audio file sent as music (`audio`).
 /// A voice note is OGG/Opus and its MIME is often missing, hence the defaults.
-pub(super) fn voice_media(msg: &teloxide::types::Message) -> Option<VoiceMedia<'_>> {
+pub(super) fn voice_media(msg: &Message) -> Option<VoiceMedia<'_>> {
     if let Some(voice) = msg.voice() {
         return Some(VoiceMedia {
             file_id: &voice.file.id,
@@ -143,10 +170,10 @@ pub(super) fn voice_media(msg: &teloxide::types::Message) -> Option<VoiceMedia<'
 /// An inbound video: what's needed to fetch it, name it in the workspace, and
 /// describe it to a cogitator.
 pub(super) struct VideoMedia<'a> {
-    pub(super) file_id: &'a teloxide::types::FileId,
+    pub(super) file_id: &'a FileId,
     /// Telegram's own poster frame, when it sent one — a free first look at the
     /// clip that costs no local decoding.
-    pub(super) thumbnail: Option<&'a teloxide::types::PhotoSize>,
+    pub(super) thumbnail: Option<&'a PhotoSize>,
     pub(super) filename: String,
     pub(super) duration_secs: u32,
     /// A round `video_note` rather than a regular clip; the two read differently
@@ -157,7 +184,7 @@ pub(super) struct VideoMedia<'a> {
 /// Inbound video: a clip (`video`) or a round video note (`video_note`). Video
 /// sent as a plain *document* deliberately keeps the generic workspace route,
 /// exactly as audio documents do.
-pub(super) fn video_media(msg: &teloxide::types::Message) -> Option<VideoMedia<'_>> {
+pub(super) fn video_media(msg: &Message) -> Option<VideoMedia<'_>> {
     if let Some(video) = msg.video() {
         return Some(VideoMedia {
             file_id: &video.file.id,
@@ -218,9 +245,7 @@ pub(super) fn video_caption(
 
 /// A document attachment that is actually an image (`image/*` MIME), with its
 /// MIME type rendered to a string — the "send as file" (uncompressed) path.
-pub(super) fn image_document(
-    msg: &teloxide::types::Message,
-) -> Option<(&teloxide::types::Document, String)> {
+pub(super) fn image_document(msg: &Message) -> Option<(&Document, String)> {
     let doc = msg.document()?;
     let mime = doc.mime_type.as_ref()?;
     (mime.type_() == "image").then(|| (doc, mime.essence_str().to_string()))
@@ -230,11 +255,11 @@ pub(super) fn image_document(
 /// Telegram photos all arrive named `photo.jpg`, so a bare basename would have
 /// each new image clobber the previous one in the inbox.
 pub(super) fn inbox_name(base: &str) -> String {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let base = std::path::Path::new(base)
+    let base = Path::new(base)
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("image");
@@ -258,7 +283,7 @@ pub(super) fn caption_with_saved(caption: Option<String>, saved: Option<&str>) -
 /// answers so the cogitator has the quoted message in view. Quoted text (or caption)
 /// is included, trimmed to a snippet; quoted media is named, never downloaded.
 /// `None` when the message is not a reply.
-pub(super) fn reply_context(msg: &teloxide::types::Message) -> Option<String> {
+pub(super) fn reply_context(msg: &Message) -> Option<String> {
     let replied = msg.reply_to_message()?;
     let what = if let Some(text) = replied.text().or_else(|| replied.caption()) {
         let text = text.trim();
@@ -299,8 +324,8 @@ pub(super) fn with_reply(reply: &Option<String>, body: Option<String>) -> Option
 /// Resolve a Telegram `file_id` and download its bytes.
 pub(super) async fn download_bytes(
     bot: &Bot,
-    file_id: &teloxide::types::FileId,
-) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    file_id: &FileId,
+) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
     let file = bot.get_file(file_id.clone()).await?;
     let mut bytes: Vec<u8> = Vec::new();
     bot.download_file(&file.path, &mut bytes).await?;

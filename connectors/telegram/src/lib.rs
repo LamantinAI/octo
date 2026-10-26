@@ -30,9 +30,12 @@ mod api;
 mod approval;
 mod batch;
 mod commands;
+mod feedback;
 mod format;
 mod fs;
 mod live;
+mod policy;
+pub use feedback::{TURN_END, TurnFeedback};
 
 use std::{
     path::PathBuf,
@@ -62,7 +65,12 @@ use self::{
     },
     outbound::{Outbound, is_voice_blob, outbound_kind},
 };
-pub use config::{TelegramConnectorFactory, factory, factory_with_authority};
+pub use config::{TelegramConnectorFactory, factory, factory_with_authority, factory_with_policy};
+pub use policy::{
+    AllowReplyContext, CleanupReport, CleanupRequest, DeliveryReport, DeliveryStatus,
+    IngressDecision, IngressScope, NativeBatch, NativeFrame, TelegramHostPolicy,
+    TelegramOutputScope, TrackingLimits,
+};
 
 /// Default quiet window before a coalescing burst (album / forward) is flushed.
 /// Short, because these bursts arrive machine-fast; single typed messages are
@@ -158,6 +166,7 @@ pub struct TelegramConnector {
     authority: Option<Authority>,
     approval_timeout: Duration,
     approval_cards: CardSettings,
+    policy: Option<Arc<dyn TelegramHostPolicy>>,
 }
 
 impl TelegramConnector {
@@ -209,6 +218,7 @@ impl TelegramConnector {
                 EventKind::from_static(SEND_FILE),
                 EventKind::from_static(TYPING),
                 EventKind::from_static(STATUS),
+                EventKind::from_static(TURN_END),
                 EventKind::from_static(ALLOW_CHAT),
                 EventKind::from_static(REMOVE_CHAT),
                 EventKind::from_static(LIST_CHATS),
@@ -229,6 +239,7 @@ impl TelegramConnector {
             authority: None,
             approval_timeout: Duration::from_secs(30),
             approval_cards: CardSettings::default(),
+            policy: None,
         })
     }
 }

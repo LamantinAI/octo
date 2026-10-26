@@ -14,9 +14,12 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["fs"] }
 thiserror = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
 # Optional durable backend: SQLite via sqlx (async, bundled libsqlite3 — no system
 # dep; runtime queries — no DATABASE_URL at build; embedded migrations run at open).
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"], optional = true }
+sqlx = { workspace = true, features = ["macros"], optional = true }
+sha2 = { workspace = true }
 
 [features]
 sqlite = ["dep:sqlx"]

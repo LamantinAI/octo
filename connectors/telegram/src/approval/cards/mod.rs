@@ -1,4 +1,5 @@
 //! Friendly native approval presentation, separate from backend authorization.
+mod delivery;
 mod registry;
 mod render;
 mod request;
@@ -29,10 +30,11 @@ impl Cards {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::{Arc, RwLock},
+        sync::{Arc, Mutex, RwLock},
         time::Duration,
     };
 
+    use async_trait::async_trait;
     use chrono::Utc;
     use octo_approval::{ApprovalAction, ApprovalPresentation, Authority};
     use octo_core::{
@@ -50,7 +52,23 @@ mod tests {
         render::{details, keyboard, text},
         request::{current_owner, request, response},
     };
-    use crate::{Acl, AclState, Role};
+    use crate::{
+        Acl, AclState, DeliveryReport, IngressDecision, IngressScope, NativeFrame, Role,
+        TelegramHostPolicy, TelegramOutputScope,
+        policy::{delivery::Delivery, tracking::Tracker},
+    };
+
+    #[derive(Default)]
+    struct DeliveryCapture(Mutex<Vec<DeliveryReport>>);
+    #[async_trait]
+    impl TelegramHostPolicy for DeliveryCapture {
+        async fn admit(&self, _: NativeFrame, _: Envelope) -> Result<IngressDecision, String> {
+            Ok(IngressDecision::Ignore)
+        }
+        fn delivered(&self, _: &Envelope, report: &DeliveryReport) {
+            self.0.lock().unwrap().push(report.clone());
+        }
+    }
 
     fn presentation() -> ApprovalPresentation {
         ApprovalPresentation {
@@ -395,7 +413,30 @@ mod tests {
         );
         assert!(!cards.present(&server.bot, &id, &acl, &spoof).await);
         assert!(server.requests.lock().unwrap().is_empty());
-        assert!(cards.present(&server.bot, &id, &acl, &envelope()).await);
+        let capture = Arc::new(DeliveryCapture::default());
+        let host: Arc<dyn TelegramHostPolicy> = capture.clone();
+        let tracker = Tracker::new(Default::default());
+        let env = envelope().with_context(TelegramOutputScope {
+            scope: IngressScope {
+                key: "session".into(),
+                epoch: "epoch".into(),
+                ephemeral: true,
+                cleanup_scope: Some("route".into()),
+            },
+            attempt_id: Some("attempt".into()),
+        });
+        let delivery = Delivery {
+            bot: &server.bot,
+            tracker: &tracker,
+            policy: Some(&host),
+            envelope: &env,
+            trusted_notice: false,
+        };
+        assert!(
+            cards
+                .present_scoped(&server.bot, &id, &acl, &env, Some(&delivery))
+                .await
+        );
         let main = server.wait("sendMessage", 1).await;
         assert!(main[0].contains("Delete store"));
         assert!(!main[0].contains("RAW SQL"));
@@ -447,6 +488,10 @@ mod tests {
             cards.registry.lock().unwrap().cards[&token].state,
             State::Pending
         );
+        let reports = capture.0.lock().unwrap();
+        assert!(reports.len() >= 2);
+        assert!(reports.iter().all(|report| report.message_ids == [17]
+            && report.scope.as_ref().unwrap().scope.key == "session"));
     }
     #[tokio::test]
     async fn timeout_and_duplicate_clicks_only_check_status_without_new_claim() {

@@ -8,19 +8,34 @@
 //! build). Migrations under `migrations/` are embedded at compile time and run when
 //! the store opens, so a schema change is a new `.sql` file, not a manual step.
 
+mod aliases;
 mod context;
+mod defaults;
+mod journal;
+mod migration;
+mod promotion;
+mod public_ids;
+mod requests;
+mod session_journal;
+mod sessions;
 
-use std::path::Path;
+use std::{fmt::Display, path::Path};
 
 use async_trait::async_trait;
 use sqlx::{
-    Pool, Sqlite,
+    Pool, Sqlite, Transaction,
+    migrate::Migrator,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
 };
 
-use crate::{ContextWindow, HistoryError, HistoryStore, Result, Role, Turn};
+static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
-fn db(e: impl std::fmt::Display) -> HistoryError {
+use crate::{
+    AppendReceipt, AppendRequest, ContextWindow, HistoryError, HistoryStore, JournalPage,
+    PageRequest, Result, Role, Turn,
+};
+
+fn db(e: impl Display) -> HistoryError {
     HistoryError::Db(e.to_string())
 }
 
@@ -32,6 +47,14 @@ pub struct SqliteHistory {
 }
 
 impl SqliteHistory {
+    /// Latest compiled schema version, for host backups before opening/migrating.
+    pub fn schema_version() -> i64 {
+        MIGRATOR
+            .iter()
+            .map(|migration| migration.version)
+            .max()
+            .unwrap_or(0)
+    }
     /// Open (creating the file + running migrations if needed) a SQLite history.
     pub async fn open(path: impl AsRef<Path>, max: usize) -> Result<Self> {
         Self::open_mode(path, Some(max.max(1) as i64)).await
@@ -41,6 +64,32 @@ impl SqliteHistory {
     /// Existing capped users keep their previous behavior through `open`.
     pub async fn open_retained(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_mode(path, None).await
+    }
+
+    /// Build a retained store on a trusted application pool, running this component's
+    /// migrations. Applications must not run a second migration chain in the same registry.
+    pub async fn from_pool(pool: Pool<Sqlite>) -> Result<Self> {
+        Self::initialize(pool, None).await
+    }
+
+    /// Trusted host seam for application metadata in this same database.
+    pub fn pool(&self) -> &Pool<Sqlite> {
+        &self.pool
+    }
+
+    /// Begin a write transaction before reading admission/migration state. The writer
+    /// reservation avoids SQLite deferred-read upgrade races under concurrent retries.
+    /// Never hold this transaction while executing models or external tools.
+    pub async fn begin_journal(&self) -> Result<Transaction<'_, Sqlite>> {
+        self.require_retained()?;
+        self.pool.begin_with("BEGIN IMMEDIATE").await.map_err(db)
+    }
+
+    fn require_retained(&self) -> Result<()> {
+        if self.max.is_some() {
+            return Err(HistoryError::Unsupported("strict retained journal"));
+        }
+        Ok(())
     }
 
     async fn open_mode(path: impl AsRef<Path>, max: Option<i64>) -> Result<Self> {
@@ -55,10 +104,11 @@ impl SqliteHistory {
             .connect_with(opts)
             .await
             .map_err(db)?;
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .map_err(db)?;
+        Self::initialize(pool, max).await
+    }
+
+    async fn initialize(pool: Pool<Sqlite>, max: Option<i64>) -> Result<Self> {
+        MIGRATOR.run(&pool).await.map_err(db)?;
         Ok(Self { pool, max })
     }
 }
@@ -106,7 +156,8 @@ impl HistoryStore for SqliteHistory {
     }
 
     async fn append(&self, channel: &str, turns: &[Turn]) -> Result<()> {
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await.map_err(db)?;
+        self.check_unmapped(&mut tx, channel).await?;
         for t in turns {
             sqlx::query("INSERT INTO turns (channel, role, content) VALUES (?1, ?2, ?3)")
                 .bind(channel)
@@ -131,6 +182,17 @@ impl HistoryStore for SqliteHistory {
         tx.commit().await.map_err(db)?;
         Ok(())
     }
+
+    async fn journal_page(&self, key: &str, request: PageRequest) -> Result<JournalPage> {
+        self.load_journal_page(key, request).await
+    }
+
+    async fn append_journal(&self, key: &str, request: &AppendRequest) -> Result<AppendReceipt> {
+        let mut tx = self.begin_journal().await?;
+        let receipt = self.append_journal_in(&mut tx, key, request).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(receipt)
+    }
 }
 
 fn role_str(r: Role) -> &'static str {
@@ -144,6 +206,14 @@ fn role_from(s: &str) -> Role {
     match s {
         "assistant" => Role::Assistant,
         _ => Role::User,
+    }
+}
+
+fn strict_role_from(s: &str) -> Result<Role> {
+    match s {
+        "assistant" => Ok(Role::Assistant),
+        "user" => Ok(Role::User),
+        _ => Err(HistoryError::Db("invalid stored journal role".into())),
     }
 }
 

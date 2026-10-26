@@ -1,10 +1,11 @@
+mod scope;
+pub(super) use scope::Scope;
+
 use std::time::Instant;
 
 use chrono::Utc;
-use octo_approval::{
-    Access, Origin, PreparedOperation, Stores, VerifiedInvocation, operation_hash,
-};
-use serde::{Deserialize, Serialize};
+use octo_approval::{PreparedOperation, VerifiedInvocation, operation_hash};
+use serde::Deserialize;
 use serde_json::{Value, from_str, json, to_string};
 use sha2::{Digest, Sha256};
 use sqlx::{Connection, Row, SqliteConnection, query};
@@ -21,74 +22,6 @@ use crate::{
     error::{SqlError, invalid},
 };
 
-#[derive(Clone, Serialize, Deserialize)]
-pub(super) struct Scope {
-    #[serde(default)]
-    pub presentation: PresentationSnapshot,
-    pub principal: String,
-    pub connector: String,
-    pub conversation: String,
-    pub destination: String,
-    pub stores: Option<Vec<String>>,
-    pub read: bool,
-    pub write: bool,
-    pub schema: bool,
-    pub delegated: bool,
-    pub policy_fingerprint: String,
-    pub max_affected_rows: u64,
-    pub timeout_ms: u64,
-}
-impl Scope {
-    pub(super) fn capture(
-        invocation: &VerifiedInvocation,
-        policy_fingerprint: String,
-        max_affected_rows: u64,
-        timeout_ms: u64,
-    ) -> Self {
-        Self {
-            presentation: PresentationSnapshot::default(),
-            principal: invocation.origin.principal.clone(),
-            connector: invocation.origin.connector.clone(),
-            conversation: invocation.origin.conversation.clone(),
-            destination: invocation.origin.private_destination.clone(),
-            stores: match &invocation.access.stores {
-                Stores::Owned => None,
-                Stores::Only(ids) => Some(ids.clone()),
-            },
-            read: invocation.access.read,
-            write: invocation.access.write,
-            schema: invocation.access.schema,
-            delegated: invocation.delegated,
-            policy_fingerprint,
-            max_affected_rows,
-            timeout_ms,
-        }
-    }
-    pub(super) fn invocation(&self) -> VerifiedInvocation {
-        VerifiedInvocation {
-            origin: Origin {
-                principal: self.principal.clone(),
-                connector: self.connector.clone(),
-                conversation: self.conversation.clone(),
-                private_destination: self.destination.clone(),
-                may_approve: false,
-            },
-            access: Access {
-                stores: self
-                    .stores
-                    .clone()
-                    .map(Stores::Only)
-                    .unwrap_or(Stores::Owned),
-                read: self.read,
-                write: self.write,
-                schema: self.schema,
-                create: false,
-            },
-            delegated: self.delegated,
-            remaining: Default::default(),
-        }
-    }
-}
 #[derive(Clone)]
 pub(super) struct Operation {
     pub prepared: PreparedOperation,
@@ -161,8 +94,17 @@ impl Database {
             .fetch_optional(conn)
             .await?
             .ok_or_else(|| SqlError::Authority("operation unavailable".into()))?;
+        let prepared: PreparedOperation = from_str(row.get("prepared")).map_err(invalid)?;
+        let stored_scope: &str = row.get("scope");
+        if prepared.scope != stored_scope
+            || operation_hash(&prepared).map_err(invalid)? != row.get::<String, _>("hash")
+        {
+            return Err(SqlError::Authority(
+                "stored operation scope/hash mismatch".into(),
+            ));
+        }
         Ok(Operation {
-            prepared: from_str(row.get("prepared")).map_err(invalid)?,
+            prepared,
             hash: row.get("hash"),
             scope: from_str(row.get("scope")).map_err(invalid)?,
             status: row.get("status"),
@@ -184,6 +126,9 @@ impl Database {
         authorization_deadline: Instant,
     ) -> Result<(Operation, bool), SqlError> {
         validate_key(key)?;
+        self.authority
+            .check_scope(invocation.scope_binding.as_ref())
+            .map_err(SqlError::Authority)?;
         let hash = request_hash(&request);
         let mut transaction = conn.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(row) = query("SELECT id,request_hash FROM __octo_sql_operations WHERE principal=? AND store_id=? AND idempotency_key=?")
@@ -235,6 +180,9 @@ impl Database {
         };
         let operation_hash = operation_hash(&prepared).map_err(invalid)?;
         let status = if pending { "pending" } else { "claimed" };
+        self.authority
+            .check_scope(scope.scope_binding.as_ref())
+            .map_err(SqlError::Authority)?;
         query("INSERT INTO __octo_sql_operations(id,hash,principal,store_id,prepared,scope,status,expires_at,idempotency_key,request_hash) VALUES(?,?,?,?,?,?,?,?,?,?)")
             .bind(&prepared.id).bind(&operation_hash).bind(&prepared.principal).bind(&prepared.store).bind(to_string(&prepared).map_err(invalid)?)
             .bind(to_string(&scope).map_err(invalid)?).bind(status).bind(prepared.expires_at).bind(key).bind(hash).execute(&mut *transaction).await?;
@@ -397,6 +345,7 @@ impl Database {
         }
         // Durable claim is separate from user SQL. A failed or interrupted
         // execution can never turn this grant back into a pending approval.
+        self.check_operation_scope(&operation)?;
         query("UPDATE __octo_sql_operations SET status='claimed' WHERE id=? AND status='pending'")
             .bind(&operation.prepared.id)
             .execute(&mut *transaction)

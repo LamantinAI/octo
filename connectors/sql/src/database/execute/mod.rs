@@ -288,6 +288,7 @@ impl Database {
         approved: bool,
         cancellation: Cancellation,
     ) -> Result<Value, SqlError> {
+        self.check_operation_scope(operation)?;
         if operation.scope.policy_fingerprint != self.policy_fingerprint() {
             return Err(SqlError::Stale);
         }
@@ -321,6 +322,7 @@ impl Database {
         } else {
             ExecutionPermit::ordinary()
         };
+        self.check_operation_scope(operation)?;
         let applied = self
             .apply_operation(
                 &mut transaction,

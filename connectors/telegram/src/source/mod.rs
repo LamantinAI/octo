@@ -1,14 +1,20 @@
 //! Verified transport provenance and addressing signals. Whether an unaddressed
 //! group event should start cognition remains a decision of the assembly.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use octo_approval::Ingress;
-use octo_core::{ChannelMetadata, Envelope, TrustLevel};
+use octo_core::{ChannelMetadata, ConnectorId, Envelope, TrustLevel};
 use serde_json::Value;
 use teloxide::types::{Message, MessageEntityKind, UserId};
 
-use crate::{Acl, Role, acl::GroupMode};
+use crate::{
+    Acl, IngressScope, NativeBatch, NativeFrame, Role, TelegramHostPolicy, acl::GroupMode,
+    inbound::chat_envelope,
+};
 
 #[derive(Clone, Default)]
 pub(super) struct GroupSettings {
@@ -41,10 +47,13 @@ impl CommandCatalog {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub(super) struct MessageSource {
     pub tags: HashMap<String, String>,
     pub proof: Option<Ingress>,
+    pub pinned: Option<Envelope>,
+    pub scope: Option<IngressScope>,
+    pub frames: Vec<NativeFrame>,
 }
 
 impl MessageSource {
@@ -57,10 +66,69 @@ impl MessageSource {
         if let Some(proof) = self.proof {
             envelope = envelope.with_context(proof);
         }
+        if let Some(pinned) = self.pinned {
+            let addressed = envelope
+                .channel_metadata
+                .as_ref()
+                .is_some_and(|m| m.tags.get("addressed").is_some_and(|v| v == "true"));
+            let invalid = envelope
+                .channel_metadata
+                .as_ref()
+                .is_some_and(|m| m.tags.get("scope_invalid").is_some_and(|v| v == "true"));
+            envelope.id = pinned.id;
+            envelope.context = pinned.context;
+            envelope.tags.extend(pinned.tags);
+            if let Some(mut metadata) = pinned.channel_metadata {
+                if addressed {
+                    metadata.tags.insert("addressed".into(), "true".into());
+                }
+                if invalid {
+                    metadata.tags.insert("scope_invalid".into(), "true".into());
+                }
+                envelope.channel_metadata = Some(metadata);
+            }
+        }
+        if let Some(scope) = self.scope {
+            envelope = envelope.with_context(scope);
+        }
+        if !self.frames.is_empty() {
+            envelope = envelope.with_context(NativeBatch {
+                frames: self.frames,
+            });
+        }
         envelope
     }
 
+    pub fn pin(&mut self, envelope: Envelope, scope: IngressScope, frame: NativeFrame) {
+        self.proof = envelope.context.get::<Ingress>().cloned();
+        self.pinned = Some(envelope);
+        self.scope = Some(scope);
+        self.frames = vec![frame];
+    }
+
+    pub fn allowed(
+        &self,
+        policy: Option<&Arc<dyn TelegramHostPolicy>>,
+        id: &ConnectorId,
+        chat: &str,
+    ) -> bool {
+        if self.tags.get("scope_invalid").is_some_and(|v| v == "true") {
+            return false;
+        }
+        let Some(policy) = policy else { return true };
+        let env = self
+            .clone()
+            .apply(chat_envelope(id, chat, String::new(), None, None));
+        policy.allow_publish(&env)
+    }
+
     pub fn merge(&mut self, next: Self) {
+        let incompatible = self.tags.get("scope_invalid").is_some_and(|v| v == "true")
+            || self.scope != next.scope
+            || (self.scope.is_some()
+                && ["sender_id", "sender_chat_id", "role"]
+                    .iter()
+                    .any(|key| self.tags.get(*key) != next.tags.get(*key)));
         self.proof = match (&self.proof, &next.proof) {
             (Some(previous), Some(current))
                 if previous.origin().principal == current.origin().principal
@@ -75,6 +143,12 @@ impl MessageSource {
             || next.tags.get("addressed").is_some_and(|s| s == "true");
         self.tags = next.tags;
         self.tags.insert("addressed".into(), addressed.to_string());
+        if incompatible {
+            self.tags.insert("scope_invalid".into(), "true".into());
+        }
+        self.pinned = next.pinned;
+        self.scope = next.scope;
+        self.frames.extend(next.frames);
     }
 }
 
@@ -264,7 +338,13 @@ pub(super) fn perceive(
             acl.group_mode(message.chat.id.0).as_str().into(),
         );
     }
-    Some((trust, MessageSource { tags, proof: None }))
+    Some((
+        trust,
+        MessageSource {
+            tags,
+            ..MessageSource::default()
+        },
+    ))
 }
 
 #[cfg(test)]

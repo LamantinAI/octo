@@ -9,8 +9,31 @@
 //! Everything else still goes through teloxide. When a typed builder appears,
 //! this module is what gets deleted.
 
+use crate::policy::tracking::MessageRef;
 use serde_json::{Value, json};
+use std::fmt::{Display, Formatter, Result as FmtResult};
 use teloxide::{Bot, types::ChatId};
+
+pub(crate) enum RichError {
+    Rejected(String),
+    Unknown,
+}
+impl RichError {
+    pub(crate) fn unknown(&self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+    pub(crate) fn description(&self) -> &str {
+        match self {
+            Self::Rejected(message) => message,
+            Self::Unknown => "Telegram delivery outcome is unknown",
+        }
+    }
+}
+impl Display for RichError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        self.description().fmt(f)
+    }
+}
 
 /// Send Markdown as a rich message. `Err` carries a description for the log and
 /// for deciding whether to drop back to the HTML renderer — never the URL, which
@@ -19,7 +42,7 @@ pub(crate) async fn send_rich_markdown(
     bot: &Bot,
     chat: ChatId,
     markdown: &str,
-) -> Result<(), String> {
+) -> Result<Option<MessageRef>, RichError> {
     let url = method_url(bot, "sendRichMessage");
     let body = json!({
         "chat_id": chat.0,
@@ -34,20 +57,27 @@ pub(crate) async fn send_rich_markdown(
         .json(&body)
         .send()
         .await
-        .map_err(|e| e.without_url().to_string())?;
+        .map_err(|_| RichError::Unknown)?;
     let status = response.status();
-    let payload: Value = response
-        .json()
-        .await
-        .map_err(|e| e.without_url().to_string())?;
+    let payload: Value = response.json().await.map_err(|_| RichError::Unknown)?;
     if payload.get("ok").and_then(Value::as_bool) == Some(true) {
-        return Ok(());
+        let message = payload.get("result");
+        return Ok(message.and_then(|m| {
+            Some(MessageRef {
+                chat_id: m.get("chat")?.get("id")?.as_i64()?,
+                message_id: i32::try_from(m.get("message_id")?.as_i64()?).ok()?,
+                date: m.get("date")?.as_i64()?,
+            })
+        }));
     }
     let description = payload
         .get("description")
         .and_then(Value::as_str)
         .unwrap_or("no description");
-    Err(format!("{status}: {description}"))
+    if payload.get("ok").and_then(Value::as_bool) != Some(false) {
+        return Err(RichError::Unknown);
+    }
+    Err(RichError::Rejected(format!("{status}: {description}")))
 }
 
 /// The endpoint for a method on the bot's own API server — a `Url` always

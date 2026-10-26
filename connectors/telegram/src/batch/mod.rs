@@ -94,6 +94,16 @@ impl Batcher {
         !self.debounce.is_zero()
     }
 
+    pub fn addressed_base(&self, base: &str) -> bool {
+        self.pending
+            .values()
+            .filter_map(|p| p.source.as_ref())
+            .any(|s| {
+                s.tags.get("native_coalesce_key").is_some_and(|v| v == base)
+                    && s.tags.get("addressed").is_some_and(|v| v == "true")
+            })
+    }
+
     pub fn push_text(
         &mut self,
         key: String,
@@ -375,7 +385,7 @@ mod tests {
                         ("sender_id".into(), "7".into()),
                         ("addressed".into(), called.into()),
                     ]),
-                    proof: None,
+                    ..MessageSource::default()
                 },
             );
         }

@@ -1,7 +1,6 @@
-use sqlx::query;
-use sqlx::query_as;
+use sqlx::{Sqlite, Transaction, query, query_as};
 
-use super::{SqliteHistory, db, role_from};
+use super::{SqliteHistory, db, strict_role_from};
 use crate::{Compact, ContextWindow, HistoryError, Result, StoredTurn, Turn};
 
 impl SqliteHistory {
@@ -32,19 +31,37 @@ impl SqliteHistory {
             compact,
             messages: rows
                 .into_iter()
-                .map(|(id, role, content)| StoredTurn {
-                    id,
-                    turn: Turn {
-                        role: role_from(&role),
-                        content,
-                    },
+                .map(|(id, role, content)| {
+                    Ok(StoredTurn {
+                        id,
+                        turn: Turn {
+                            role: strict_role_from(&role)?,
+                            content,
+                        },
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>>>()?,
         })
     }
 
     pub(super) async fn commit_compact(
         &self,
+        channel: &str,
+        previous: Option<i64>,
+        through: i64,
+        content: &str,
+    ) -> Result<bool> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        let saved = self
+            .commit_compact_in(&mut tx, channel, previous, through, content)
+            .await?;
+        tx.commit().await.map_err(db)?;
+        Ok(saved)
+    }
+
+    pub(super) async fn commit_compact_in(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
         channel: &str,
         previous: Option<i64>,
         through: i64,
@@ -65,7 +82,7 @@ impl SqliteHistory {
             AND (SELECT id FROM compacts WHERE channel = ?1 ORDER BY id DESC LIMIT 1) IS ?3
             AND ?2 >= COALESCE((SELECT through_id FROM compacts WHERE channel = ?1 ORDER BY id DESC LIMIT 1), 0)")
             .bind(channel).bind(through).bind(previous).bind(content)
-            .execute(&self.pool).await.map_err(db)?;
+            .execute(&mut **tx).await.map_err(db)?;
         Ok(result.rows_affected() == 1)
     }
 }

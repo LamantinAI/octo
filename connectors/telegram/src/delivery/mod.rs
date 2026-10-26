@@ -14,10 +14,11 @@ use tokio::time::timeout;
 use tracing::{info, warn};
 
 use crate::{
-    AclState, SEND_FILE_RESULT,
+    AclState, DeliveryStatus, IngressScope, SEND_FILE_RESULT, TelegramOutputScope,
     control::outgoing_allowed,
     fs::{load_outgoing, workspace_root},
     outbound::{Outbound, outbound_kind},
+    policy::{delivery::Delivery, tracking::MessageRef},
     source::GroupSettings,
 };
 
@@ -33,8 +34,39 @@ pub(super) async fn handle_file(
     id: &ConnectorId,
     env: &Envelope,
     ctx: &ConnectorContext,
+    delivery: Option<&Delivery<'_>>,
 ) {
-    let result = deliver(bot, workspace, acl, groups, env).await;
+    let result = if delivery.is_some_and(|d| !d.allowed()) {
+        failed("not_sent", "The originating chat scope is closed.")
+    } else {
+        deliver(bot, workspace, acl, groups, env).await
+    };
+    if let Some(delivery) = delivery {
+        let chat = result
+            .get("chat_id")
+            .and_then(Value::as_i64)
+            .or_else(|| env.channel.as_ref().and_then(|c| c.as_str().parse().ok()))
+            .unwrap_or(0);
+        let status = match result["status"].as_str() {
+            Some("sent") => DeliveryStatus::Sent,
+            Some("unknown") => DeliveryStatus::Unknown,
+            _ => DeliveryStatus::Failed,
+        };
+        let messages = match (result["message_id"].as_i64(), result["date"].as_i64()) {
+            (Some(id), Some(date)) => i32::try_from(id)
+                .ok()
+                .map(|message_id| {
+                    vec![MessageRef {
+                        chat_id: chat,
+                        message_id,
+                        date,
+                    }]
+                })
+                .unwrap_or_default(),
+            _ => vec![],
+        };
+        delivery.report(chat, &messages, status).await;
+    }
     let mut response = Envelope::new(id.clone(), EventKind::from_static(SEND_FILE_RESULT), result)
         .with_correlation(env.id)
         .with_target(env.source.clone());
@@ -122,9 +154,19 @@ async fn deliver(
         }
     };
     match timeout(Duration::from_secs(90), send).await {
-        Ok(Ok(message)) => {
-            info!(chat, %path, kind = ?kind, "sent file");
-            json!({"ok":true,"status":"sent","sent":path,"chat_id":message.chat.id.0,"message_id":message.id.0})
+        Ok(Ok(message)) if message.id.0 > 0 => {
+            let ephemeral = env
+                .context
+                .get::<TelegramOutputScope>()
+                .is_some_and(|s| s.scope.ephemeral)
+                || env
+                    .context
+                    .get::<IngressScope>()
+                    .is_some_and(|s| s.ephemeral);
+            if !ephemeral {
+                info!(chat, %path, kind = ?kind, "sent file");
+            }
+            json!({"ok":true,"status":"sent","sent":path,"chat_id":message.chat.id.0,"message_id":message.id.0,"date":message.date.timestamp()})
         }
         Ok(Err(
             error @ (RequestError::Api(_)
@@ -223,6 +265,7 @@ mod tests {
                 &ConnectorId::new("telegram"),
                 env,
                 &ctx,
+                None,
             ),
         )
         .await

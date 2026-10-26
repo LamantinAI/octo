@@ -7,6 +7,9 @@ mod presentation;
 mod schema;
 mod service;
 
+#[cfg(test)]
+mod scopes;
+
 mod driver;
 pub use driver::Database;
 pub(crate) use driver::{Completion, Notice};

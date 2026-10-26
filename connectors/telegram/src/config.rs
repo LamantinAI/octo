@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 use super::{AclState, DEFAULT_DEBOUNCE, DEFAULT_MAX_WAIT, TelegramConnector};
 use crate::source::GroupSettings;
-use crate::{Acl, Role};
+use crate::{Acl, Role, TelegramHostPolicy};
 
 // ── Config-driven construction (`type = "telegram"` manifest) ────────────────
 
@@ -166,4 +166,34 @@ impl ConnectorFactory for AuthorizedFactory {
 /// Bind real Telegram ingress to an assembly-owned authority service.
 pub fn factory_with_authority(authority: Authority) -> Arc<dyn ConnectorFactory> {
     Arc::new(AuthorizedFactory(authority))
+}
+
+struct PolicyFactory {
+    authority: Authority,
+    policy: Arc<dyn TelegramHostPolicy>,
+}
+impl ConnectorFactory for PolicyFactory {
+    fn type_name(&self) -> &str {
+        "telegram"
+    }
+    fn create(
+        &self,
+        id: ConnectorId,
+        config: &toml::Value,
+        ctx: FactoryContext<'_>,
+    ) -> Result<Arc<dyn Connector>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut connector = create_connector(id, config, ctx)?;
+        let instance = Arc::get_mut(&mut connector).expect("new connector");
+        instance.authority = Some(self.authority.clone());
+        instance.policy = Some(self.policy.clone());
+        Ok(connector)
+    }
+}
+
+/// Optional host session policy, while retaining Telegram ACL/native authority.
+pub fn factory_with_policy(
+    authority: Authority,
+    policy: Arc<dyn TelegramHostPolicy>,
+) -> Arc<dyn ConnectorFactory> {
+    Arc::new(PolicyFactory { authority, policy })
 }

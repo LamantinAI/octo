@@ -127,6 +127,10 @@ impl Database {
                     ));
                 }
                 invocation.remaining = deadline.saturating_duration_since(Instant::now());
+                database
+                    .authority
+                    .check_scope(invocation.scope_binding.as_ref())
+                    .map_err(SqlError::Authority)?;
                 database.engine.validate_identity()?;
                 let value = database
                     .dispatch(&mut conn, &kind, payload, invocation, cancellation.clone())

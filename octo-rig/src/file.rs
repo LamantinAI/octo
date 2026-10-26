@@ -1,6 +1,8 @@
-use std::{sync::Arc, time::Duration};
+use std::{any::Any, sync::Arc, time::Duration};
 
-use octo_core::{ChannelId, ConnectorId, Envelope, EventBus, EventKind, InProcessBus};
+use octo_core::{
+    ChannelId, ConnectorId, Envelope, EnvelopeContext, EventBus, EventKind, InProcessBus,
+};
 use rig::{completion::ToolDefinition, tool::Tool};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -19,6 +21,7 @@ pub struct SendFileTool {
     channel: String,
     confirmation_timeout: Option<Duration>,
     origin: Option<(ConnectorId, ChannelId)>,
+    context: EnvelopeContext,
 }
 
 impl SendFileTool {
@@ -35,7 +38,12 @@ impl SendFileTool {
             channel: channel.into(),
             confirmation_timeout: None,
             origin: None,
+            context: EnvelopeContext::default(),
         }
+    }
+    pub fn with_context<T: Any + Send + Sync>(mut self, value: T) -> Self {
+        self.context.insert(value);
+        self
     }
     /// Host-supplied provenance, independent of the file's destination.
     pub fn with_origin(mut self, connector: ConnectorId, channel: ChannelId) -> Self {
@@ -97,6 +105,7 @@ impl Tool for SendFileTool {
         )
         .with_target(self.target.clone())
         .with_channel(ChannelId::new(self.channel.clone()));
+        env.context = self.context.clone();
 
         if let Some((connector, channel)) = &self.origin {
             env = env
@@ -104,7 +113,7 @@ impl Tool for SendFileTool {
                 .with_tag("origin.channel", channel.as_str());
         }
 
-        tracing::info!(path = %args.path, target = %self.target, "rig tool → send_file");
+        tracing::info!(target = %self.target, "rig tool → send_file");
         if let Some(timeout) = self.confirmation_timeout {
             return Ok(match self.bus.publish_and_await_response(env, timeout).await {
                 Ok(reply) => reply.payload_as::<Value>().cloned().unwrap_or_else(|| json!({"ok":false,"status":"unknown","error":"Invalid delivery acknowledgement; check the destination before retrying."})),

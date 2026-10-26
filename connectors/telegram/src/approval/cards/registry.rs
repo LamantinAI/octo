@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -7,6 +8,8 @@ use octo_approval::ApprovalPresentation;
 use octo_core::{ConnectorId, Envelope};
 use rand::{RngCore, rngs::OsRng};
 use teloxide::types::{CallbackQuery, MessageId};
+
+use super::delivery::CardDelivery;
 
 #[derive(Clone, Debug)]
 pub(crate) struct CardSettings {
@@ -102,12 +105,13 @@ pub(super) struct Card {
     pub chat: i64,
     pub message: Option<MessageId>,
     pub state: State,
+    pub delivery: Option<Arc<CardDelivery>>,
     retain_until: Instant,
 }
 #[derive(Debug)]
 pub(super) enum Reject {
     Invalid,
-    Expired(Card),
+    Expired(Box<Card>),
     Unavailable,
     Forbidden,
 }
@@ -195,6 +199,7 @@ impl Registry {
             presentation,
             message: None,
             state: State::Pending,
+            delivery: None,
             retain_until: Instant::now() + Duration::from_secs(self.settings.retention_seconds),
         };
         self.cards.insert(token, card.clone());
@@ -230,7 +235,7 @@ impl Registry {
             if card.state == State::Pending {
                 card.state = State::Expired;
             }
-            return Err(Reject::Expired(card.clone()));
+            return Err(Reject::Expired(Box::new(card.clone())));
         }
         let effective = if action.is_decision() && card.state != State::Pending {
             Action::Status

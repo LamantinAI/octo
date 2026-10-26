@@ -1,6 +1,8 @@
 //! Host-authenticated invocation grants and operation-specific approval contracts.
 mod authority;
 mod operation;
+mod scope;
+pub use scope::{ScopeBinding, ScopeValidator};
 mod presentation;
 mod settings;
 
