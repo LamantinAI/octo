@@ -1,0 +1,18 @@
+[package]
+name = "octo-connector-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Hosted HTTP router and event bridge under the Octo connector lifecycle"
+
+[dependencies]
+octo-core = { path = "../../octo-core" }
+async-trait.workspace = true
+axum.workspace = true
+tokio = { workspace = true, features = ["net"] }
+tracing.workspace = true
+
+[dev-dependencies]
+reqwest.workspace = true
+serde_json.workspace = true

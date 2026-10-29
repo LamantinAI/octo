@@ -30,6 +30,7 @@ const COMMANDS: &[&str] = &[
     "sql.execute",
     "sql.schema.apply",
     "sql.operation.status",
+    "sql.approval.list",
 ];
 const CATALOG: &str = "SQLite application stores (separate from host memory/history). All calls require host-bound identity. \
 Use sql.store.create {name,purpose,tags?,idempotency_key}; list/search {query?,cursor?,limit?}; describe {store_id,tables?}. \

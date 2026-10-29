@@ -18,12 +18,15 @@ pub(crate) use driver::{Completion, Notice};
 mod tests {
     use std::{
         fs::{hard_link, read, write},
-        sync::Arc,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
         time::Duration,
     };
 
     use chrono::Utc;
-    use octo_approval::{Access, Authority, Origin};
+    use octo_approval::{Access, Authority, Origin, ScopeBinding, ScopeValidator, Stores};
     use octo_core::{ConnectorId, Envelope, EventKind};
     use serde_json::{Value, json};
     use sqlx::{Row, query};
@@ -335,5 +338,181 @@ mod tests {
         let pending = work.await.unwrap().unwrap();
         assert_eq!(pending["status"], "approval_required", "{pending}");
         assert!(pending["expires_at"].as_i64().unwrap() * 1000 <= started + 3000);
+    }
+
+    struct QueueScope(AtomicBool);
+    impl ScopeValidator for QueueScope {
+        fn allows(&self, binding: &ScopeBinding) -> bool {
+            binding.opaque_id == "queue-test"
+                && binding.epoch == "epoch"
+                && self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    async fn list_with(
+        f: &Fixture,
+        origin: Origin,
+        access: Access,
+        delegated: bool,
+    ) -> Result<Value, SqlError> {
+        let ingress = f.authority.issue(origin, access);
+        let ingress = if delegated {
+            ingress.attenuate(Vec::new(), false, false).unwrap()
+        } else {
+            ingress
+        };
+        let envelope = Envelope::new(
+            ConnectorId::new("test"),
+            EventKind::new("sql.approval.list"),
+            json!({}),
+        )
+        .with_target(ConnectorId::new("sql"));
+        let proof = f.authority.bind(&ingress, &envelope).unwrap();
+        f.db.handle(&envelope.with_context(proof)).await
+    }
+
+    #[tokio::test]
+    async fn approval_queue_requires_human_private_read_and_current_store_grants() {
+        let f = Fixture::new(Limits::default()).await;
+        let store = f.store().await;
+        let table = f.table(&store).await;
+        let pending = f.call("sql.execute", json!({"store_id":store,"expected_revision":2,"sql":format!("DELETE FROM {table}"),"idempotency_key":"queue"})).await.unwrap();
+        assert_eq!(pending["status"], "approval_required");
+        let origin = Origin {
+            principal: "owner".into(),
+            connector: "web".into(),
+            conversation: "private".into(),
+            private_destination: "private".into(),
+            may_approve: true,
+        };
+        let listing = list_with(&f, origin.clone(), Access::owner(), false)
+            .await
+            .unwrap();
+        assert_eq!(listing["items"][0]["operation_id"], pending["operation_id"]);
+        let mut no_read = Access::owner();
+        no_read.read = false;
+        assert!(matches!(
+            list_with(&f, origin.clone(), no_read, false).await,
+            Err(SqlError::Authority(_))
+        ));
+        let mut no_approval = origin.clone();
+        no_approval.may_approve = false;
+        assert!(matches!(
+            list_with(&f, no_approval, Access::owner(), false).await,
+            Err(SqlError::Authority(_))
+        ));
+        let mut group = origin.clone();
+        group.conversation = "group".into();
+        assert!(matches!(
+            list_with(&f, group, Access::owner(), false).await,
+            Err(SqlError::Authority(_))
+        ));
+        assert!(matches!(
+            list_with(&f, origin.clone(), Access::owner(), true).await,
+            Err(SqlError::Authority(_))
+        ));
+        let mut restricted = Access::owner();
+        restricted.stores = Stores::Only(vec!["another-store".into()]);
+        assert_eq!(
+            list_with(&f, origin.clone(), restricted, false)
+                .await
+                .unwrap()["items"],
+            json!([])
+        );
+        let mut granted = Access::owner();
+        granted.stores = Stores::Only(vec![store]);
+        assert_eq!(
+            list_with(&f, origin, granted, false).await.unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let unproved = Envelope::new(
+            ConnectorId::new("test"),
+            EventKind::new("sql.approval.list"),
+            json!({}),
+        )
+        .with_target(ConnectorId::new("sql"));
+        assert!(matches!(
+            f.db.handle(&unproved).await,
+            Err(SqlError::Authority(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn approval_queue_is_principal_scoped_and_excludes_decided_expired_or_closed_work() {
+        let f = Fixture::new(Limits::default()).await;
+        let live = Arc::new(QueueScope(AtomicBool::new(true)));
+        f.authority.clone().with_scope_validator(live.clone());
+        let store = f.store().await;
+        let table = f.table(&store).await;
+        let pending = f.call("sql.execute", json!({"store_id":store,"expected_revision":2,"sql":format!("DELETE FROM {table}"),"idempotency_key":"decided"})).await.unwrap();
+        assert_eq!(
+            f.db.handle(&f.envelope("sql.approval.list", json!({}), false, "another-owner"))
+                .await
+                .unwrap()["items"],
+            json!([])
+        );
+        assert_eq!(
+            f.call("sql.approval.list", json!({})).await.unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        f.call(
+            "sql.approval.decide",
+            json!({"operation_id":pending["operation_id"],"approve":false}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            f.call("sql.approval.list", json!({})).await.unwrap()["items"],
+            json!([])
+        );
+
+        let ingress = f.authority.issue(
+            Origin {
+                principal: "owner".into(),
+                connector: "web".into(),
+                conversation: "private".into(),
+                private_destination: "private".into(),
+                may_approve: true,
+            },
+            Access::owner(),
+        );
+        let ingress = f
+            .authority
+            .bind_scope(&ingress, ScopeBinding::new("queue-test", "epoch").unwrap())
+            .unwrap();
+        let envelope = Envelope::new(ConnectorId::new("test"), EventKind::new("sql.execute"), json!({"store_id":store,"expected_revision":2,"sql":format!("DELETE FROM {table}"),"idempotency_key":"closed"})).with_target(ConnectorId::new("sql"));
+        let proof = f.authority.bind(&ingress, &envelope).unwrap();
+        let closed = f.db.handle(&envelope.with_context(proof)).await.unwrap();
+        assert_eq!(closed["status"], "approval_required");
+        assert_eq!(
+            f.call("sql.approval.list", json!({})).await.unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        live.0.store(false, Ordering::SeqCst);
+        assert_eq!(
+            f.call("sql.approval.list", json!({})).await.unwrap()["items"],
+            json!([])
+        );
+        live.0.store(true, Ordering::SeqCst);
+        let mut connection = f.db.connection.lock().await;
+        query("UPDATE __octo_sql_operations SET expires_at=0 WHERE id=?")
+            .bind(closed["operation_id"].as_str().unwrap())
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        drop(connection);
+        assert_eq!(
+            f.call("sql.approval.list", json!({})).await.unwrap()["items"],
+            json!([])
+        );
     }
 }

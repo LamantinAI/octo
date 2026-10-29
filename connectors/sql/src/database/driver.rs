@@ -243,6 +243,7 @@ impl Database {
                 self.operation_status(conn, from_value(payload).map_err(invalid)?, &invocation)
                     .await
             }
+            "sql.approval.list" => self.pending_operations(conn, &invocation).await,
             _ => Err(invalid("unknown SQL command")),
         }
     }
