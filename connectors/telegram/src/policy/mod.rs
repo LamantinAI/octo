@@ -1,5 +1,6 @@
 //! Optional assembly-owned policy. The connector owns Telegram IO; the host owns
 //! session meaning. Native frames/stamps are captured before download or batching.
+use crate::{CallbackDecision, CallbackFrame, CallbackLimits};
 use async_trait::async_trait;
 use octo_core::{ConnectorId, Envelope};
 use std::time::Duration;
@@ -120,6 +121,13 @@ pub trait TelegramHostPolicy: Send + Sync {
         frame: NativeFrame,
         provisional: Envelope,
     ) -> Result<IngressDecision, String>;
+    /// Generic human callback transport only; no native message/tool authority.
+    async fn callback(&self, _frame: CallbackFrame) -> Result<CallbackDecision, String> {
+        Ok(CallbackDecision::unavailable())
+    }
+    fn callback_limits(&self) -> CallbackLimits {
+        CallbackLimits::default()
+    }
     /// Rechecks only the pinned stamp; must never resolve the current selector again.
     fn allow_publish(&self, _envelope: &Envelope) -> bool {
         true

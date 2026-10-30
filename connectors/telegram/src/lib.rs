@@ -29,6 +29,10 @@ mod acl;
 mod api;
 mod approval;
 mod batch;
+mod callbacks;
+mod inline;
+pub use callbacks::{CallbackDecision, CallbackFrame, CallbackLimits, CallbackMessage};
+pub use inline::{InlineButton, InlineKeyboard, InlineKeyboardError};
 mod commands;
 mod feedback;
 mod format;
@@ -55,6 +59,7 @@ mod control;
 mod delivery;
 mod inbound;
 mod outbound;
+pub use outbound::ClassicMarkdown;
 mod runtime;
 mod source;
 #[cfg(test)]
