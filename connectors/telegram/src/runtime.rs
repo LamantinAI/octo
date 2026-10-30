@@ -38,11 +38,13 @@ use super::{
     outbound::{is_voice_blob, send_reply},
 };
 use crate::{
-    AllowReplyContext, DeliveryStatus, NativeFrame,
+    AllowReplyContext, DeliveryStatus, InlineKeyboard, NativeFrame,
     approval::{Cards, handle_decision, message_proof},
     batch::{Batcher, Emit, Flush},
+    callbacks::{CallbackInput, Callbacks},
     commands::{SET_COMMANDS, set_commands},
     fs::{save_incoming, workspace_root},
+    inline::send_inline,
     live::Live,
     policy::delivery::{Delivery, notice},
     policy::tracking::MessageRef,
@@ -62,6 +64,15 @@ impl Connector for TelegramConnector {
 
     async fn run(self: Arc<Self>, ctx: ConnectorContext) -> OctoResult<()> {
         let bot = Bot::new(self.token.clone());
+        self.run_with_bot(ctx, bot).await
+    }
+}
+impl TelegramConnector {
+    pub(crate) async fn run_with_bot(
+        self: Arc<Self>,
+        ctx: ConnectorContext,
+        bot: Bot,
+    ) -> OctoResult<()> {
         let me = bot
             .get_me()
             .await
@@ -72,6 +83,7 @@ impl Connector for TelegramConnector {
         let bot_id = me.user.id;
 
         let cards = Cards::new(self.approval_cards.clone());
+        let callbacks = Callbacks::new(self.policy.clone());
         let tracker = Tracker::new(
             self.policy
                 .as_ref()
@@ -166,6 +178,10 @@ impl Connector for TelegramConnector {
                             // the status trace.
                             out_live.end_turn(&out_bot, chat_id,&env);
 
+                            if let Some(keyboard) = env.context.get::<InlineKeyboard>() {
+                                send_inline(&out_bot, chat_id, env.payload_as::<String>().map(String::as_str), keyboard, &delivery).await;
+                                continue;
+                            }
                             // A media payload → photo/voice/document; a String → text.
                             if let Some(blob) = env.payload_as::<Blob>() {
                                 let file = InputFile::memory(blob.bytes().clone())
@@ -242,7 +258,11 @@ impl Connector for TelegramConnector {
                             register_add(&self.acl, &groups, change);
                         }
                         if let UpdateKind::CallbackQuery(query)=update.kind {
-                            cards.callback(&bot,&self.id,&self.acl,&self.authority,query,&ctx,self.approval_timeout).await;
+                            if query.data.as_deref().is_some_and(|data| data.starts_with("oa:")) {
+                                cards.callback(&bot,&self.id,&self.acl,&self.authority,query,&ctx,self.approval_timeout).await;
+                            } else {
+                                callbacks.handle(&bot,CallbackInput {connector:self.id.clone(),bot_id:bot_id.0,update_id,query},&self.acl,&groups,&ctx).await;
+                            }
                             continue;
                         }
                         if let UpdateKind::Message(msg) = update.kind {

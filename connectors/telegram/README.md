@@ -40,6 +40,45 @@ use envelope tag `control_reply=true` with original sender/chat metadata to answ
 bootstrap commands or confirm revocation. It cannot target a different chat.
 No ACL configured retains the standalone connector's allow-all behavior.
 
+## Per-reply Markdown rendering
+
+The host can attach `ClassicMarkdown` to a reply's context to use native Telegram
+formatted text instead of rich-message blocks. Markdown becomes the supported
+inline HTML subset, with explicit newline gaps between paragraphs. This is useful
+for bounded control notices whose literal spacing matters. The preference applies
+to that reply only; it does not disable rich rendering for subsequent answers.
+
+## Host inline controls
+
+An assembly can attach an `InlineKeyboard` to the context of a string
+`chat.reply`. `InlineButton::new(label, data)` validates a single-line label of
+at most 64 characters and callback data of 1–64 bytes; `InlineKeyboard::new(rows)`
+bounds the rows and button count. These are host types, never reconstructed from
+model JSON or envelope tags. The `oa:` callback namespace is reserved for the
+existing approval subsystem.
+
+A marked reply is one literal plain-text message with its keyboard. It retains
+the normal outbound ACL, host delivery checks and native delivery observations.
+Invalid or oversized text fails before sending; it is not split with a missing
+keyboard or retried through another renderer. Ordinary rich replies and approval
+cards keep their existing rendering paths.
+
+`TelegramHostPolicy::callback` receives a `CallbackFrame` with transport-derived
+connector, bot, update/query IDs, clicker, message facts and opaque data. Message
+accessibility is explicit. Missing or inline-only messages without a known chat,
+malformed data and ACL refusals are acknowledged without invoking host policy.
+The frame grants no native tool authority. The host must check its own resource
+access and idempotency; the button message's date/ID is not a new click identity.
+
+The hook returns a bounded `CallbackDecision`: an optional acknowledgement,
+alert flag and post-events. It cannot manufacture `chat.message` input. Polling
+awaits callback admission before handling the next update, so subsequent native
+input observes the committed host state. Both the hook and acknowledgement have
+deadlines; defaults are five seconds each, adjustable through `callback_limits`.
+Acknowledgement failure does not discard committed post-events or trigger an
+automatic retry. Post-events still pass normal host publication/delivery fences.
+`oa:` callbacks remain exclusively with the approval handler.
+
 ## File delivery results
 
 `chat.send_file` is a request/reply operation. The connector advertises
