@@ -8,14 +8,32 @@
 
 #![allow(dead_code)]
 
-use std::sync::Arc;
+use std::{io::Result as IoResult, sync::Arc};
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    spawn,
 };
 
-type Handler = Box<dyn Fn(&str) -> String + Send + Sync>;
+type Handler = Box<dyn Fn(&Request) -> String + Send + Sync>;
+
+#[derive(Debug, Clone)]
+pub struct Request {
+    pub method: String,
+    pub target: String,
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+}
+
+impl Request {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
 
 /// One mock route: an exact method + path, a status, and a body-producing handler.
 pub struct Route {
@@ -31,6 +49,15 @@ impl Route {
         path: &str,
         status: u16,
         handler: impl Fn(&str) -> String + Send + Sync + 'static,
+    ) -> Self {
+        Self::with_request(method, path, status, move |request| handler(&request.body))
+    }
+
+    pub fn with_request(
+        method: &str,
+        path: &str,
+        status: u16,
+        handler: impl Fn(&Request) -> String + Send + Sync + 'static,
     ) -> Self {
         Self {
             method: method.to_ascii_uppercase(),
@@ -52,13 +79,13 @@ impl MockServer {
         let addr = listener.local_addr().unwrap();
         let routes = Arc::new(routes);
 
-        tokio::spawn(async move {
+        spawn(async move {
             loop {
                 let Ok((socket, _)) = listener.accept().await else {
                     break;
                 };
                 let routes = Arc::clone(&routes);
-                tokio::spawn(async move {
+                spawn(async move {
                     let _ = serve_one(socket, &routes).await;
                 });
             }
@@ -74,13 +101,16 @@ impl MockServer {
     }
 }
 
-async fn serve_one(mut socket: TcpStream, routes: &[Route]) -> std::io::Result<()> {
-    let (method, target, body) = read_request(&mut socket).await?;
-    let path = target.split('?').next().unwrap_or(&target);
+async fn serve_one(mut socket: TcpStream, routes: &[Route]) -> IoResult<()> {
+    let request = read_request(&mut socket).await?;
+    let path = request.target.split('?').next().unwrap_or(&request.target);
 
-    let (status, resp_body) = match routes.iter().find(|r| r.method == method && r.path == path) {
-        Some(route) => (route.status, (route.handler)(&body)),
-        None => (404, format!("no mock route for {method} {path}")),
+    let (status, resp_body) = match routes
+        .iter()
+        .find(|r| r.method == request.method && r.path == path)
+    {
+        Some(route) => (route.status, (route.handler)(&request)),
+        None => (404, format!("no mock route for {} {path}", request.method)),
     };
 
     let reason = match status {
@@ -102,7 +132,7 @@ async fn serve_one(mut socket: TcpStream, routes: &[Route]) -> std::io::Result<(
 }
 
 /// Read one HTTP request: the method, the request target, and the body.
-async fn read_request(socket: &mut TcpStream) -> std::io::Result<(String, String, String)> {
+async fn read_request(socket: &mut TcpStream) -> IoResult<Request> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
 
@@ -125,8 +155,12 @@ async fn read_request(socket: &mut TcpStream) -> std::io::Result<(String, String
     let method = parts.next().unwrap_or_default().to_ascii_uppercase();
     let target = parts.next().unwrap_or_default().to_string();
 
-    let content_length = lines
+    let headers: Vec<(String, String)> = lines
         .filter_map(|l| l.split_once(':'))
+        .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
+        .collect();
+    let content_length = headers
+        .iter()
         .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
         .and_then(|(_, v)| v.trim().parse::<usize>().ok())
         .unwrap_or(0);
@@ -142,7 +176,12 @@ async fn read_request(socket: &mut TcpStream) -> std::io::Result<(String, String
         body.extend_from_slice(&chunk[..n]);
     }
 
-    Ok((method, target, String::from_utf8_lossy(&body).to_string()))
+    Ok(Request {
+        method,
+        target,
+        headers,
+        body: String::from_utf8_lossy(&body).to_string(),
+    })
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {

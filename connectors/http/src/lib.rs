@@ -18,7 +18,7 @@
 //!   correlated through `correlation_id`. Failures emit `<ns>.event.error`.
 //! - Path/query parameters extracted from the command payload via a JSONPath
 //!   subset ([`jsonpath`]).
-//! - Header-based auth, per-request timeout, status-based retry.
+//! - Header-based auth and OAuth2 refresh tokens, per-request timeout, status-based retry.
 //! - Static headers on every request (`[connector.headers]`), over a default
 //!   `User-Agent: octo-connector-http/<version>` — reqwest sends none, and some
 //!   APIs (Wikimedia's among them) refuse a request without one.
@@ -29,18 +29,24 @@
 //! See the `petstore_case.md`, `configurable_connectors.md` and
 //! `runtime_config.md` vault drafts for the full design.
 
+mod auth;
 pub mod jsonpath;
 mod request;
 pub mod spec;
 
-use std::sync::Arc;
+use std::{error::Error, path::Path, sync::Arc};
 
 use async_trait::async_trait;
 use octo_core::{
     Connector, ConnectorCapabilities, ConnectorContext, ConnectorFactory, ConnectorId, Envelope,
     EventKind, FactoryContext, Filter, OctoResult, PayloadRegistry, SubscribeOptions,
 };
-use serde_json::Value;
+use octo_http_auth::HttpAuth;
+use reqwest::Client;
+use serde_json::{Value, json, to_string};
+use tokio::select;
+use toml::Value as TomlValue;
+use tracing::warn;
 
 pub use spec::{
     AuthSpec, EndpointSpec, HttpMethod, HttpSpec, ListenerSpec, RetrySpec, SecretSource, SpecError,
@@ -51,20 +57,27 @@ pub struct HttpConnector {
     id: ConnectorId,
     spec: HttpSpec,
     capabilities: ConnectorCapabilities,
-    client: reqwest::Client,
+    client: Client,
+    auth: Option<HttpAuth>,
 }
 
 impl HttpConnector {
     /// Build a connector from a validated [`HttpSpec`] using a default HTTP client.
     pub fn from_spec(spec: HttpSpec) -> Arc<Self> {
-        Self::with_client(spec, reqwest::Client::new())
+        Self::with_client(spec, Client::new())
     }
 
     /// Build a connector from a validated [`HttpSpec`] with a caller-supplied
     /// HTTP client (lets several dyn connectors share a connection pool, and
     /// lets tests inject a client pointed at a mock server).
-    pub fn with_client(spec: HttpSpec, client: reqwest::Client) -> Arc<Self> {
+    pub fn with_client(spec: HttpSpec, client: Client) -> Arc<Self> {
         let id = ConnectorId::new(spec.id.clone());
+        let auth = match &spec.auth {
+            Some(AuthSpec::OAuth2(config)) => {
+                Some(HttpAuth::with_client(config.clone(), client.clone()))
+            }
+            _ => None,
+        };
 
         let accept_kinds: Vec<EventKind> =
             spec.endpoints.iter().map(|e| e.cmd_kind.clone()).collect();
@@ -88,11 +101,12 @@ impl HttpConnector {
             spec,
             capabilities,
             client,
+            auth,
         })
     }
 
     /// Load a connector from a `connector.toml` manifest file.
-    pub fn from_file(path: impl AsRef<std::path::Path>) -> Result<Arc<Self>, SpecError> {
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Arc<Self>, SpecError> {
         Ok(Self::from_spec(HttpSpec::from_toml_file(path)?))
     }
 
@@ -127,7 +141,7 @@ impl HttpConnector {
                 }
             }
             Err(e) => {
-                tracing::warn!(connector = %self.id, error = %e, "failed to load model schemas");
+                warn!(connector = %self.id, error = %e, "failed to load model schemas");
             }
         }
         registry
@@ -153,7 +167,7 @@ impl Connector for HttpConnector {
             .await?;
 
         loop {
-            tokio::select! {
+            select! {
                 next = sub.next() => match next {
                     Some(envelope) => self.clone().handle(envelope, &ctx).await,
                     None => return Ok(()),
@@ -189,14 +203,14 @@ fn navigate<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
 fn render_json(value: &Value) -> String {
     match value {
         Value::String(s) => json_escape_inner(s),
-        other => serde_json::to_string(other).unwrap_or_default(),
+        other => to_string(other).unwrap_or_default(),
     }
 }
 
 /// JSON-escape a string and strip the surrounding quotes, yielding content safe
 /// to drop inside a `"..."` in a template.
 fn json_escape_inner(s: &str) -> String {
-    let quoted = serde_json::to_string(s).unwrap_or_else(|_| format!("\"{s}\""));
+    let quoted = to_string(s).unwrap_or_else(|_| format!("\"{s}\""));
     quoted[1..quoted.len() - 1].to_string()
 }
 
@@ -288,7 +302,7 @@ impl HttpError {
 
     /// Render as the `<ns>.event.error` payload shape.
     fn into_value(self) -> Value {
-        serde_json::json!({
+        json!({
             "http_status": self.http_status,
             "message": self.message,
         })
@@ -299,20 +313,20 @@ impl HttpError {
 /// [`OctoBuilder::register_connector_type`](octo_core::OctoBuilder::register_connector_type),
 /// and every `connector.toml` with `type = "http"` becomes an instance.
 pub struct HttpConnectorFactory {
-    client: reqwest::Client,
+    client: Client,
 }
 
 impl HttpConnectorFactory {
     /// Factory using a default HTTP client.
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: Client::new(),
         }
     }
 
     /// Factory whose instances share a caller-supplied HTTP client (connection
     /// pool reuse; or a proxy-free client in tests).
-    pub fn with_client(client: reqwest::Client) -> Self {
+    pub fn with_client(client: Client) -> Self {
         Self { client }
     }
 }
@@ -331,9 +345,9 @@ impl ConnectorFactory for HttpConnectorFactory {
     fn create(
         &self,
         _id: ConnectorId,
-        config: &toml::Value,
+        config: &TomlValue,
         ctx: FactoryContext<'_>,
-    ) -> Result<Arc<dyn Connector>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Arc<dyn Connector>, Box<dyn Error + Send + Sync>> {
         // The connector takes its id from the manifest's `[connector] id`,
         // which is the same value the loader passed as `_id`.
         let spec = HttpSpec::from_toml_value(config.clone(), ctx.base_dir)?;
@@ -349,9 +363,11 @@ pub fn factory() -> Arc<dyn ConnectorFactory> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use serde_json::json;
     use std::path::Path;
+
+    use serde_json::{from_str, json};
+
+    use super::*;
 
     fn notifier() -> Arc<HttpConnector> {
         let toml = r#"
@@ -384,7 +400,7 @@ response_kind = "notify.event.sent"
         let tmpl = r#"{ "text": "${payload.text}", "channel": "${payload.channel}", "count": ${payload.n}, "user": "octo" }"#;
 
         let rendered = c.render_template(tmpl, &payload, &env(json!({})));
-        let parsed: Value = serde_json::from_str(&rendered).expect("rendered body is valid JSON");
+        let parsed: Value = from_str(&rendered).expect("rendered body is valid JSON");
 
         // String with embedded quotes is escaped correctly.
         assert_eq!(parsed["text"], "hi \"there\"");
@@ -402,7 +418,7 @@ response_kind = "notify.event.sent"
             &json!({}),
             &env(json!({})),
         );
-        let parsed: Value = serde_json::from_str(&rendered).unwrap();
+        let parsed: Value = from_str(&rendered).unwrap();
         assert_eq!(parsed["src"], "agent");
         assert_eq!(parsed["kind"], "notify.cmd.send");
     }

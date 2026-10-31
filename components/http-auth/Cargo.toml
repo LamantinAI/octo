@@ -6,7 +6,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Reusable HTTP/network authentication modes for Octo connectors: Basic (app password) and Bearer now, OAuth2 (bearer + refresh) planned. Config-deserializable, secrets read from the environment. Shared by the CalDAV / SMTP / HTTP connectors so a new provider is a config preset, not new code."
+description = "Reusable HTTP/network authentication modes for Octo connectors: Basic, Bearer, and OAuth2 with refresh-token exchange and access-token caching. Config-deserializable, secrets read from the environment."
 
 [dependencies]
 serde = { workspace = true }
