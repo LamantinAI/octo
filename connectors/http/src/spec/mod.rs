@@ -9,30 +9,38 @@
 
 use std::{
     collections::HashMap,
+    env::var,
+    fs::{read_dir, read_to_string},
+    io::Error as IoError,
     path::{Path, PathBuf},
 };
 
 use octo_core::EventKind;
-use reqwest::header::HeaderMap;
+use octo_http_auth::AuthConfig;
+use reqwest::{Method, header::HeaderMap};
+use serde_json::{Error as JsonError, Value, from_str as from_json};
+use thiserror::Error;
+use toml::{Value as TomlValue, de::Error as TomlError, from_str as from_toml};
+
 mod parse;
 use self::parse::RawConfig;
-use crate::jsonpath::JsonPath;
+use crate::jsonpath::{JsonPath, ParseError};
 
 /// Errors raised while loading / validating a connector manifest.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Error)]
 pub enum SpecError {
     #[error("reading manifest {path}: {source}")]
     Io {
         path: PathBuf,
         #[source]
-        source: std::io::Error,
+        source: IoError,
     },
 
     #[error("parsing manifest {path}: {source}")]
     Toml {
         path: PathBuf,
         #[source]
-        source: toml::de::Error,
+        source: TomlError,
     },
 
     #[error("connector type must be 'http', got '{0}'")]
@@ -51,24 +59,27 @@ pub enum SpecError {
         cmd_kind: String,
         name: String,
         #[source]
-        source: crate::jsonpath::ParseError,
+        source: ParseError,
     },
 
     #[error("header '{name}': not a valid HTTP header name or value")]
     BadHeader { name: String },
 
+    #[error("invalid connector auth: {0}")]
+    BadAuth(String),
+
     #[error("reading model '{path}': {source}")]
     ModelIo {
         path: PathBuf,
         #[source]
-        source: std::io::Error,
+        source: IoError,
     },
 
     #[error("parsing model '{path}': {source}")]
     ModelJson {
         path: PathBuf,
         #[source]
-        source: serde_json::Error,
+        source: JsonError,
     },
 }
 
@@ -99,13 +110,13 @@ impl HttpMethod {
         matches!(self, Self::Post | Self::Put | Self::Patch)
     }
 
-    pub fn as_reqwest(self) -> reqwest::Method {
+    pub fn as_reqwest(self) -> Method {
         match self {
-            Self::Get => reqwest::Method::GET,
-            Self::Post => reqwest::Method::POST,
-            Self::Put => reqwest::Method::PUT,
-            Self::Delete => reqwest::Method::DELETE,
-            Self::Patch => reqwest::Method::PATCH,
+            Self::Get => Method::GET,
+            Self::Post => Method::POST,
+            Self::Put => Method::PUT,
+            Self::Delete => Method::DELETE,
+            Self::Patch => Method::PATCH,
         }
     }
 }
@@ -116,18 +127,21 @@ pub enum SecretSource {
     Env(String),
 }
 
-/// Connector-level authentication (MVP: a single header carrying a secret).
+/// Connector-level authentication: a static header or a shared OAuth2 runtime.
 #[derive(Debug, Clone)]
-pub struct AuthSpec {
-    /// `api_key`, `bearer`, ... — kept as a string; only header-injection is
-    /// implemented for the MVP. Richer schemes get dedicated Rust connectors.
-    pub kind: String,
-    /// Header name to set (e.g. `api-key`, `Authorization`).
-    pub header: String,
-    /// A `${secret.NAME}` reference resolved against [`HttpSpec::secrets`].
-    pub secret_ref: String,
-    /// Static prefix prepended to the resolved secret (e.g. `Bearer ` for bearer).
-    pub value_prefix: String,
+pub enum AuthSpec {
+    /// Existing `api_key`, `bearer`, and custom header configurations.
+    Header {
+        kind: String,
+        /// Header name to set (e.g. `api-key`, `Authorization`).
+        header: String,
+        /// A `${secret.NAME}` reference resolved against [`HttpSpec::secrets`].
+        secret_ref: String,
+        /// Static prefix prepended to the secret (e.g. `Bearer `).
+        value_prefix: String,
+    },
+    /// Refresh-token configuration consumed by `octo-http-auth`.
+    OAuth2(AuthConfig),
 }
 
 /// Retry policy for transient HTTP failures.
@@ -195,7 +209,7 @@ impl HttpSpec {
     /// is resolved relative to the manifest's directory.
     pub fn from_toml_file(path: impl AsRef<Path>) -> Result<Self, SpecError> {
         let path = path.as_ref();
-        let text = std::fs::read_to_string(path).map_err(|source| SpecError::Io {
+        let text = read_to_string(path).map_err(|source| SpecError::Io {
             path: path.to_path_buf(),
             source,
         })?;
@@ -212,7 +226,7 @@ impl HttpSpec {
     /// Parse and validate a manifest from TOML text. `base_dir` anchors a
     /// relative `models_dir`.
     pub fn from_toml_str(text: &str, base_dir: &Path) -> Result<Self, SpecError> {
-        let raw: RawConfig = toml::from_str(text).map_err(|source| SpecError::Toml {
+        let raw: RawConfig = from_toml(text).map_err(|source| SpecError::Toml {
             path: base_dir.to_path_buf(),
             source,
         })?;
@@ -223,7 +237,7 @@ impl HttpSpec {
     /// receives it). `base_dir` anchors a relative `models_dir`.
     ///
     /// [`ConnectorFactory`]: octo_core::ConnectorFactory
-    pub fn from_toml_value(value: toml::Value, base_dir: &Path) -> Result<Self, SpecError> {
+    pub fn from_toml_value(value: TomlValue, base_dir: &Path) -> Result<Self, SpecError> {
         let raw: RawConfig = value.try_into().map_err(|source| SpecError::Toml {
             path: base_dir.to_path_buf(),
             source,
@@ -244,14 +258,14 @@ impl HttpSpec {
             .strip_prefix("${secret.")
             .and_then(|s| s.strip_suffix('}'))?;
         match self.secrets.get(name)? {
-            SecretSource::Env(var) => std::env::var(var).ok(),
+            SecretSource::Env(name) => var(name).ok(),
         }
     }
 
     /// Load the model JSON schemas declared in `models_dir`. Returns
     /// `(schema_name, schema)` pairs where `schema_name` is the filename stem.
     /// No `models_dir` (or a missing directory) yields an empty list.
-    pub fn load_models(&self) -> Result<Vec<(String, serde_json::Value)>, SpecError> {
+    pub fn load_models(&self) -> Result<Vec<(String, Value)>, SpecError> {
         let Some(dir) = &self.models_dir else {
             return Ok(Vec::new());
         };
@@ -259,7 +273,7 @@ impl HttpSpec {
             return Ok(Vec::new());
         }
         let mut out = Vec::new();
-        let entries = std::fs::read_dir(dir).map_err(|source| SpecError::ModelIo {
+        let entries = read_dir(dir).map_err(|source| SpecError::ModelIo {
             path: dir.clone(),
             source,
         })?;
@@ -275,15 +289,14 @@ impl HttpSpec {
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            let text = std::fs::read_to_string(&path).map_err(|source| SpecError::ModelIo {
+            let text = read_to_string(&path).map_err(|source| SpecError::ModelIo {
                 path: path.clone(),
                 source,
             })?;
-            let schema: serde_json::Value =
-                serde_json::from_str(&text).map_err(|source| SpecError::ModelJson {
-                    path: path.clone(),
-                    source,
-                })?;
+            let schema: Value = from_json(&text).map_err(|source| SpecError::ModelJson {
+                path: path.clone(),
+                source,
+            })?;
             out.push((stem.to_string(), schema));
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -368,9 +381,14 @@ petstore_key = { env = "PETSTORE_API_KEY" }
         assert_eq!(fetch.method, HttpMethod::Get);
         assert_eq!(fetch.path_params.get("petId").unwrap().as_str(), "$.id");
 
-        let auth = spec.auth.as_ref().unwrap();
-        assert_eq!(auth.header, "api-key");
-        assert_eq!(auth.secret_ref, "${secret.petstore_key}");
+        let AuthSpec::Header {
+            header, secret_ref, ..
+        } = spec.auth.as_ref().unwrap()
+        else {
+            panic!("expected header auth");
+        };
+        assert_eq!(header, "api-key");
+        assert_eq!(secret_ref, "${secret.petstore_key}");
 
         let retry = spec.retry.as_ref().unwrap();
         assert_eq!(retry.max_attempts, 3);

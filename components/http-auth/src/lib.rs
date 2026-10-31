@@ -14,11 +14,15 @@
 //! by the CalDAV / SMTP / HTTP connectors, and a new provider is a config preset.
 
 use std::{
+    env::var,
     sync::Mutex,
     time::{Duration, Instant},
 };
 
+use base64::{Engine, engine::general_purpose::STANDARD};
+use reqwest::{Client, RequestBuilder, header::AUTHORIZATION};
 use serde::Deserialize;
+use serde_json::from_str;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -44,8 +48,8 @@ pub enum AuthError {
 ///
 /// ```toml
 /// auth = "basic"
-/// login = "me@yandex.ru"
-/// password_env = "OCTO_YANDEX_APP_PASSWORD"
+/// login = "user@example.org"
+/// password_env = "OCTO_APP_PASSWORD"
 /// ```
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(tag = "auth", rename_all = "lowercase")]
@@ -114,8 +118,6 @@ impl Credential {
         match self {
             Credential::None => None,
             Credential::Basic { login, secret } => {
-                use base64::Engine;
-                use base64::engine::general_purpose::STANDARD;
                 let encoded = STANDARD.encode(format!("{login}:{secret}"));
                 Some(format!("Basic {encoded}"))
             }
@@ -129,7 +131,7 @@ impl Credential {
 /// authenticated connector instance.
 pub struct HttpAuth {
     config: AuthConfig,
-    client: reqwest::Client,
+    client: Client,
     cache: Mutex<Option<CachedToken>>,
 }
 
@@ -144,12 +146,12 @@ const EXPIRY_LEEWAY: Duration = Duration::from_secs(60);
 impl HttpAuth {
     /// Build from an [`AuthConfig`] using a default HTTP client.
     pub fn new(config: AuthConfig) -> Self {
-        Self::with_client(config, reqwest::Client::new())
+        Self::with_client(config, Client::new())
     }
 
     /// Build sharing a caller-supplied HTTP client (pool reuse; a proxy-free
     /// client in tests).
-    pub fn with_client(config: AuthConfig, client: reqwest::Client) -> Self {
+    pub fn with_client(config: AuthConfig, client: Client) -> Self {
         Self {
             config,
             client,
@@ -182,12 +184,9 @@ impl HttpAuth {
 
     /// Resolve and apply to a `reqwest` request builder (adds `Authorization`, or
     /// nothing for [`AuthConfig::None`]).
-    pub async fn apply(
-        &self,
-        req: reqwest::RequestBuilder,
-    ) -> Result<reqwest::RequestBuilder, AuthError> {
+    pub async fn apply(&self, req: RequestBuilder) -> Result<RequestBuilder, AuthError> {
         match self.credential().await?.http_authorization() {
-            Some(value) => Ok(req.header(reqwest::header::AUTHORIZATION, value)),
+            Some(value) => Ok(req.header(AUTHORIZATION, value)),
             None => Ok(req),
         }
     }
@@ -256,7 +255,10 @@ impl HttpAuth {
             });
         }
         let parsed: TokenResponse =
-            serde_json::from_str(&body).map_err(|e| AuthError::TokenParse(e.to_string()))?;
+            from_str(&body).map_err(|e| AuthError::TokenParse(e.to_string()))?;
+        if parsed.access_token.trim().is_empty() {
+            return Err(AuthError::TokenParse("empty access token".into()));
+        }
         let ttl = Duration::from_secs(parsed.expires_in.unwrap_or(3600));
         Ok((parsed.access_token, ttl))
     }
@@ -275,20 +277,24 @@ struct TokenResponse {
     expires_in: Option<u64>,
 }
 
-fn env_secret(var: &str) -> Result<String, AuthError> {
-    std::env::var(var).map_err(|_| AuthError::MissingSecret(var.to_string()))
+fn env_secret(var_name: &str) -> Result<String, AuthError> {
+    var(var_name).map_err(|_| AuthError::MissingSecret(var_name.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::env::set_var;
+
+    use toml::from_str as from_toml;
+
     use super::*;
 
     #[test]
     fn deserializes_basic_from_toml() {
-        let cfg: AuthConfig = toml::from_str(
+        let cfg: AuthConfig = from_toml(
             r#"
             auth = "basic"
-            login = "me@yandex.ru"
+            login = "user@example.org"
             password_env = "APP_PW"
         "#,
         )
@@ -298,7 +304,7 @@ mod tests {
 
     #[test]
     fn deserializes_oauth2_from_toml() {
-        let cfg: AuthConfig = toml::from_str(
+        let cfg: AuthConfig = from_toml(
             r#"
             auth = "oauth2"
             token_url = "https://oauth2.googleapis.com/token"
@@ -313,7 +319,7 @@ mod tests {
 
     #[tokio::test]
     async fn basic_resolves_to_base64_header_via_httpauth() {
-        unsafe { std::env::set_var("HTTP_AUTH_TEST_PW", "s3cret") };
+        unsafe { set_var("HTTP_AUTH_TEST_PW", "s3cret") };
         let auth = HttpAuth::new(AuthConfig::Basic {
             login: "user".into(),
             password_env: "HTTP_AUTH_TEST_PW".into(),
@@ -330,7 +336,7 @@ mod tests {
 
     #[tokio::test]
     async fn bearer_resolves_to_bearer_header() {
-        unsafe { std::env::set_var("HTTP_AUTH_TEST_TOKEN", "abc123") };
+        unsafe { set_var("HTTP_AUTH_TEST_TOKEN", "abc123") };
         let auth = HttpAuth::new(AuthConfig::Bearer {
             token_env: "HTTP_AUTH_TEST_TOKEN".into(),
         });
@@ -363,7 +369,7 @@ mod tests {
     fn token_response_parses_google_shape() {
         let json =
             r#"{"access_token":"ya29.a0","expires_in":3599,"token_type":"Bearer","scope":"..."}"#;
-        let t: TokenResponse = serde_json::from_str(json).unwrap();
+        let t: TokenResponse = from_str(json).unwrap();
         assert_eq!(t.access_token, "ya29.a0");
         assert_eq!(t.expires_in, Some(3599));
     }
