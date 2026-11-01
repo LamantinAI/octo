@@ -1,8 +1,13 @@
-use std::{sync::Arc, time::Duration};
+use std::{env::var, sync::Arc, time::Duration};
 
 use octo_core::{ConnectorContext, Envelope, EventKind, TrailAction, TrailActor, TrailEntry};
-use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
-use serde_json::Value;
+use reqwest::{
+    Error as RequestError, Response,
+    header::{CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT},
+};
+use serde_json::{Value, from_str, to_string};
+use tokio::time::sleep;
+use tracing::warn;
 
 use super::{
     EndpointSpec, HttpConnector, HttpError, envelope_field, json_escape_inner, navigate,
@@ -31,7 +36,7 @@ impl HttpConnector {
         ));
 
         if let Err(e) = ctx.publish(emission).await {
-            tracing::warn!(connector = %self.id, error = %e, "failed to publish http response");
+            warn!(connector = %self.id, error = %e, "failed to publish http response");
         }
     }
 
@@ -67,7 +72,7 @@ impl HttpConnector {
         let body: Option<String> = if endpoint.method.has_body() {
             Some(match &endpoint.body_template {
                 Some(tmpl) => self.render_template(tmpl, payload, envelope),
-                None => serde_json::to_string(payload).unwrap_or_default(),
+                None => to_string(payload).unwrap_or_default(),
             })
         } else {
             None
@@ -85,7 +90,7 @@ impl HttpConnector {
         let value = if body.trim().is_empty() {
             Value::Null
         } else {
-            serde_json::from_str(&body).map_err(|e| {
+            from_str(&body).map_err(|e| {
                 HttpError::local(format!("response decode error: {e} (body: {body})"))
             })?
         };
@@ -182,9 +187,7 @@ impl HttpConnector {
                 .resolve_secret(&format!("${{secret.{path}}}"))
                 .map(|s| json_escape_inner(&s))
                 .unwrap_or_default(),
-            "env" => std::env::var(path)
-                .map(|s| json_escape_inner(&s))
-                .unwrap_or_default(),
+            "env" => var(path).map(|s| json_escape_inner(&s)).unwrap_or_default(),
             "envelope" => envelope_field(envelope, path)
                 .map(|s| json_escape_inner(&s))
                 .unwrap_or_default(),
@@ -200,13 +203,16 @@ impl HttpConnector {
         url: &str,
         query: &[(String, String)],
         body: Option<&str>,
-    ) -> Result<reqwest::Response, HttpError> {
+    ) -> Result<Response, HttpError> {
         let max_attempts = self.spec.retry.as_ref().map_or(1, |r| r.max_attempts);
+        // Resolve credentials once per command, before API retries. Auth failures
+        // emit an error without sending an unauthenticated API request.
+        let headers = self.request_headers().await?;
 
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let response = self.send_once(endpoint, url, query, body).await;
+            let response = self.send_once(endpoint, url, query, body, &headers).await;
 
             match response {
                 Ok(resp) => {
@@ -235,24 +241,20 @@ impl HttpConnector {
         url: &str,
         query: &[(String, String)],
         body: Option<&str>,
-    ) -> Result<reqwest::Response, reqwest::Error> {
+        headers: &HeaderMap,
+    ) -> Result<Response, RequestError> {
         let mut req = self
             .client
             .request(endpoint.method.as_reqwest(), url)
-            .headers(self.static_headers());
+            .headers(headers.clone());
 
         if !query.is_empty() {
             req = req.query(query);
         }
         if let Some(body) = body {
             req = req
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header(CONTENT_TYPE, "application/json")
                 .body(body.to_string());
-        }
-        if let Some(auth) = &self.spec.auth {
-            if let Some(secret) = self.spec.resolve_secret(&auth.secret_ref) {
-                req = req.header(&auth.header, format!("{}{}", auth.value_prefix, secret));
-            }
         }
         if let Some(ms) = self.spec.timeout_ms {
             req = req.timeout(Duration::from_millis(ms));
@@ -290,6 +292,6 @@ impl HttpConnector {
             .backoff_initial_ms
             .saturating_mul(factor)
             .min(retry.backoff_max_ms);
-        tokio::time::sleep(Duration::from_millis(delay)).await;
+        sleep(Duration::from_millis(delay)).await;
     }
 }

@@ -10,6 +10,7 @@ description = "Dynamic, TOML-configured HTTP connector for the Octo runtime — 
 
 [dependencies]
 octo-core = { path = "../../octo-core" }
+octo-http-auth = { path = "../../components/http-auth" }
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 async-trait = { workspace = true }
 serde = { workspace = true }
@@ -20,5 +21,6 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+tokio-util = { workspace = true }
 # A dependency-free tokio mock HTTP server is used in tests; needs net + io-util.
 tokio = { workspace = true, features = ["net", "io-util", "rt-multi-thread", "macros"] }

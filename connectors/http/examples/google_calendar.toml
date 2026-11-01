@@ -1,0 +1,30 @@
+# Opt-in, read-only Google Calendar example. See ../README.md for OAuth setup.
+[connector]
+id = "google_calendar"
+type = "http"
+base_url = "https://www.googleapis.com/calendar/v3"
+
+[connector.auth]
+type = "oauth2"
+token_url = "https://oauth2.googleapis.com/token"
+client_id = "YOUR_CLIENT_ID.apps.googleusercontent.com"
+client_secret_env = "GOOGLE_CLIENT_SECRET"
+refresh_token_env = "GOOGLE_REFRESH_TOKEN"
+
+[connector.timeout]
+request_ms = 10000
+
+[[connector.endpoint]]
+cmd_kind = "google_calendar.cmd.list_events"
+method = "GET"
+path = "/calendars/{calendarId}/events"
+path_params = { calendarId = "$.calendar_id" }
+response_kind = "google_calendar.event.events_listed"
+
+[[connector.endpoint]]
+cmd_kind = "google_calendar.cmd.list_events_page"
+method = "GET"
+path = "/calendars/{calendarId}/events"
+path_params = { calendarId = "$.calendar_id" }
+query_params = { pageToken = "$.page_token" }
+response_kind = "google_calendar.event.events_listed"

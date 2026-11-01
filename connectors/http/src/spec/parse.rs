@@ -1,8 +1,13 @@
-use std::{collections::HashMap, path::Path};
+use std::{collections::HashMap, env::var, path::Path};
 
 use octo_core::EventKind;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use octo_http_auth::AuthConfig;
+use reqwest::{
+    Url,
+    header::{HeaderMap, HeaderName, HeaderValue},
+};
 use serde::Deserialize;
+use toml::{Table, Value as TomlValue, de::Error as TomlError};
 
 use super::{
     AuthSpec, EndpointSpec, HttpMethod, HttpSpec, ListenerSpec, RetrySpec, SecretSource, SpecError,
@@ -42,6 +47,50 @@ struct RawAuth {
     secret_var: Option<String>,
     #[serde(default)]
     value_prefix: Option<String>,
+    #[serde(flatten)]
+    fields: Table,
+}
+
+impl RawAuth {
+    fn into_spec(mut self) -> Result<AuthSpec, SpecError> {
+        if self.type_ == "oauth2" {
+            self.fields.insert("auth".into(), "oauth2".into());
+            let config: AuthConfig = TomlValue::Table(self.fields)
+                .try_into()
+                .map_err(|e: TomlError| SpecError::BadAuth(e.to_string()))?;
+            if let AuthConfig::Oauth2 {
+                token_url,
+                client_id,
+                client_secret_env,
+                refresh_token_env,
+            } = &config
+            {
+                let url = Url::parse(token_url)
+                    .map_err(|_| SpecError::BadAuth("token_url must be an HTTP(S) URL".into()))?;
+                if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+                    return Err(SpecError::BadAuth(
+                        "token_url must be an HTTP(S) URL".into(),
+                    ));
+                }
+                if [client_id, client_secret_env, refresh_token_env]
+                    .iter()
+                    .any(|v| v.trim().is_empty())
+                {
+                    return Err(SpecError::BadAuth(
+                        "OAuth2 client and environment variable names must be nonempty".into(),
+                    ));
+                }
+            }
+            Ok(AuthSpec::OAuth2(config))
+        } else {
+            Ok(AuthSpec::Header {
+                kind: self.type_,
+                header: self.header.unwrap_or_else(|| "Authorization".into()),
+                secret_ref: self.secret_var.unwrap_or_default(),
+                value_prefix: self.value_prefix.unwrap_or_default(),
+            })
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,12 +144,7 @@ impl RawConnector {
 
         let models_dir = self.models_dir.map(|rel| base_dir.join(rel));
 
-        let auth = self.auth.map(|a| AuthSpec {
-            kind: a.type_,
-            header: a.header.unwrap_or_else(|| "Authorization".to_string()),
-            secret_ref: a.secret_var.unwrap_or_default(),
-            value_prefix: a.value_prefix.unwrap_or_default(),
-        });
+        let auth = self.auth.map(RawAuth::into_spec).transpose()?;
 
         let retry = self.retry.map(|r| RetrySpec {
             max_attempts: r.max_attempts.max(1),
@@ -223,7 +267,7 @@ fn resolve_env_templates(s: &str) -> String {
         };
         let end = start + end_rel;
         let name = out[start + 6..end].to_string();
-        let val = std::env::var(&name).unwrap_or_default();
+        let val = var(&name).unwrap_or_default();
         out.replace_range(start..=end, &val);
     }
     out
