@@ -298,17 +298,17 @@ async fn token_failures_emit_sanitized_errors_and_can_be_retried_by_later_comman
         (
             200,
             "invalid token response: test refresh+&=",
-            "auth: invalid OAuth2 token response",
+            "auth: invalid OAuth2 token response: Syntax at line 1, column 1",
         ),
         (
             200,
             r#"{"expires_in":3600}"#,
-            "auth: invalid OAuth2 token response",
+            "auth: invalid OAuth2 token response: Data at line 1, column 19",
         ),
         (
             200,
             r#"{"access_token":""}"#,
-            "auth: invalid OAuth2 token response",
+            "auth: invalid OAuth2 token response: empty access token",
         ),
     ] {
         let fixture = Fixture::start(status, body.into()).await;
@@ -318,7 +318,10 @@ async fn token_failures_emit_sanitized_errors_and_can_be_retried_by_later_comman
             assert_eq!(response.kind.as_str(), "google_calendar.event.error");
             let payload = response.payload_as::<Value>().unwrap();
             assert_eq!(payload["http_status"], Value::Null);
-            assert_eq!(payload["message"], message);
+            let actual = payload["message"].as_str().unwrap();
+            assert_eq!(actual, message);
+            assert!(!actual.contains("test secret+&="));
+            assert!(!actual.contains("test refresh+&="));
         }
         assert_eq!(fixture.tokens.lock().unwrap().len(), 2);
         assert!(fixture.api.lock().unwrap().is_empty());

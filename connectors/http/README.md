@@ -29,8 +29,10 @@ its own request timeout.
 
 Missing credentials, token endpoint failures, and invalid token responses emit
 a correlated `<connector-id>.event.error` with `http_status = null`; the API
-request is skipped. Token response bodies and transport details are omitted
-from auth errors because they may contain credentials. API status retries
+request is skipped. The shared `octo-http-auth` component discards token response
+bodies and raw transport/parser messages because they may contain credentials.
+Errors retain HTTP status, transport failure category, or JSON parse category and
+location, so all consumers can safely display or log them. API status retries
 continue to use `[connector.retry]`; token exchange failures are not retried
 within the command. A later command can attempt token exchange again. An API
 401 is surfaced according to the existing retry policy; it does not force a

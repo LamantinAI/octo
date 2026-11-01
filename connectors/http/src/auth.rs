@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use octo_http_auth::{AuthError, Credential};
+use octo_http_auth::Credential;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use tokio::time::timeout;
 
@@ -40,7 +40,7 @@ impl HttpConnector {
                 let credential = timeout(duration, auth.credential())
                     .await
                     .map_err(|_| HttpError::local("auth: OAuth2 token request timed out"))?
-                    .map_err(auth_error)?;
+                    .map_err(|error| HttpError::local(error.to_string()))?;
                 let Credential::Bearer(token) = credential else {
                     return Err(HttpError::local(
                         "auth: OAuth2 bearer credential is unavailable",
@@ -56,18 +56,4 @@ impl HttpConnector {
         headers.insert(name, value);
         Ok(headers)
     }
-}
-
-// Token endpoints can echo secrets in URLs or response bodies. Only expose the
-// failure category and status in the connector's error envelope.
-fn auth_error(error: AuthError) -> HttpError {
-    HttpError::local(match error {
-        AuthError::MissingSecret(name) => format!("auth: env var `{name}` is not set"),
-        AuthError::TokenRefused { status, .. } => {
-            format!("auth: OAuth2 token endpoint returned {status}")
-        }
-        AuthError::TokenRequest(_) => "auth: OAuth2 token request failed".into(),
-        AuthError::TokenParse(_) => "auth: invalid OAuth2 token response".into(),
-        AuthError::OAuth2NeedsRuntime => "auth: OAuth2 runtime is unavailable".into(),
-    })
 }

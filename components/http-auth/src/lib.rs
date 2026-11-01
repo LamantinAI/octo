@@ -20,11 +20,14 @@ use std::{
 };
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use reqwest::{Client, RequestBuilder, header::AUTHORIZATION};
+use reqwest::{Client, Error as RequestError, RequestBuilder, header::AUTHORIZATION};
 use serde::Deserialize;
-use serde_json::from_str;
+use serde_json::{Error as JsonError, from_str};
 use thiserror::Error;
 
+/// Authentication failures with safe diagnostics. Errors returned by [`HttpAuth`]
+/// retain no token endpoint bodies, URLs, or raw transport/parser messages, so
+/// both `Display` and `Debug` can be used by consumers without further redaction.
 #[derive(Debug, Error)]
 pub enum AuthError {
     #[error("auth: env var `{0}` is not set")]
@@ -33,13 +36,13 @@ pub enum AuthError {
     #[error("auth: oauth2 needs an HttpAuth (token cache); call HttpAuth::credential")]
     OAuth2NeedsRuntime,
 
-    #[error("auth: oauth2 token request failed: {0}")]
+    #[error("auth: OAuth2 token request failed: {0}")]
     TokenRequest(String),
 
-    #[error("auth: oauth2 token endpoint returned {status}: {body}")]
-    TokenRefused { status: u16, body: String },
+    #[error("auth: OAuth2 token endpoint returned {status}")]
+    TokenRefused { status: u16 },
 
-    #[error("auth: oauth2 token response parse: {0}")]
+    #[error("auth: invalid OAuth2 token response: {0}")]
     TokenParse(String),
 }
 
@@ -242,20 +245,15 @@ impl HttpAuth {
             .form(&form)
             .send()
             .await
-            .map_err(|e| AuthError::TokenRequest(e.to_string()))?;
+            .map_err(token_request_error)?;
         let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| AuthError::TokenRequest(e.to_string()))?;
         if !status.is_success() {
             return Err(AuthError::TokenRefused {
                 status: status.as_u16(),
-                body,
             });
         }
-        let parsed: TokenResponse =
-            from_str(&body).map_err(|e| AuthError::TokenParse(e.to_string()))?;
+        let body = resp.text().await.map_err(token_request_error)?;
+        let parsed: TokenResponse = from_str(&body).map_err(token_parse_error)?;
         if parsed.access_token.trim().is_empty() {
             return Err(AuthError::TokenParse("empty access token".into()));
         }
@@ -279,6 +277,36 @@ struct TokenResponse {
 
 fn env_secret(var_name: &str) -> Result<String, AuthError> {
     var(var_name).map_err(|_| AuthError::MissingSecret(var_name.to_string()))
+}
+
+// Raw errors may include credentials in URLs, response values, or nested causes.
+// Keep only locally selected categories and numeric parser locations.
+fn token_request_error(error: RequestError) -> AuthError {
+    let category = if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connection"
+    } else if error.is_builder() {
+        "request construction"
+    } else if error.is_redirect() {
+        "redirect"
+    } else if error.is_body() {
+        "response body"
+    } else if error.is_decode() {
+        "response decoding"
+    } else {
+        "transport"
+    };
+    AuthError::TokenRequest(category.into())
+}
+
+fn token_parse_error(error: JsonError) -> AuthError {
+    AuthError::TokenParse(format!(
+        "{:?} at line {}, column {}",
+        error.classify(),
+        error.line(),
+        error.column()
+    ))
 }
 
 #[cfg(test)]
