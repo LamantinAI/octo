@@ -19,11 +19,14 @@ use str0m::{
 };
 use tracing::{debug, info, warn};
 
+use self::speech::{NO_SPEECH_TIMEOUT, SpeechWatch, TAIL_KEEP_FRAMES, Verdict};
 use crate::{
     net::{NetStats, feed, routable_ip, rtp_seq},
     ogg::{MAX_FILL_FRAMES, Recorder, finish},
     signal::{CallError, post_call},
 };
+
+mod speech;
 
 /// One 20 ms Opus frame at 48 kHz is 960 samples — the outbound-silence and granule step.
 pub(crate) const SAMPLES_PER_FRAME: u64 = 960;
@@ -35,7 +38,7 @@ pub(crate) const SILENCE_FRAME: [u8; 3] = [0xf8, 0xff, 0xfe];
 /// Give the WebRTC connection this long to produce the first audio frame.
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Hard ceiling on one recording, in case `turn.done` never lands.
+/// Hard ceiling on one recording, in case neither `turn.done` nor the end of speech lands.
 pub(crate) const TURN_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Keep receiving this long after `turn.done`, so the audio tail lands.
@@ -103,7 +106,8 @@ pub(crate) async fn synthesize(
 }
 
 /// The sans-IO loop: pump 20 ms outbound silence once connected, collect inbound Opus
-/// frames, and stop shortly after `turn.done` (so the audio tail lands). Returns the muxed
+/// frames, and stop shortly after `turn.done` (so the audio tail lands) — or, if it never
+/// comes, once the speech has ended; a voice that only streams silence fails the turn. Returns the muxed
 /// Ogg and the model's own transcript (if it reported one).
 pub(crate) fn drive_call(
     mut rtc: Rtc,
@@ -115,6 +119,7 @@ pub(crate) fn drive_call(
     let opus_pt = opus_pt(&rtc).ok_or("no Opus payload type negotiated")?;
 
     let mut rec = Recorder::default();
+    let mut speech = SpeechWatch::default();
     let mut net = NetStats::default();
     let mut transcript: Option<String> = None;
     let mut connected = false;
@@ -161,6 +166,10 @@ pub(crate) fn drive_call(
                         frames = rec.frames.len(),
                         "speak: call disconnected before turn.done"
                     );
+                    if !speech.heard_speech() {
+                        return Err("the voice call dropped before saying anything".into());
+                    }
+                    rec.trim_silent_tail(TAIL_KEEP_FRAMES);
                     return finish(rec, transcript);
                 }
                 Output::Event(Event::MediaData(m)) => {
@@ -182,6 +191,7 @@ pub(crate) fn drive_call(
                         rec.seq_lost += skipped;
                     }
                     rec.last_seq = Some(last);
+                    speech.observe(&m.data, Instant::now());
                     rec.push(m.time.numer(), &m.data);
                 }
                 Output::Event(Event::ChannelData(d)) => match parse_oai(&d.data) {
@@ -207,6 +217,30 @@ pub(crate) fn drive_call(
             info!(?net, "speak: network");
             return finish(rec, transcript);
         }
+        if stop_at.is_none() {
+            match speech.verdict(now) {
+                Verdict::SpeechEnded => {
+                    info!(
+                        frames = rec.frames.len(),
+                        "speak: speech ended without turn.done; closing on silence"
+                    );
+                    info!(?net, "speak: network");
+                    rec.trim_silent_tail(TAIL_KEEP_FRAMES);
+                    return finish(rec, transcript);
+                }
+                Verdict::NoSpeech => {
+                    warn!(
+                        frames = rec.frames.len(),
+                        "speak: the voice streamed only silence"
+                    );
+                    return Err(format!(
+                        "the voice answered with silence — no speech within {} s",
+                        NO_SPEECH_TIMEOUT.as_secs()
+                    ));
+                }
+                Verdict::Listening => {}
+            }
+        }
         if rec.frames.is_empty() && now.duration_since(start) > CONNECT_TIMEOUT {
             return Err(format!(
                 "no audio within {} s — WebRTC did not connect",
@@ -218,6 +252,10 @@ pub(crate) fn drive_call(
                 frames = rec.frames.len(),
                 "speak: no turn.done within the ceiling — recording may be cut short"
             );
+            if !speech.heard_speech() {
+                return Err("the voice said nothing before the call's ceiling".into());
+            }
+            rec.trim_silent_tail(TAIL_KEEP_FRAMES);
             return finish(rec, transcript);
         }
 
