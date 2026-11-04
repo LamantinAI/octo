@@ -128,8 +128,8 @@ impl Live {
                 // Delete every message the trace occupied — rollover may have split it
                 // across several; the behaviour must be uniform for short and long turns.
                 for id in status.ids {
-                    if let Err(e) = bot.delete_message(chat, id).await {
-                        warn!(chat = chat.0, error = %e, "telegram status delete failed");
+                    if let Err(_e) = bot.delete_message(chat, id).await {
+                        warn!(chat = chat.0, "telegram status delete failed");
                     }
                 }
             });

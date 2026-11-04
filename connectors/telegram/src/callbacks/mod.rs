@@ -107,19 +107,26 @@ mod tests {
         testing::{blocked_ack_server, server},
     };
     use crate::{
-        Acl, AclState, GroupMode, IngressDecision, NativeFrame, Role, TelegramHostPolicy,
-        approval::Cards, source::GroupSettings,
+        Acl, AclState, ActorRoleDecision, GroupMode, IngressDecision, NativeFrame, Role,
+        TelegramHostPolicy, VerifiedActor, approval::Cards, source::GroupSettings,
     };
 
     #[derive(Default)]
     struct Policy {
         frames: Mutex<Vec<CallbackFrame>>,
         slow: bool,
+        host_role: Option<Arc<Mutex<Option<Role>>>>,
     }
     #[async_trait]
     impl TelegramHostPolicy for Policy {
         async fn admit(&self, _: NativeFrame, _: Envelope) -> Result<IngressDecision, String> {
             Ok(IngressDecision::Ignore)
+        }
+        async fn actor_role(&self, _actor: VerifiedActor) -> Result<ActorRoleDecision, String> {
+            Ok(match &self.host_role {
+                Some(role) => ActorRoleDecision::Role(*role.lock().unwrap()),
+                None => ActorRoleDecision::ContinueLegacy,
+            })
         }
         async fn callback(&self, frame: CallbackFrame) -> Result<CallbackDecision, String> {
             self.frames.lock().unwrap().push(frame);
@@ -308,6 +315,7 @@ mod tests {
         let ctx = ctx();
         let policy = Arc::new(Policy {
             slow: true,
+            host_role: None,
             ..Policy::default()
         });
         let callbacks = Callbacks::new(Some(policy.clone()));
@@ -442,5 +450,57 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[tokio::test]
+    async fn fresh_host_role_replaces_acl_and_revocation_denies_an_existing_owner() {
+        let server = server().await;
+        let role = Arc::new(Mutex::new(Some(Role::Owner)));
+        let policy = Arc::new(Policy {
+            host_role: Some(role.clone()),
+            ..Policy::default()
+        });
+        let callbacks = Callbacks::new(Some(policy.clone()));
+        let empty = Some(Arc::new(AclState {
+            acl: RwLock::new(Acl::new()),
+            path: None,
+        }));
+        callbacks
+            .handle(
+                &server.bot,
+                input(query("opaque")),
+                &empty,
+                &GroupSettings::default(),
+                &ctx(),
+            )
+            .await;
+        assert_eq!(
+            policy.frames.lock().unwrap().len(),
+            1,
+            "account identity admits an unlisted chat"
+        );
+        *role.lock().unwrap() = None;
+        let listed = acl();
+        listed
+            .as_ref()
+            .unwrap()
+            .acl
+            .write()
+            .unwrap()
+            .insert(7, Role::Owner);
+        callbacks
+            .handle(
+                &server.bot,
+                input(query("opaque")),
+                &listed,
+                &GroupSettings::default(),
+                &ctx(),
+            )
+            .await;
+        assert_eq!(
+            policy.frames.lock().unwrap().len(),
+            1,
+            "revoked actor cannot fall back to owner ACL"
+        );
+        server.wait("answercallbackquery", 2).await;
     }
 }

@@ -99,7 +99,9 @@ pub(super) async fn send_reply(
                     return;
                 }
                 if is_unsupported(e.description()) {
-                    warn!(error = %e, "telegram: server has no rich messages; using the HTML renderer from here on");
+                    warn!(
+                        "telegram: server has no rich messages; using the HTML renderer from here on"
+                    );
                     *rich_messages = false;
                     send_html(bot, chat, &chunk, delivery).await;
                     continue;
@@ -111,7 +113,7 @@ pub(super) async fn send_reply(
                     if delivery.is_some_and(|d| !d.allowed()) {
                         return;
                     }
-                    warn!(error = %e, "telegram rich send with media failed; retrying with the media as links");
+                    warn!("telegram rich send with media failed; retrying with the media as links");
                     let linked = media_as_links(&chunk);
                     match send_rich_markdown(bot, chat, &sanitize_rich(&linked)).await {
                         Ok(sent) => {
@@ -135,13 +137,13 @@ pub(super) async fn send_reply(
                                 }
                                 return;
                             }
-                            warn!(error = %e, "telegram rich send failed; falling back to HTML")
+                            warn!("telegram rich send failed; falling back to HTML")
                         }
                     }
                     send_html(bot, chat, &linked, delivery).await;
                     continue;
                 }
-                warn!(error = %e, "telegram rich send failed; falling back to HTML");
+                warn!("telegram rich send failed; falling back to HTML");
                 send_html(bot, chat, &chunk, delivery).await;
             }
         }
@@ -195,7 +197,7 @@ pub(super) async fn send_html(
                     }
                     return;
                 }
-                warn!(error = %e, "telegram HTML send failed; retrying as plain text");
+                warn!("telegram HTML send failed; retrying as plain text");
                 let plain = strip_tags(&chunk);
                 if delivery.is_some_and(|d| !d.allowed()) {
                     return;
@@ -216,11 +218,11 @@ pub(super) async fn send_html(
                                 .await;
                         }
                     }
-                    Err(e2) => {
+                    Err(_e2) => {
                         if let Some(delivery) = delivery {
                             delivery.report(chat.0, &[], DeliveryStatus::Unknown).await;
                         }
-                        warn!(error = %e2, "telegram plain send failed");
+                        warn!("telegram plain send failed");
                     }
                 }
             }

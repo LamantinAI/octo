@@ -1,12 +1,19 @@
 //! Optional assembly-owned policy. The connector owns Telegram IO; the host owns
 //! session meaning. Native frames/stamps are captured before download or batching.
-use crate::{CallbackDecision, CallbackFrame, CallbackLimits};
+use std::time::Duration;
+
 use async_trait::async_trait;
 use octo_core::{ConnectorId, Envelope};
-use std::time::Duration;
+
+use crate::{CallbackDecision, CallbackFrame, CallbackLimits, CommandMenuScope, TelegramCommand};
 
 pub(super) mod delivery;
 pub(super) mod ingress;
+pub(crate) mod outbound;
+pub(crate) mod preflight;
+pub use preflight::{
+    ActorRoleDecision, PreflightDecision, PreflightFrame, VerifiedActor, VerifiedBot,
+};
 pub(super) mod tracking;
 
 #[derive(Clone, Debug)]
@@ -114,6 +121,26 @@ pub struct CleanupReport {
 
 #[async_trait]
 pub trait TelegramHostPolicy: Send + Sync {
+    /// Optional native menu for a verified scope. None preserves legacy behavior.
+    async fn command_menu(
+        &self,
+        _scope: CommandMenuScope,
+    ) -> Result<Option<Vec<TelegramCommand>>, String> {
+        Ok(None)
+    }
+    /// Called after getMe and before polling starts. Errors are intentionally redacted.
+    async fn bot_ready(&self, _bot: VerifiedBot) -> Result<(), String> {
+        Ok(())
+    }
+    /// Runs before legacy ACL perception and before any message-body logging/hash.
+    async fn preflight(&self, _frame: PreflightFrame) -> Result<PreflightDecision, String> {
+        Ok(PreflightDecision::ContinueLegacy)
+    }
+    /// Fresh callback/approval authorization; None denies even an existing ACL owner.
+    async fn actor_role(&self, _actor: VerifiedActor) -> Result<ActorRoleDecision, String> {
+        Ok(ActorRoleDecision::ContinueLegacy)
+    }
+
     /// Input carries verified Telegram metadata/native authority. Return its pinned
     /// full EnvelopeContext, preserving native authority and adding host context.
     async fn admit(
@@ -131,6 +158,16 @@ pub trait TelegramHostPolicy: Send + Sync {
     /// Rechecks only the pinned stamp; must never resolve the current selector again.
     fn allow_publish(&self, _envelope: &Envelope) -> bool {
         true
+    }
+    /// Authorize the exact resolved native destination. None preserves legacy ACL
+    /// and native ingress-marker behavior; failures deny without exposing errors.
+    async fn authorize_outbound(
+        &self,
+        _bot: VerifiedBot,
+        _chat_id: i64,
+        _envelope: &Envelope,
+    ) -> Result<Option<bool>, String> {
+        Ok(None)
     }
     fn allow_delivery(&self, _envelope: &Envelope) -> bool {
         true

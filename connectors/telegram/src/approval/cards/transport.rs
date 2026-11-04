@@ -16,11 +16,39 @@ use super::{
     delivery::CardDelivery,
     registry::{Action, Card, Registry, Reject, State},
     render::{BUSY, EXPIRED, FORBIDDEN, UNAVAILABLE, details, keyboard, text},
-    request::{current_owner, request, response},
+    request::{current_owner, request_authorized, response},
 };
-use crate::{AclState, policy::delivery::Delivery};
+use crate::{
+    AclState, ActorRoleDecision, Role, VerifiedActor,
+    policy::{delivery::Delivery, preflight::actor_role},
+};
 
 impl Cards {
+    async fn current_owner(&self, acl: &Option<Arc<AclState>>, actor: u64, chat: i64) -> bool {
+        if actor as i64 != chat {
+            return false;
+        }
+        let Some(bot) = &self.bot_identity else {
+            return current_owner(acl, actor, chat);
+        };
+        match actor_role(
+            self.policy.as_ref(),
+            VerifiedActor {
+                bot: bot.clone(),
+                actor_id: actor as i64,
+                actor_is_bot: false,
+                chat_id: chat,
+                chat_type: "private".into(),
+            },
+        )
+        .await
+        {
+            Ok(ActorRoleDecision::ContinueLegacy) => current_owner(acl, actor, chat),
+            Ok(ActorRoleDecision::Role(role)) => role == Some(Role::Owner),
+            Err(_) => false,
+        }
+    }
+
     /// A native context is mandatory. Invalid trusted routing is suppressed,
     /// rather than falling through to a raw technical String on the main card.
     #[cfg(test)]
@@ -50,7 +78,7 @@ impl Cards {
         let Ok(chat) = presentation.private_destination.parse::<i64>() else {
             return true;
         };
-        if !current_owner(acl, chat as u64, chat) {
+        if !self.current_owner(acl, chat as u64, chat).await {
             return true;
         }
         let mut card = match self
@@ -115,9 +143,15 @@ impl Cards {
             let _ = bot.answer_callback_query(query.id).text(BUSY).await;
             return true;
         };
-        let owner = query
-            .regular_message()
-            .is_some_and(|message| current_owner(acl, query.from.id.0, message.chat.id.0));
+        let owner = if let Some(message) = query.regular_message() {
+            message.chat.is_private()
+                && !query.from.is_bot
+                && self
+                    .current_owner(acl, query.from.id.0, message.chat.id.0)
+                    .await
+        } else {
+            false
+        };
         let begun = self
             .registry
             .lock()
@@ -170,7 +204,8 @@ impl Cards {
         if action.is_decision() {
             edit(bot, card).await;
         }
-        let envelope = match request(authority, id, acl, query, card, action) {
+        let owner = self.current_owner(acl, query.from.id.0, card.chat).await;
+        let envelope = match request_authorized(authority, id, query, card, action, owner) {
             Ok(request) => request,
             Err(_) => {
                 if action.is_decision() {

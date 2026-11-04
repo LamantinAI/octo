@@ -9,7 +9,8 @@ use tracing::warn;
 
 use super::{CallbackDecision, CallbackFrame, CallbackMessage};
 use crate::{
-    Acl, AclState, GroupMode, TelegramHostPolicy,
+    Acl, AclState, ActorRoleDecision, GroupMode, TelegramHostPolicy, VerifiedActor, VerifiedBot,
+    policy::preflight::actor_role,
     source::{GroupSettings, is_admin},
 };
 
@@ -23,6 +24,7 @@ pub(crate) struct Callbacks {
     policy: Option<Arc<dyn TelegramHostPolicy>>,
     jobs: Arc<Semaphore>,
     timeout: Duration,
+    bot_identity: Option<VerifiedBot>,
 }
 impl Callbacks {
     pub(crate) fn new(policy: Option<Arc<dyn TelegramHostPolicy>>) -> Self {
@@ -31,12 +33,17 @@ impl Callbacks {
             .map(|policy| policy.callback_limits())
             .unwrap_or_default();
         Self {
+            bot_identity: None,
             policy,
             jobs: Arc::new(Semaphore::new(limits.max_concurrent.clamp(1, 64))),
             timeout: limits
                 .timeout
                 .clamp(Duration::from_millis(100), Duration::from_secs(10)),
         }
+    }
+    pub(crate) fn with_identity(mut self, bot: VerifiedBot) -> Self {
+        self.bot_identity = Some(bot);
+        self
     }
     pub(crate) async fn handle(
         &self,
@@ -55,9 +62,41 @@ impl Callbacks {
         {
             return;
         }
-        let allowed = {
-            let acl = acl.as_ref().map(|state| state.acl.read().unwrap());
-            allowed(acl.as_deref(), groups, query)
+        let native = frame(&input);
+        let host_role = if let Some(message) = &native.message {
+            actor_role(
+                self.policy.as_ref(),
+                VerifiedActor {
+                    bot: self.bot_identity.clone().unwrap_or_else(|| VerifiedBot {
+                        connector: input.connector.clone(),
+                        bot_id: input.bot_id,
+                        username: String::new(),
+                    }),
+                    actor_id: query.from.id.0 as i64,
+                    actor_is_bot: query.from.is_bot,
+                    chat_id: message.chat_id,
+                    chat_type: message.chat_type.clone(),
+                },
+            )
+            .await
+        } else {
+            Ok(ActorRoleDecision::Role(None))
+        };
+        let allowed = match host_role {
+            Ok(ActorRoleDecision::Role(role)) => {
+                role.is_some()
+                    && !query.from.is_bot
+                    && native.message.as_ref().is_some_and(|message| {
+                        message.accessible
+                            && (message.chat_type != "private"
+                                || message.chat_id == query.from.id.0 as i64)
+                    })
+            }
+            Err(_) => false,
+            Ok(ActorRoleDecision::ContinueLegacy) => {
+                let acl = acl.as_ref().map(|state| state.acl.read().unwrap());
+                allowed(acl.as_deref(), groups, query)
+            }
         };
         let valid = query
             .data

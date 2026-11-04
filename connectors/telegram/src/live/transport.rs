@@ -148,9 +148,9 @@ impl Live {
                 entry.ids.push(sent.id);
                 entry.lines = line;
             }
-            Err(e) => {
+            Err(_e) => {
                 delivery.report(chat.0, &[], DeliveryStatus::Unknown).await;
-                warn!(chat = chat.0, error = %e, "telegram status send failed");
+                warn!(chat = chat.0, "telegram status send failed");
             }
         }
     }

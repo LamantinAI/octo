@@ -34,6 +34,7 @@ mod inline;
 pub use callbacks::{CallbackDecision, CallbackFrame, CallbackLimits, CallbackMessage};
 pub use inline::{InlineButton, InlineKeyboard, InlineKeyboardError};
 mod commands;
+pub use commands::{CommandMenuScope, TelegramCommand};
 mod feedback;
 mod format;
 mod fs;
@@ -72,9 +73,10 @@ use self::{
 };
 pub use config::{TelegramConnectorFactory, factory, factory_with_authority, factory_with_policy};
 pub use policy::{
-    AllowReplyContext, CleanupReport, CleanupRequest, DeliveryReport, DeliveryStatus,
-    IngressDecision, IngressScope, NativeBatch, NativeFrame, TelegramHostPolicy,
-    TelegramOutputScope, TrackingLimits,
+    ActorRoleDecision, AllowReplyContext, CleanupReport, CleanupRequest, DeliveryReport,
+    DeliveryStatus, IngressDecision, IngressScope, NativeBatch, NativeFrame, PreflightDecision,
+    PreflightFrame, TelegramHostPolicy, TelegramOutputScope, TrackingLimits, VerifiedActor,
+    VerifiedBot,
 };
 
 /// Default quiet window before a coalescing burst (album / forward) is flushed.

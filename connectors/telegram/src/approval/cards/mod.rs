@@ -11,16 +11,29 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::Semaphore;
 
+use crate::{TelegramHostPolicy, VerifiedBot};
 pub(crate) use registry::CardSettings;
 use registry::Registry;
 
 pub(crate) struct Cards {
     registry: Mutex<Registry>,
     jobs: Arc<Semaphore>,
+    policy: Option<Arc<dyn TelegramHostPolicy>>,
+    bot_identity: Option<VerifiedBot>,
 }
 impl Cards {
+    #[cfg(test)]
     pub fn new(settings: CardSettings) -> Arc<Self> {
+        Self::with_policy(settings, None, None)
+    }
+    pub fn with_policy(
+        settings: CardSettings,
+        policy: Option<Arc<dyn TelegramHostPolicy>>,
+        bot_identity: Option<VerifiedBot>,
+    ) -> Arc<Self> {
         Arc::new(Self {
+            policy,
+            bot_identity,
             jobs: Arc::new(Semaphore::new(settings.max_cards)),
             registry: Mutex::new(Registry::new(settings)),
         })

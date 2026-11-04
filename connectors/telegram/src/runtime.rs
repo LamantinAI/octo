@@ -1,5 +1,5 @@
 use std::{
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
 };
 mod media;
@@ -32,24 +32,29 @@ use tracing::{info, warn};
 use super::{
     ALLOW_CHAT, FLUSH_TICK, GROUP_MODE, LIST_CHATS, REMOVE_CHAT, SEND_FILE, STATUS, TYPING,
     TelegramConnector,
-    control::{handle_control, migrate, outgoing_allowed, owner_chats, register_add},
+    control::{handle_control, migrate, owner_chats, register_add},
     delivery::handle_file,
     inbound::{chat_envelope, coalesce_key, publish_flush, reply_context, with_reply},
     outbound::{is_voice_blob, send_reply},
 };
 use crate::{
-    AllowReplyContext, DeliveryStatus, InlineKeyboard, NativeFrame,
+    ActorRoleDecision, AllowReplyContext, DeliveryStatus, InlineKeyboard, NativeFrame,
+    PreflightFrame, VerifiedActor, VerifiedBot,
     approval::{Cards, handle_decision, message_proof},
     batch::{Batcher, Emit, Flush},
     callbacks::{CallbackInput, Callbacks},
-    commands::{SET_COMMANDS, set_commands},
+    commands::{HostMenus, SET_COMMANDS, set_commands},
     fs::{save_incoming, workspace_root},
     inline::send_inline,
     live::Live,
-    policy::delivery::{Delivery, notice},
-    policy::tracking::MessageRef,
-    policy::{ingress::admit, tracking::Tracker},
-    source::perceive,
+    policy::{
+        delivery::{Delivery, notice},
+        ingress::admit,
+        outbound::{destination, outbound_allowed},
+        preflight::{actor_role, chat_type, preflight},
+        tracking::{MessageRef, Tracker},
+    },
+    source::{actor_id, command_name, perceive, perceive_admitted},
 };
 
 #[async_trait]
@@ -73,17 +78,54 @@ impl TelegramConnector {
         ctx: ConnectorContext,
         bot: Bot,
     ) -> OctoResult<()> {
-        let me = bot
-            .get_me()
-            .await
-            .map_err(|error| OctoError::Connector(error.to_string()))?;
+        let me = bot.get_me().await.map_err(|_| {
+            OctoError::Connector("Telegram bot identity verification failed".into())
+        })?;
         let mut groups = self.groups.clone();
         groups.address_names.push(me.user.first_name.clone());
         let username = me.username().to_string();
         let bot_id = me.user.id;
+        let verified_bot = VerifiedBot {
+            connector: self.id.clone(),
+            bot_id: bot_id.0,
+            username: username.clone(),
+        };
+        if let Some(policy) = &self.policy {
+            policy.bot_ready(verified_bot.clone()).await.map_err(|_| {
+                OctoError::Connector("Telegram host identity registration failed".into())
+            })?;
+        }
 
-        let cards = Cards::new(self.approval_cards.clone());
-        let callbacks = Callbacks::new(self.policy.clone());
+        let mut host_menus = HostMenus::default();
+        if host_menus
+            .startup(&bot, self.policy.as_ref())
+            .await
+            .is_err()
+        {
+            warn!("telegram: host command menu setup failed; refresh will retry");
+        }
+        for chat in owner_chats(&self.acl) {
+            host_menus
+                .refresh(
+                    &bot,
+                    self.policy.as_ref(),
+                    VerifiedActor {
+                        bot: verified_bot.clone(),
+                        actor_id: chat,
+                        actor_is_bot: false,
+                        chat_id: chat,
+                        chat_type: "private".into(),
+                    },
+                )
+                .await;
+        }
+
+        let cards = Cards::with_policy(
+            self.approval_cards.clone(),
+            self.policy.clone(),
+            Some(verified_bot.clone()),
+        );
+        let callbacks = Callbacks::new(self.policy.clone()).with_identity(verified_bot.clone());
         let tracker = Tracker::new(
             self.policy
                 .as_ref()
@@ -110,6 +152,8 @@ impl TelegramConnector {
         let out_live = live.clone();
         let out_tracker = tracker.clone();
         let out_policy = self.policy.clone();
+        let out_host_managed = host_menus.managed_flag();
+        let out_identity = verified_bot.clone();
         spawn(async move {
             // Latched off the first time the server says it has no rich messages
             // (an older self-hosted Bot API), so replies stop paying for a call
@@ -121,40 +165,40 @@ impl TelegramConnector {
                         Some(env) => {
                             if out_live.handle_end(&out_bot, &env) {continue}
                             let delivery=Delivery{bot:&out_bot,tracker:&out_tracker,policy:out_policy.as_ref(),envelope:&env,trusted_notice:false};
-                            if !delivery.allowed() && env.kind.as_str() != SEND_FILE {continue}
                             // Control commands mutate the ACL; everything else is
                             // an outbound message to send.
                             if matches!(env.kind.as_str(), ALLOW_CHAT | REMOVE_CHAT | LIST_CHATS | GROUP_MODE) {
+                                if !delivery.allowed() {continue}
                                 handle_control(&out_acl, &out_groups, &out_id, &env, &out_ctx).await;
                                 continue;
                             }
                             // The bot's command menu (set by the assembly at startup).
                             if env.kind.as_str() == SET_COMMANDS {
+                                if !delivery.allowed() {continue}
                                 if env.tags.get("control_plane").map(String::as_str) != Some("true") { continue; }
                                 let owners = owner_chats(&out_acl);
                                 let payload = env.payload_as::<Value>().cloned().unwrap_or(Value::Null);
                                 commands.write().unwrap().update(&payload);
-                                let result = set_commands(&out_bot, &owners, &payload).await;
+                                let result = set_commands(&out_bot, &owners, &payload, out_host_managed.load(Ordering::Acquire)).await;
                                 let resp = Envelope::new(out_id.clone(), EventKind::new(format!("{SET_COMMANDS}.result")), result)
                                     .with_correlation(env.id);
-                                if let Err(e) = out_ctx.publish(resp).await {
-                                    warn!(error = %e, "telegram: failed to publish set_commands result");
+                                if let Err(_e) = out_ctx.publish(resp).await {
+                                    warn!("telegram: failed to publish set_commands result");
                                 }
                                 continue;
                             }
                             if env.kind.as_str() == SEND_FILE {
-                                handle_file(&out_bot, &out_workspace, &out_acl, &out_groups, &out_id, &env, &out_ctx,Some(&delivery)).await;
+                                handle_file(&out_bot, &out_workspace, &out_acl, &out_groups, &out_id, &env, &out_ctx,Some(&delivery),Some(&out_identity)).await;
                                 continue;
                             }
-                            if !outgoing_allowed(&out_acl, &out_groups, &env) {
-                                warn!("telegram: outbound destination is not allowed");
-                                continue;
-                            }
-                            // The chat id rides on the envelope's channel.
-                            let Some(chat) = env.channel.as_ref().and_then(|c| c.as_str().parse::<i64>().ok()) else {
+                            let Some(chat) = destination(&env) else {
                                 warn!(kind = %env.kind, "outbound without a numeric channel; dropped");
                                 continue;
                             };
+                            if !outbound_allowed(out_policy.as_ref(), &out_identity, chat, &env, &out_acl, &out_groups).await || !delivery.allowed() {
+                                warn!("telegram: outbound destination is not allowed");
+                                continue;
+                            }
                             let chat_id = ChatId(chat);
 
                             // Live-turn feedback: typing indicator / status trace.
@@ -195,7 +239,7 @@ impl TelegramConnector {
                                 };
                                 match sent {
                                     Ok(sent) => {delivery.report(chat,&[MessageRef{chat_id:sent.chat.id.0,message_id:sent.id.0,date:sent.date.timestamp()}],DeliveryStatus::Sent).await;info!(chat, ct = blob.content_type(), "sent media");}
-                                    Err(e) => {delivery.report(chat,&[],DeliveryStatus::Unknown).await;warn!(error = %e, "telegram media send failed");}
+                                    Err(_e) => {delivery.report(chat,&[],DeliveryStatus::Unknown).await;warn!("telegram media send failed");}
                                 }
                             } else if let Some(text) = env.payload_as::<String>() {
                                 send_reply(&out_bot, chat_id, text, &mut rich_messages,Some(&delivery)).await;
@@ -268,7 +312,15 @@ impl TelegramConnector {
                         if let UpdateKind::Message(msg) = update.kind {
                             if migrate(&self.acl, &msg) { continue; }
                             let chat = msg.chat.id.0.to_string();
-                            let perception = {
+                            let preflight_frame = PreflightFrame::from_message(verified_bot.clone(), update_id, &msg, &groups, &self.commands.read().unwrap());
+                            let host_admission = preflight(&self, &bot, preflight_frame).await;
+                            if let Some(actor_id) = actor_id(&msg) {
+                                host_menus.refresh(&bot, self.policy.as_ref(), VerifiedActor { bot:verified_bot.clone(), actor_id, actor_is_bot:msg.from.as_ref().is_some_and(|actor|actor.is_bot), chat_id:msg.chat.id.0, chat_type:chat_type(&msg) }).await;
+                            }
+                            let Some(host_admission) = host_admission else { continue };
+                            let perception = if let Some((role, context)) = host_admission {
+                                perceive_admitted(&msg, &groups, bot_id, &username, &self.commands.read().unwrap(), role, context)
+                            } else {
                                 let acl = self.acl.as_ref().map(|state| state.acl.read().unwrap());
                                 perceive(&msg, acl.as_deref(), &groups, bot_id, &username, &self.commands.read().unwrap())
                             };
@@ -293,6 +345,16 @@ impl TelegramConnector {
                                 notice(&bot,&tracker,self.policy.as_ref(),&self.id,msg.chat.id.0,"Media and files are not supported in temporary chats yet.".into(),source.scope.clone()).await;
                                 continue;
                             }
+                            if msg.text().and_then(|body| command_name(body, &username)).is_some_and(|command| matches!(command, "sqlapprove" | "sqldeny")) {
+                                let role = if let Some(actor_id) = actor_id(&msg) {
+                                    actor_role(self.policy.as_ref(), VerifiedActor { bot:verified_bot.clone(), actor_id, actor_is_bot:msg.from.as_ref().is_some_and(|actor|actor.is_bot), chat_id:msg.chat.id.0, chat_type:chat_type(&msg) }).await
+                                } else { Ok(ActorRoleDecision::Role(None)) };
+                                match role {
+                                    Ok(ActorRoleDecision::ContinueLegacy) => {},
+                                    Ok(ActorRoleDecision::Role(role)) => source.proof = self.authority.as_ref().and_then(|authority|message_proof(authority, &self.id, &msg, role)),
+                                    Err(_) => source.proof = None,
+                                }
+                            }
                             if handle_decision(&self.authority, source.proof.as_ref(), &bot,
                                 &self.id, &msg, &username, &ctx, self.approval_timeout).await { continue; }
                             let now = Instant::now();
@@ -310,7 +372,7 @@ impl TelegramConnector {
                             // cogitator sees what is being replied to (#17).
                             let reply = if self.policy.is_none()||source.pinned.as_ref().is_some_and(|e|e.context.get::<AllowReplyContext>().is_some()){reply_context(&msg)}else{None};
                             if let Some(text) = msg.text() {
-                                if !source.scope.as_ref().is_some_and(|s|s.ephemeral){info!(%chat, "recv: {text}");}
+                                if self.policy.is_none(){info!(%chat, "recv: {text}");}
                                 let body =
                                     with_reply(&reply, Some(text.to_string())).unwrap_or_default();
                                 if buffer {
@@ -344,7 +406,7 @@ impl TelegramConnector {
                             }
                         }
                     }
-                    Some(Err(e)) => warn!(error = %e, "telegram update error"),
+                    Some(Err(_)) => warn!("telegram update error"),
                     None => {
                         for flush in batcher.drain_all() {
                             publish_flush(&self.id, &ctx, flush,self.policy.as_ref()).await;

@@ -38,7 +38,7 @@ pub(super) async fn receive_media(
                 info!(%chat,bytes=bytes.len(),"recv: photo");
                 let saved = connector
                     .save_incoming(&inbox_name("photo.jpg"), &bytes)
-                    .map_err(|e| warn!(error=%e,"failed to save incoming photo"))
+                    .map_err(|_e| warn!("failed to save incoming photo"))
                     .ok();
                 let blob = Blob::new(bytes, "image/jpeg").with_filename("photo.jpg");
                 let caption = caption_with_saved(
@@ -47,7 +47,7 @@ pub(super) async fn receive_media(
                 );
                 return Some((Emit::Image { blob, caption }, true));
             }
-            Err(e) => warn!(error=%e,"telegram photo download failed"),
+            Err(_e) => warn!("telegram photo download failed"),
         }
     } else if let Some((doc, mime)) = image_document(msg) {
         match download_bytes(bot, &doc.file.id).await {
@@ -59,7 +59,7 @@ pub(super) async fn receive_media(
                 let name = doc.file_name.clone().unwrap_or_else(|| "image".into());
                 let saved = connector
                     .save_incoming(&inbox_name(&name), &bytes)
-                    .map_err(|e| warn!(error=%e,"failed to save incoming image document"))
+                    .map_err(|_e| warn!("failed to save incoming image document"))
                     .ok();
                 let caption = caption_with_saved(
                     with_reply(reply, msg.caption().map(str::to_string)),
@@ -73,7 +73,7 @@ pub(super) async fn receive_media(
                     false,
                 ));
             }
-            Err(e) => warn!(error=%e,"telegram document download failed"),
+            Err(_e) => warn!("telegram document download failed"),
         }
     } else if let Some(audio) = voice_media(msg) {
         match download_bytes(bot, audio.file_id).await {
@@ -84,7 +84,7 @@ pub(super) async fn receive_media(
                 info!(%chat,bytes=bytes.len(),secs=audio.duration_secs,"recv: voice");
                 let path = connector
                     .save_incoming(&inbox_name(&audio.filename), &bytes)
-                    .map_err(|e| warn!(error=%e,"failed to save incoming voice"))
+                    .map_err(|_e| warn!("failed to save incoming voice"))
                     .ok();
                 return Some((
                     Emit::Audio {
@@ -96,7 +96,7 @@ pub(super) async fn receive_media(
                     false,
                 ));
             }
-            Err(e) => warn!(error=%e,"telegram voice download failed"),
+            Err(_e) => warn!("telegram voice download failed"),
         }
     } else if let Some(video) = video_media(msg) {
         match download_bytes(bot, video.file_id).await {
@@ -106,7 +106,7 @@ pub(super) async fn receive_media(
                 }
                 let saved = connector
                     .save_incoming(&inbox_name(&video.filename), &bytes)
-                    .map_err(|e| warn!(error=%e,"failed to save incoming video"))
+                    .map_err(|_e| warn!("failed to save incoming video"))
                     .ok();
                 info!(%chat,bytes=bytes.len(),secs=video.duration_secs,rel=saved.as_deref().unwrap_or("-"),"recv: video");
                 let caption = video_caption(
@@ -133,11 +133,11 @@ pub(super) async fn receive_media(
                 };
                 return Some((emit, false));
             }
-            Err(e) => {
+            Err(_e) => {
                 if !allowed() {
                     return None;
                 }
-                warn!(error=%e,"telegram video download failed");
+                warn!("telegram video download failed");
                 return Some((
                     Emit::Text {
                         text: format!(
@@ -170,10 +170,10 @@ pub(super) async fn receive_media(
                             false,
                         ));
                     }
-                    Err(e) => warn!(error=%e,"failed to save incoming file"),
+                    Err(_e) => warn!("failed to save incoming file"),
                 }
             }
-            Err(e) => warn!(error=%e,"telegram file download failed"),
+            Err(_e) => warn!("telegram file download failed"),
         }
     }
     None
