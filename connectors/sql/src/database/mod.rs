@@ -336,8 +336,23 @@ mod tests {
         sleep(Duration::from_secs(2)).await;
         drop(guard);
         let pending = work.await.unwrap().unwrap();
-        assert_eq!(pending["status"], "approval_required", "{pending}");
-        assert!(pending["expires_at"].as_i64().unwrap() * 1000 <= started + 3000);
+        // A loaded executor may finish the queue wait in the final partial
+        // second. Conservative expiry is valid; extending the grant is not.
+        assert!(
+            matches!(
+                pending["status"].as_str(),
+                Some("approval_required" | "expired")
+            ),
+            "{pending}"
+        );
+        let stored = f
+            .call(
+                "sql.operation.status",
+                json!({"operation_id":pending["operation_id"],"include_approval":true}),
+            )
+            .await
+            .unwrap();
+        assert!(stored["expires_at"].as_i64().unwrap() * 1000 <= started + 3000);
     }
 
     struct QueueScope(AtomicBool);

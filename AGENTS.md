@@ -68,8 +68,8 @@ Orient by crate and responsibility first:
 
 ## Module Organisation
 
-Keep code **modular, grouped by purpose**, one concern per file. **Cap each file at
-~500 lines (hard limit 600).** `octo-core` already uses a `mod.rs`-with-submodules
+Keep code **modular, grouped by purpose**, one concern per file. **Keep handwritten production code within
+300 lines per file.** `octo-core` already uses a `mod.rs`-with-submodules
 layout where a concern grew past a flat file:
 
 ```
@@ -86,7 +86,7 @@ octo-core/src/
 └── router/                 ← Router trait, Route predicates, RuleBasedRouter
 ```
 
-Split a flat file into `mod.rs`-with-submodules when it passes ~500 lines or more
+Split a flat file into `mod.rs`-with-submodules when its production code approaches 300 lines or more
 than a few cohesive concerns accumulate. Shared cross-submodule types live in the
 parent `mod.rs`.
 
@@ -95,7 +95,8 @@ parent `mod.rs`.
 - Unit tests belong in inline `#[cfg(test)] mod tests` blocks in the owning `mod.rs`
   or crate `lib.rs`. Do not add standalone `src/**/tests.rs` files.
 - Keep implementation helpers in cohesive sibling files when a module grows; keep
-  the facade and its tests together and respect the 600-line hard limit.
+  the facade and its tests together and keep production code within 300 lines. Necessary inline tests in the owning
+  `mod.rs` or `lib.rs` may exceed that limit; preserve all meaningful tests.
 - Tests exercising only the public API across components belong in the crate's
   `tests/` directory. Shared integration fixtures may live in `tests/common/mod.rs`.
 - Async integration scenarios must have a bounded wait. A connector's local shutdown
@@ -176,3 +177,12 @@ staging or publishing, review direct and indirect disclosure. Use neutral
 placeholders, repository-relative paths and reserved example addresses. Preserve
 required licenses and public attribution; existing history does not authorize
 copying private details. Never reintroduce unsanitized history during a merge.
+
+## Production module size
+
+Keep handwritten production code within **300 lines per file**, organized by domain
+and responsibility. An owning Rust `mod.rs` or `lib.rs` may exceed that size because
+of necessary inline tests; its production portion must still meet the limit.
+Preserve meaningful tests. Do not hide oversized services in arbitrary `impl`
+fragments or move oversized test blocks into unrelated files. Generated lockfiles
+are exempt; control generated declaration sizes through their generator.

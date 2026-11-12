@@ -14,15 +14,7 @@ impl Database {
         conn: &mut SqliteConnection,
         actor: &VerifiedInvocation,
     ) -> Result<Value, SqlError> {
-        if actor.delegated
-            || !actor.origin.may_approve
-            || actor.origin.conversation != actor.origin.private_destination
-            || !actor.access.read
-        {
-            return Err(SqlError::Authority(
-                "Human private read access required".into(),
-            ));
-        }
+        self.require_private_approval_reader(actor)?;
         let ids:Vec<(String,)>=query_as("SELECT id FROM __octo_sql_operations WHERE principal=? AND status='pending' AND expires_at>? ORDER BY expires_at,id LIMIT 1000")
             .bind(&actor.origin.principal).bind(Utc::now().timestamp()).fetch_all(&mut *conn).await?;
         let mut items = Vec::new();
@@ -36,9 +28,7 @@ impl Database {
             {
                 continue;
             }
-            items.push(json!({"operation_id":id,"status":operation.status,"summary":operation.scope.presentation,
-                "expires_at":operation.prepared.expires_at,"decision_connector":operation.scope.connector,
-                "private_destination":operation.scope.destination}));
+            items.push(self.approval_projection(&operation, false));
         }
         Ok(json!({"items":items}))
     }

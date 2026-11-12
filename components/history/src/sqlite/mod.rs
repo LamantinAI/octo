@@ -11,6 +11,7 @@
 mod aliases;
 mod context;
 mod defaults;
+mod deletion;
 mod journal;
 mod migration;
 mod ownership;

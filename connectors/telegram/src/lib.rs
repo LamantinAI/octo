@@ -278,7 +278,7 @@ mod tests {
             "telegram",
             "111222:SECRETTOKEN",
             acl,
-            Some(PathBuf::from("/home/someone/private-acl.json")),
+            Some(PathBuf::from("state/private-acl.json")),
         );
         let bare = TelegramConnector::new("telegram", "333444:OTHERTOKEN");
 

@@ -204,6 +204,7 @@ impl SqlConnector {
             operation_hash: payload["operation_hash"].as_str().unwrap_or("").into(),
             recipient_principal: notice.principal.clone(),
             private_destination: destination.clone(),
+            origin_scope: notice.origin_scope.clone(),
             expires_at: payload["expires_at"].as_i64().unwrap_or(0),
             resource: notice.summary.resource.clone(),
             action: notice.summary.action,

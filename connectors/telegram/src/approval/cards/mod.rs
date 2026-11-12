@@ -89,6 +89,7 @@ mod tests {
             operation_id: "operation-1".into(),
             operation_hash: "exact-hash".into(),
             recipient_principal: "telegram:user:7".into(),
+            origin_scope: None,
             private_destination: "7".into(),
             expires_at: Utc::now().timestamp() + 60,
             action: ApprovalAction::DeleteStore,

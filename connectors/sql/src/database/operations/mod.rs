@@ -1,4 +1,6 @@
+mod decisions;
 mod list;
+mod projection;
 mod scope;
 pub(super) use scope::Scope;
 
@@ -43,6 +45,8 @@ pub(super) struct OperationStatus {
     pub operation_id: String,
     #[serde(default)]
     pub include_details: bool,
+    #[serde(default)]
+    pub include_approval: bool,
 }
 
 pub(super) fn validate_key(key: &str) -> Result<(), SqlError> {
@@ -261,153 +265,6 @@ impl Database {
             .await?;
         Ok(self.operation_response(&operation))
     }
-    pub(super) async fn decide(
-        &self,
-        conn: &mut SqliteConnection,
-        request: Decision,
-        invocation: &VerifiedInvocation,
-        cancellation: Cancellation,
-    ) -> Result<Value, SqlError> {
-        let mut transaction = conn.begin_with("BEGIN IMMEDIATE").await?;
-        let operation = self
-            .operation(&mut transaction, &request.operation_id)
-            .await?;
-        if operation.prepared.principal != invocation.origin.principal
-            || invocation.delegated
-            || !invocation.origin.may_approve
-            || operation.scope.connector != invocation.origin.connector
-            || operation.scope.destination != invocation.origin.conversation
-        {
-            return Err(SqlError::Authority(
-                "operation belongs to another human/private channel".into(),
-            ));
-        }
-        if !invocation.access.permits(
-            &operation.prepared.store,
-            &operation.prepared.principal,
-            &invocation.origin.principal,
-        ) || (operation.scope.read && !invocation.access.read)
-            || (operation.scope.write && !invocation.access.write)
-            || (operation.scope.schema && !invocation.access.schema)
-        {
-            return Err(SqlError::Authority(
-                "current operation capabilities unavailable".into(),
-            ));
-        }
-        if operation.status != "pending" {
-            return Ok(self.operation_response(&operation));
-        }
-        if operation.scope.policy_fingerprint != self.policy_fingerprint() {
-            return Err(SqlError::Stale);
-        }
-        if operation.prepared.expires_at <= Utc::now().timestamp() {
-            query(
-                "UPDATE __octo_sql_operations SET status='expired' WHERE id=? AND status='pending'",
-            )
-            .bind(&operation.prepared.id)
-            .execute(&mut *transaction)
-            .await?;
-            self.audit_decision(&mut transaction, &operation, invocation, "expired")
-                .await?;
-            transaction.commit().await?;
-            return Ok(json!({"status":"expired","operation_id":operation.prepared.id}));
-        }
-        let cancellation = match self
-            .pending_cancellations
-            .lock()
-            .await
-            .get(&operation.prepared.id)
-        {
-            Some(original) => cancellation.combined(original),
-            None => cancellation,
-        };
-        if !request.approve || cancellation.is_cancelled() {
-            let status = if cancellation.is_cancelled() {
-                "cancelled"
-            } else {
-                "rejected"
-            };
-            query("UPDATE __octo_sql_operations SET status=? WHERE id=? AND status='pending'")
-                .bind(status)
-                .bind(&operation.prepared.id)
-                .execute(&mut *transaction)
-                .await?;
-            self.audit_decision(&mut transaction, &operation, invocation, status)
-                .await?;
-            transaction.commit().await?;
-            return Ok(json!({"status":status,"operation_id":operation.prepared.id}));
-        }
-        let store = self
-            .load_store(&mut transaction, &operation.prepared.store, invocation)
-            .await?;
-        let (actual, _) = snapshot(&mut transaction, &store).await?;
-        if store.revision != operation.prepared.revision || actual != store.fingerprint {
-            return Err(SqlError::Stale);
-        }
-        // Durable claim is separate from user SQL. A failed or interrupted
-        // execution can never turn this grant back into a pending approval.
-        self.check_operation_scope(&operation)?;
-        query("UPDATE __octo_sql_operations SET status='claimed' WHERE id=? AND status='pending'")
-            .bind(&operation.prepared.id)
-            .execute(&mut *transaction)
-            .await?;
-        self.audit_decision(&mut transaction, &operation, invocation, "approved")
-            .await?;
-        transaction.commit().await?;
-        self.perform(conn, operation, true, cancellation).await
-    }
-    async fn audit_decision(
-        &self,
-        conn: &mut SqliteConnection,
-        operation: &Operation,
-        invocation: &VerifiedInvocation,
-        outcome: &str,
-    ) -> Result<(), SqlError> {
-        let detail = json!({"operation_hash":operation.hash,"connector":invocation.origin.connector,
-            "conversation":invocation.origin.conversation});
-        query("INSERT INTO __octo_sql_audit(operation_id,principal,outcome,detail,created_at,actor) VALUES(?,?,?,?,?,?)")
-            .bind(&operation.prepared.id).bind(&operation.prepared.principal).bind(outcome)
-            .bind(detail.to_string()).bind(Utc::now().timestamp()).bind(&invocation.origin.principal)
-            .execute(conn).await?;
-        Ok(())
-    }
-    pub(super) async fn operation_status(
-        &self,
-        conn: &mut SqliteConnection,
-        request: OperationStatus,
-        invocation: &VerifiedInvocation,
-    ) -> Result<Value, SqlError> {
-        let mut operation = self.operation(conn, &request.operation_id).await?;
-        if operation.prepared.principal != invocation.origin.principal {
-            return Err(SqlError::Authority("operation unavailable".into()));
-        }
-        if !invocation.access.read
-            || !invocation.access.permits(
-                &operation.prepared.store,
-                &operation.prepared.principal,
-                &invocation.origin.principal,
-            )
-        {
-            return Err(SqlError::Authority(
-                "current store read access unavailable".into(),
-            ));
-        }
-        if operation.status == "pending" && operation.prepared.expires_at <= Utc::now().timestamp()
-        {
-            query(
-                "UPDATE __octo_sql_operations SET status='expired' WHERE id=? AND status='pending'",
-            )
-            .bind(&operation.prepared.id)
-            .execute(conn)
-            .await?;
-            operation.status = "expired".into();
-        }
-        Ok(if request.include_details {
-            self.operation_details(&operation)
-        } else {
-            self.operation_response(&operation)
-        })
-    }
 }
 
 #[cfg(test)]
@@ -515,5 +372,114 @@ mod tests {
             .await
             .is_err()
         );
+    }
+    #[tokio::test]
+    async fn private_projection_preserves_original_full_binding_after_terminal_decision_without_engine_paths()
+     {
+        use octo_approval::{Access, Origin, ScopeBinding, ScopeValidator};
+        use octo_core::{ConnectorId, Envelope, EventKind};
+        use std::sync::Arc;
+        struct Live;
+        impl ScopeValidator for Live {
+            fn allows(&self, _binding: &ScopeBinding) -> bool {
+                true
+            }
+        }
+        let f = Fixture::new(Limits::default()).await;
+        let authority = f.authority.clone().with_scope_validator(Arc::new(Live));
+        let store = f.store().await;
+        let table = f.table(&store).await;
+        let original = ScopeBinding::new("account/account", "origin-epoch").unwrap();
+        let human = authority.issue(
+            Origin {
+                principal: "owner".into(),
+                connector: "web".into(),
+                conversation: "user:owner".into(),
+                private_destination: "user:owner".into(),
+                may_approve: true,
+            },
+            Access::owner(),
+        );
+        let scoped = authority.bind_scope(&human, original.clone()).unwrap();
+        let request=Envelope::new(ConnectorId::new("agent"),EventKind::new("sql.execute"),json!({"store_id":store,"expected_revision":2,"sql":format!("DELETE FROM {table}"),"idempotency_key":"private-projection"})).with_target(ConnectorId::new("sql"));
+        let proof = authority.bind(&scoped, &request).unwrap();
+        let pending = f.db.handle(&request.with_context(proof)).await.unwrap();
+        assert!(pending.get("origin_scope").is_none());
+        let operation = pending["operation_id"].as_str().unwrap();
+        let queue = f.call("sql.approval.list", json!({})).await.unwrap();
+        assert_eq!(queue["items"][0]["origin_scope"], json!(original));
+        assert_eq!(queue["items"][0]["decision_connector"], "web");
+        let public = f
+            .call("sql.operation.status", json!({"operation_id":operation}))
+            .await
+            .unwrap();
+        assert!(public.get("origin_scope").is_none());
+        let private = f
+            .call(
+                "sql.operation.status",
+                json!({"operation_id":operation,"include_approval":true,"include_details":true}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(private["origin_scope"], json!(original));
+        assert_eq!(private["operation_hash"], pending["operation_hash"]);
+        assert_eq!(private["can_decide"], true);
+        assert!(!private.to_string().contains(f.dir.path().to_str().unwrap()));
+        let decision = Envelope::new(
+            ConnectorId::new("web"),
+            EventKind::new("sql.approval.decide"),
+            json!({"operation_id":operation,"approve":true}),
+        )
+        .with_target(ConnectorId::new("sql"));
+        let proof = authority.bind_decision(&human, &decision).unwrap();
+        let result = f.db.handle(&decision.with_context(proof)).await.unwrap();
+        assert_eq!(result["status"], "committed");
+        let after = f
+            .call(
+                "sql.operation.status",
+                json!({"operation_id":operation,"include_approval":true}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(after["status"], "committed");
+        assert_eq!(after["origin_scope"], json!(original));
+        assert_eq!(after["can_decide"], false);
+        assert!(
+            f.call("sql.approval.list", json!({})).await.unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+    #[tokio::test]
+    async fn private_projection_requires_human_private_authority_beyond_regular_status_read_access()
+    {
+        use octo_approval::{Access, Origin};
+        use octo_core::{ConnectorId, Envelope, EventKind};
+        let f = Fixture::new(Limits::default()).await;
+        let store = f.store().await;
+        let table = f.table(&store).await;
+        let pending=f.call("sql.execute",json!({"store_id":store,"expected_revision":2,"sql":format!("DELETE FROM {table}"),"idempotency_key":"projection-eligibility"})).await.unwrap();
+        for private in [false, true] {
+            let ingress = f.authority.issue(
+                Origin {
+                    principal: "owner".into(),
+                    connector: "web".into(),
+                    conversation: "worker".into(),
+                    private_destination: "worker".into(),
+                    may_approve: false,
+                },
+                Access::owner(),
+            );
+            let request = Envelope::new(
+                ConnectorId::new("agent"),
+                EventKind::new("sql.operation.status"),
+                json!({"operation_id":pending["operation_id"],"include_approval":private}),
+            )
+            .with_target(ConnectorId::new("sql"));
+            let proof = f.authority.bind(&ingress, &request).unwrap();
+            let result = f.db.handle(&request.with_context(proof)).await;
+            assert_eq!(result.is_err(), private);
+        }
     }
 }
