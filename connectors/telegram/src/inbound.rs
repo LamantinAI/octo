@@ -2,8 +2,8 @@ use std::{
     any::Any,
     error::Error,
     path::Path,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{Arc, OnceLock},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use octo_core::{
@@ -11,11 +11,12 @@ use octo_core::{
     TrustLevel,
 };
 use teloxide::{
-    Bot,
+    Bot, RequestError,
     net::Download,
     requests::Requester,
     types::{Document, FileId, Message, PhotoSize},
 };
+use tokio::time::sleep;
 use tracing::warn;
 
 use crate::{
@@ -321,13 +322,47 @@ pub(super) fn with_reply(reply: &Option<String>, body: Option<String>) -> Option
     }
 }
 
+/// How long one media request (GetFile or the file download) may take.
+///
+/// teloxide's default client gives every request 17 s. Telegram sometimes needs
+/// longer to resolve a file, and a large download can take longer too, so media
+/// requests go through their own client. Without an ingress policy media is
+/// read inline with updates, so keep the worst case (GetFile, its retry, the
+/// download) near 90 s.
+#[cfg(not(test))]
+const MEDIA_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const MEDIA_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// The bot used for media requests: same token and API URL, longer timeout.
+fn media_bot(bot: &Bot) -> Bot {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    // Same settings as Bot::new, only the timeout differs.
+    let client = CLIENT.get_or_init(|| {
+        teloxide::net::default_reqwest_settings()
+            .timeout(MEDIA_TIMEOUT)
+            .build()
+            .expect("creating Telegram media client")
+    });
+    Bot::with_client(bot.token(), client.clone()).set_api_url(bot.api_url())
+}
+
 /// Resolve a Telegram `file_id` and download its bytes.
 pub(super) async fn download_bytes(
     bot: &Bot,
     file_id: &FileId,
 ) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
-    let file = bot.get_file(file_id.clone()).await?;
+    let bot = media_bot(bot);
+    let file = match bot.get_file(file_id.clone()).await {
+        // GetFile is read-only, so retry a transport failure once.
+        Err(RequestError::Network(_)) => {
+            sleep(Duration::from_millis(250)).await;
+            bot.get_file(file_id.clone()).await
+        }
+        result => result,
+    }?;
     let mut bytes: Vec<u8> = Vec::new();
+    // teloxide redacts the bot token from the URLs in its network errors.
     bot.download_file(&file.path, &mut bytes).await?;
     Ok(bytes)
 }

@@ -181,7 +181,8 @@ pub(super) async fn receive_media(
 
 #[cfg(test)]
 mod tests {
-    use super::receive_media;
+    use super::{Emit, receive_media};
+    use crate::inbound::download_bytes;
     use crate::runtime::pending::{MediaInput, MediaQueue};
     use crate::{
         IngressDecision, IngressScope, NativeFrame, TelegramConnector, TelegramHostPolicy,
@@ -200,13 +201,17 @@ mod tests {
     use serde_json::{from_value, json};
     use std::{
         fs::read_dir,
+        future::pending,
         sync::{
             Arc,
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
     };
-    use teloxide::{Bot, types::Message};
+    use teloxide::{
+        Bot,
+        types::{FileId, Message},
+    };
     use tempfile::tempdir;
     use tokio::{net::TcpListener, spawn, sync::Notify, time::timeout};
     struct Policy(Arc<AtomicBool>);
@@ -221,6 +226,106 @@ mod tests {
     }
     fn photo() -> Message {
         from_value(json!({"message_id":3,"date":1700000000,"chat":{"id":42,"type":"private","first_name":"Person"},"photo":[{"file_id":"image","file_unique_id":"stable-image","width":2,"height":2}]})).unwrap()
+    }
+
+    #[tokio::test]
+    async fn photo_reaches_vision_after_get_file_times_out_once() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let get_file_requests = requests.clone();
+        let app = Router::new().fallback(any(move |request: Request<Body>| {
+            let get_file_requests = get_file_requests.clone();
+            async move {
+                if request.uri().path().ends_with("/GetFile") {
+                    if get_file_requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return pending().await;
+                    }
+                    return Response::builder()
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({
+                                "ok": true,
+                                "result": {
+                                    "file_id": "image",
+                                    "file_unique_id": "stable-image",
+                                    "file_path": "image.jpg"
+                                }
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap();
+                }
+                assert!(request.uri().path().ends_with("/image.jpg"));
+                Response::new(Body::from("image bytes"))
+            }
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = spawn(async move { serve(listener, app).await.unwrap() });
+        // The default 17 s client would outlast the 3 s guard below: the photo
+        // only arrives if media requests use their own (test: 500 ms) timeout.
+        let bot =
+            Bot::new("123:FAKE").set_api_url(Url::parse(&format!("http://{address}")).unwrap());
+        let connector = TelegramConnector::new("telegram", "123:FAKE");
+        let result = timeout(
+            Duration::from_secs(3),
+            receive_media(&connector, &bot, &photo(), &MessageSource::default(), &None),
+        )
+        .await
+        .unwrap();
+        server.abort();
+        assert!(matches!(result, Some((Emit::Image { .. }, true))));
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+    }
+
+    /// A fake token in Telegram's shape, so teloxide's redaction path is the real one.
+    const SECRET: &str = "FAKExFAKExFAKExFAKExFAKExFAKExFAKEx";
+    const TOKEN: &str = "123456789:FAKExFAKExFAKExFAKExFAKExFAKExFAKEx";
+
+    /// Telegram request URLs embed the bot token; a media network error must not.
+    async fn media_error(hang_get_file: bool) -> String {
+        let app = Router::new().fallback(any(move |request: Request<Body>| async move {
+            if request.uri().path().ends_with("/GetFile") && !hang_get_file {
+                return Response::builder()
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "ok": true,
+                            "result": {
+                                "file_id": "image",
+                                "file_unique_id": "stable-image",
+                                "file_path": "image.jpg"
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap();
+            }
+            pending().await
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = spawn(async move { serve(listener, app).await.unwrap() });
+        let bot = Bot::new(TOKEN).set_api_url(Url::parse(&format!("http://{address}")).unwrap());
+        let error = timeout(
+            Duration::from_secs(3),
+            download_bytes(&bot, &FileId("image".to_owned())),
+        )
+        .await
+        .unwrap()
+        .unwrap_err()
+        .to_string();
+        server.abort();
+        error
+    }
+    #[tokio::test]
+    async fn get_file_network_error_hides_the_token() {
+        let error = media_error(true).await;
+        assert!(!error.contains(SECRET), "{error}");
+    }
+    #[tokio::test]
+    async fn download_network_error_hides_the_token() {
+        let error = media_error(false).await;
+        assert!(!error.contains(SECRET), "{error}");
     }
     #[tokio::test]
     async fn temporary_media_never_starts_network_or_workspace_pipeline() {
