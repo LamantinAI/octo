@@ -11,16 +11,29 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::Semaphore;
 
+use crate::{TelegramHostPolicy, VerifiedBot};
 pub(crate) use registry::CardSettings;
 use registry::Registry;
 
 pub(crate) struct Cards {
     registry: Mutex<Registry>,
     jobs: Arc<Semaphore>,
+    policy: Option<Arc<dyn TelegramHostPolicy>>,
+    bot_identity: Option<VerifiedBot>,
 }
 impl Cards {
+    #[cfg(test)]
     pub fn new(settings: CardSettings) -> Arc<Self> {
+        Self::with_policy(settings, None, None)
+    }
+    pub fn with_policy(
+        settings: CardSettings,
+        policy: Option<Arc<dyn TelegramHostPolicy>>,
+        bot_identity: Option<VerifiedBot>,
+    ) -> Arc<Self> {
         Arc::new(Self {
+            policy,
+            bot_identity,
             jobs: Arc::new(Semaphore::new(settings.max_cards)),
             registry: Mutex::new(Registry::new(settings)),
         })
@@ -76,6 +89,7 @@ mod tests {
             operation_id: "operation-1".into(),
             operation_hash: "exact-hash".into(),
             recipient_principal: "telegram:user:7".into(),
+            origin_scope: None,
             private_destination: "7".into(),
             expires_at: Utc::now().timestamp() + 60,
             action: ApprovalAction::DeleteStore,

@@ -19,6 +19,7 @@ pub(super) fn current_owner(acl: &Option<Arc<AclState>>, actor: u64, chat: i64) 
             acl.role(actor) == Some(Role::Owner) && acl.role(chat) == Some(Role::Owner)
         })
 }
+#[cfg(test)]
 pub(super) fn request(
     authority: &Authority,
     id: &ConnectorId,
@@ -27,9 +28,29 @@ pub(super) fn request(
     card: &Card,
     action: Action,
 ) -> Result<Envelope, String> {
+    request_authorized(
+        authority,
+        id,
+        query,
+        card,
+        action,
+        query
+            .regular_message()
+            .is_some_and(|message| current_owner(acl, query.from.id.0, message.chat.id.0)),
+    )
+}
+
+pub(super) fn request_authorized(
+    authority: &Authority,
+    id: &ConnectorId,
+    query: &CallbackQuery,
+    card: &Card,
+    action: Action,
+    owner: bool,
+) -> Result<Envelope, String> {
     let message = query.regular_message().ok_or("Message is inaccessible")?;
     if !message.chat.is_private()
-        || !current_owner(acl, query.from.id.0, message.chat.id.0)
+        || !owner
         || query.from.is_bot
         || query.from.id.0 != card.actor
         || message.id != card.message.ok_or("Card is not active")?

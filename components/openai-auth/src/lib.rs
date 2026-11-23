@@ -13,22 +13,20 @@
 //! the only way in: it serialises every refresh behind a lock, so the refresh stays
 //! single-owner when one `Arc` is shared across the LLM path and the voice connectors.
 
+mod refresh;
 mod storage;
-use std::{
-    fs::read_to_string,
-    path::{Path, PathBuf},
-    time::{Duration, Instant},
-};
+mod subscription;
+
+use std::{fs::read_to_string, path::Path};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
-use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, from_slice, from_str, json, to_string_pretty};
-use tokio::sync::Mutex;
+use serde_json::{Map, Value, from_slice, from_str, to_string_pretty};
 use tracing::{info, warn};
 
-use self::storage::write_private;
+pub use self::subscription::SubscriptionAuth;
+use self::{refresh::refresh, storage::write_private};
 
 /// The crate's error — a human-readable message. A token store either yields a usable
 /// [`Subscription`] or an error a person can act on (usually: run the login flow).
@@ -46,9 +44,6 @@ pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 /// Refresh once the access token has this little life left (or is already expired).
 const REFRESH_WINDOW_SECS: i64 = 300;
-/// A forced refresh this recent already answered a revocation: a second caller that hit
-/// the same 401 concurrently reuses it instead of POSTing another refresh.
-const FORCE_DEDUPE: Duration = Duration::from_secs(30);
 /// The sign-in command named in errors unless the assembly supplies its own.
 const DEFAULT_LOGIN_HINT: &str = "codex login";
 
@@ -145,8 +140,7 @@ async fn ensure_fresh(path: &Path, login: &str) -> Result<Subscription> {
 }
 
 /// Refresh NOW, ignoring what the JWT `exp` claims. The server can revoke an access
-/// token ahead of its stated expiry (seen live 2026-08-10: a 401 `token_expired`
-/// with `exp` still eight days out), and [`ensure_fresh`] trusts `exp` — so it would
+/// token ahead of its stated expiry, and [`ensure_fresh`] trusts `exp` — so it would
 /// keep serving the revoked token forever. This is the escape hatch for a caller
 /// that has just watched the token bounce off the server. A rejected refresh errors
 /// through [`refresh`], which already points at the login command.
@@ -178,62 +172,6 @@ async fn force_refresh(path: &Path, login: &str) -> Result<Subscription> {
         )));
     }
     subscription_from(&auth.tokens)
-}
-
-/// A shared, refresh-serialised handle over the subscription token store — the one way
-/// in. Every refresh happens under a lock, so it is SINGLE-OWNER: safe to share behind an
-/// `Arc` across the cogitator's LLM backend and the voice connectors, because two
-/// concurrent callers can never both POST a refresh and invalidate each other's token —
-/// the second waits, re-reads the store the first has just refreshed, and returns it
-/// without a second POST. The same holds for two callers that hit one revocation (a 401)
-/// at once: the second reuses the first's forced refresh.
-pub struct SubscriptionAuth {
-    path: PathBuf,
-    /// The sign-in command errors point at (e.g. an assembly's own `albert login`).
-    login_hint: String,
-    /// Serialises refreshes; holds when the last forced refresh completed.
-    last_forced: Mutex<Option<Instant>>,
-}
-
-impl SubscriptionAuth {
-    /// A handle over the codex-style `auth.json` at `path`.
-    pub fn new(path: PathBuf) -> Self {
-        Self {
-            path,
-            login_hint: DEFAULT_LOGIN_HINT.into(),
-            last_forced: Mutex::new(None),
-        }
-    }
-
-    /// Name the sign-in command errors point at (default: `codex login`).
-    pub fn with_login_hint(mut self, hint: impl Into<String>) -> Self {
-        self.login_hint = hint.into();
-        self
-    }
-
-    /// The token store this handle reads and refreshes.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// A fresh [`Subscription`], refreshing the access token first if it is near expiry.
-    pub async fn fresh(&self) -> Result<Subscription> {
-        let _serialise = self.last_forced.lock().await;
-        ensure_fresh(&self.path, &self.login_hint).await
-    }
-
-    /// Force a refresh now — the escape hatch for a live 401 the JWT `exp` still calls
-    /// valid (revocation). Serialised the same way, so it can't race a concurrent `fresh`;
-    /// a forced refresh that completed moments ago is reused rather than repeated.
-    pub async fn force_refresh(&self) -> Result<Subscription> {
-        let mut last_forced = self.last_forced.lock().await;
-        if last_forced.is_some_and(|at| at.elapsed() < FORCE_DEDUPE) {
-            return ensure_fresh(&self.path, &self.login_hint).await;
-        }
-        let sub = force_refresh(&self.path, &self.login_hint).await?;
-        *last_forced = Some(Instant::now());
-        Ok(sub)
-    }
 }
 
 /// True when the access token expires within [`REFRESH_WINDOW_SECS`] (or already
@@ -279,30 +217,23 @@ fn subscription_from(tokens: &Tokens) -> Result<Subscription> {
     })
 }
 
-/// The refresh-token grant (`grant_type=refresh_token`), sent as JSON — matching the
-/// codex flow. Returns the new tokens; a non-2xx is a hard error pointing at re-login.
-async fn refresh(refresh_token: &str, login: &str) -> Result<RefreshResponse> {
-    let resp = HttpClient::new()
-        .post(TOKEN_URL)
-        .json(&json!({
-            "client_id": CLIENT_ID,
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-        }))
-        .send()
-        .await
-        .map_err(|e| AuthError(format!("token refresh request failed: {e}")))?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(AuthError(format!(
-            "token refresh rejected ({status}): {body}; run `{login}`"
-        )));
+/// Local test builds capture their refresh destination once; normal builds always
+/// use the public provider endpoint.
+fn token_endpoint() -> &'static str {
+    #[cfg(feature = "local-e2e")]
+    {
+        use std::{env::var, sync::OnceLock};
+        static ENDPOINT: OnceLock<String> = OnceLock::new();
+        return ENDPOINT.get_or_init(|| match var("ALBERT_E2E_AUTH_INTERNAL_ORIGIN") {
+            Ok(origin) => format!("{}/oauth/token", origin.trim_end_matches('/')),
+            Err(_) => TOKEN_URL.into(),
+        });
     }
-    from_str(&body).map_err(|e| AuthError(format!("token refresh parse: {e}")))
+    #[cfg(not(feature = "local-e2e"))]
+    TOKEN_URL
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct RefreshResponse {
     access_token: Option<String>,
     refresh_token: Option<String>,
@@ -555,9 +486,11 @@ mod tests {
     #[ignore = "hits auth.openai.com; run with --ignored"]
     async fn refresh_rejects_bad_token() {
         let result = super::refresh("definitely-not-a-valid-refresh-token", "codex login").await;
-        println!("refresh(bogus) -> {result:?}");
         assert!(result.is_err(), "a bogus refresh token must be rejected");
-        let msg = format!("{:?}", result.unwrap_err());
+        let msg = match result {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("a bogus refresh token must be rejected"),
+        };
         assert!(
             msg.contains("rejected"),
             "expected a clean HTTP rejection, got: {msg}"

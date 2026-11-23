@@ -14,11 +14,15 @@ use tokio::time::timeout;
 use tracing::{info, warn};
 
 use crate::{
-    AclState, DeliveryStatus, IngressScope, SEND_FILE_RESULT, TelegramOutputScope,
+    AclState, DeliveryStatus, IngressScope, SEND_FILE_RESULT, TelegramOutputScope, VerifiedBot,
     control::outgoing_allowed,
     fs::{load_outgoing, workspace_root},
     outbound::{Outbound, outbound_kind},
-    policy::{delivery::Delivery, tracking::MessageRef},
+    policy::{
+        delivery::Delivery,
+        outbound::{destination, outbound_allowed},
+        tracking::MessageRef,
+    },
     source::GroupSettings,
 };
 
@@ -35,17 +39,14 @@ pub(super) async fn handle_file(
     env: &Envelope,
     ctx: &ConnectorContext,
     delivery: Option<&Delivery<'_>>,
+    identity: Option<&VerifiedBot>,
 ) {
-    let result = if delivery.is_some_and(|d| !d.allowed()) {
-        failed("not_sent", "The originating chat scope is closed.")
-    } else {
-        deliver(bot, workspace, acl, groups, env).await
-    };
+    let result = deliver(bot, workspace, acl, groups, env, delivery, identity).await;
     if let Some(delivery) = delivery {
         let chat = result
             .get("chat_id")
             .and_then(Value::as_i64)
-            .or_else(|| env.channel.as_ref().and_then(|c| c.as_str().parse().ok()))
+            .or_else(|| destination(env))
             .unwrap_or(0);
         let status = match result["status"].as_str() {
             Some("sent") => DeliveryStatus::Sent,
@@ -84,6 +85,8 @@ async fn deliver(
     acl: &Option<Arc<AclState>>,
     groups: &GroupSettings,
     env: &Envelope,
+    delivery: Option<&Delivery<'_>>,
+    identity: Option<&VerifiedBot>,
 ) -> Value {
     let Some(params) = env.payload_as::<Value>() else {
         return failed("not_sent", "File command requires a JSON payload.");
@@ -95,22 +98,35 @@ async fn deliver(
     else {
         return failed("not_sent", "Missing workspace path.");
     };
-    let chat = if let Some(explicit) = params.get("chat") {
-        explicit.as_i64()
-    } else {
-        env.channel.as_ref().and_then(|c| c.as_str().parse().ok())
-    };
+    let chat = destination(env);
     let Some(chat) = chat.filter(|id| *id != 0) else {
         return failed(
             "not_sent",
             "Missing or invalid destination chat. Bind a channel or supply chat.",
         );
     };
-    if !outgoing_allowed(acl, groups, env) {
+    let allowed = match identity {
+        Some(identity) => {
+            outbound_allowed(
+                delivery.and_then(|delivery| delivery.policy),
+                identity,
+                chat,
+                env,
+                acl,
+                groups,
+            )
+            .await
+        }
+        None => outgoing_allowed(acl, groups, env),
+    };
+    if !allowed {
         return failed(
             "not_sent",
-            "Destination is not allowed by the Telegram ACL.",
+            "Destination is not authorized for Telegram delivery.",
         );
+    }
+    if delivery.is_some_and(|delivery| !delivery.allowed()) {
+        return failed("not_sent", "The originating chat scope is closed.");
     }
     let root = match workspace_root(workspace) {
         Ok(root) => root,
@@ -128,6 +144,24 @@ async fn deliver(
     let caption = params.get("caption").and_then(Value::as_str);
     let kind = outbound_kind(&filename);
     let file = InputFile::memory(bytes).file_name(filename);
+    if delivery.is_some_and(|delivery| !delivery.allowed()) {
+        return failed("not_sent", "The originating chat scope is closed.");
+    }
+    if let Some(identity) = identity {
+        if !outbound_allowed(
+            delivery.and_then(|delivery| delivery.policy),
+            identity,
+            chat,
+            env,
+            acl,
+            groups,
+        )
+        .await
+            || delivery.is_some_and(|delivery| !delivery.allowed())
+        {
+            return failed("not_sent", "Destination authorization is no longer valid.");
+        }
+    }
     let send = async {
         match kind {
             Outbound::Photo => {
@@ -184,7 +218,10 @@ async fn deliver(
 mod tests {
     use std::{
         fs::write,
-        sync::{Mutex, RwLock},
+        sync::{
+            Mutex, RwLock,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     use axum::{Json, Router, body::Bytes, http::StatusCode, routing::post, serve};
@@ -194,7 +231,84 @@ mod tests {
     use tokio::{net::TcpListener, spawn, task::JoinHandle};
 
     use super::*;
-    use crate::{Acl, Role, SEND_FILE};
+    use crate::{
+        Acl, IngressDecision, NativeFrame, Role, SEND_FILE, TelegramHostPolicy,
+        policy::tracking::Tracker,
+    };
+    use async_trait::async_trait;
+
+    struct CurrentBinding {
+        calls: AtomicUsize,
+        revoke_before_send: bool,
+    }
+    #[async_trait]
+    impl TelegramHostPolicy for CurrentBinding {
+        async fn admit(&self, _: NativeFrame, _: Envelope) -> Result<IngressDecision, String> {
+            Ok(IngressDecision::Ignore)
+        }
+        async fn authorize_outbound(
+            &self,
+            _: VerifiedBot,
+            chat: i64,
+            _: &Envelope,
+        ) -> Result<Option<bool>, String> {
+            assert_eq!(chat, 77, "authorize the explicit native upload destination");
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(!self.revoke_before_send || call == 0))
+        }
+    }
+
+    #[tokio::test]
+    async fn host_authorizes_unlisted_file_destination_and_rechecks_binding_before_upload() {
+        for revoked in [false, true] {
+            let server = server(json!({"ok":true,"result":{"message_id":17,"date":1,"chat":{"id":77,"type":"private","first_name":"Person"},"text":"file"}})).await;
+            let dir = tempdir().unwrap();
+            write(dir.path().join("report.txt"), b"report").unwrap();
+            let envelope = command(json!({"path":"report.txt","chat":77}));
+            let host = Arc::new(CurrentBinding {
+                calls: AtomicUsize::new(0),
+                revoke_before_send: revoked,
+            });
+            let policy: Arc<dyn TelegramHostPolicy> = host.clone();
+            let tracker = Tracker::new(Default::default());
+            let delivery = Delivery {
+                bot: &server.bot,
+                tracker: &tracker,
+                policy: Some(&policy),
+                envelope: &envelope,
+                trusted_notice: false,
+            };
+            let identity = VerifiedBot {
+                connector: ConnectorId::new("telegram"),
+                bot_id: 9,
+                username: "test_bot".into(),
+            };
+            let acl = Some(Arc::new(AclState {
+                acl: RwLock::new(Acl::new()),
+                path: None,
+            }));
+            let result = timeout(
+                Duration::from_secs(2),
+                deliver(
+                    &server.bot,
+                    &Some(dir.path().into()),
+                    &acl,
+                    &GroupSettings::default(),
+                    &envelope,
+                    Some(&delivery),
+                    Some(&identity),
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(host.calls.load(Ordering::SeqCst), 2);
+            assert_eq!(result["status"], if revoked { "not_sent" } else { "sent" });
+            assert_eq!(
+                server.requests.lock().unwrap().len(),
+                if revoked { 0 } else { 1 }
+            );
+        }
+    }
 
     struct Server {
         bot: Bot,
@@ -265,6 +379,7 @@ mod tests {
                 &ConnectorId::new("telegram"),
                 env,
                 &ctx,
+                None,
                 None,
             ),
         )

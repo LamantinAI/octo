@@ -5,7 +5,7 @@ use std::{
     time::Instant,
 };
 
-use octo_approval::{Authority, VerifiedInvocation};
+use octo_approval::{Authority, ScopeBinding, VerifiedInvocation};
 use octo_core::Envelope;
 use serde_json::{Value, from_value, to_vec};
 use sqlx::SqliteConnection;
@@ -29,6 +29,7 @@ pub(crate) struct Notice {
     pub connector: String,
     pub destination: String,
     pub principal: String,
+    pub origin_scope: Option<ScopeBinding>,
     pub summary: PresentationSnapshot,
 }
 pub(crate) struct Completion {
@@ -154,6 +155,7 @@ impl Database {
                         .or_insert(cancellation);
                     Some(Notice {
                         principal: operation.prepared.principal,
+                        origin_scope: operation.scope.scope_binding,
                         summary: operation.scope.presentation,
                         connector: operation.scope.connector,
                         destination: operation.scope.destination,
@@ -243,6 +245,7 @@ impl Database {
                 self.operation_status(conn, from_value(payload).map_err(invalid)?, &invocation)
                     .await
             }
+            "sql.approval.list" => self.pending_operations(conn, &invocation).await,
             _ => Err(invalid("unknown SQL command")),
         }
     }

@@ -8,9 +8,10 @@ use serde_json::{Value, json};
 use teloxide::types::{ChatMemberUpdated, Message};
 use tracing::warn;
 
-use super::{ALLOW_CHAT, AclState, GROUP_MODE, LIST_CHATS, REMOVE_CHAT, SEND_FILE};
+use super::{ALLOW_CHAT, AclState, GROUP_MODE, LIST_CHATS, REMOVE_CHAT};
 use crate::{
     Acl, GroupMode, Role,
+    policy::{outbound::destination, preflight::HostAuthorized},
     source::{GroupSettings, is_admin},
 };
 
@@ -140,18 +141,12 @@ pub(super) fn outgoing_allowed(
     settings: &GroupSettings,
     env: &Envelope,
 ) -> bool {
-    let Some(state) = acl else { return true };
-    let chat = if env.kind.as_str() == SEND_FILE {
-        env.payload_as::<Value>().and_then(|p| p["chat"].as_i64())
-    } else {
-        None
-    }
-    .or_else(|| {
-        env.channel
-            .as_ref()
-            .and_then(|id| id.as_str().parse::<i64>().ok())
-    });
+    let chat = destination(env);
     let Some(chat) = chat else { return false };
+    if let Some(authorized) = env.context.get::<HostAuthorized>() {
+        return authorized.chat_id == chat && env.target.as_ref() == Some(&authorized.connector);
+    }
+    let Some(state) = acl else { return true };
     let acl = state.acl.read().unwrap();
     if acl.role(chat).is_some() || (chat > 0 && settings.admins.contains(&chat)) {
         return true;

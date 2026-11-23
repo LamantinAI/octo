@@ -7,7 +7,7 @@ use std::{
 };
 
 use octo_approval::Ingress;
-use octo_core::{ChannelMetadata, ConnectorId, Envelope, TrustLevel};
+use octo_core::{ChannelMetadata, ConnectorId, Envelope, EnvelopeContext, TrustLevel};
 use serde_json::Value;
 use teloxide::types::{Message, MessageEntityKind, UserId};
 
@@ -54,10 +54,14 @@ pub(super) struct MessageSource {
     pub pinned: Option<Envelope>,
     pub scope: Option<IngressScope>,
     pub frames: Vec<NativeFrame>,
+    pub host_context: Option<EnvelopeContext>,
 }
 
 impl MessageSource {
     pub fn apply(self, mut envelope: Envelope) -> Envelope {
+        if let Some(context) = self.host_context {
+            envelope.context = context;
+        }
         envelope
             .channel_metadata
             .get_or_insert_with(ChannelMetadata::new)
@@ -146,6 +150,7 @@ impl MessageSource {
         if incompatible {
             self.tags.insert("scope_invalid".into(), "true".into());
         }
+        self.host_context = next.host_context;
         self.pinned = next.pinned;
         self.scope = next.scope;
         self.frames.extend(next.frames);
@@ -345,6 +350,22 @@ pub(super) fn perceive(
             ..MessageSource::default()
         },
     ))
+}
+
+/// Preserve native provenance/addressing while the host supplies account authority.
+pub(super) fn perceive_admitted(
+    message: &Message,
+    settings: &GroupSettings,
+    bot: UserId,
+    username: &str,
+    commands: &CommandCatalog,
+    role: Role,
+    context: EnvelopeContext,
+) -> Option<(Option<(Role, TrustLevel)>, MessageSource)> {
+    let (_, mut source) = perceive(message, None, settings, bot, username, commands)?;
+    source.tags.insert("role".into(), role.as_str().into());
+    source.host_context = Some(context);
+    Some((Some((role, role.trust())), source))
 }
 
 #[cfg(test)]

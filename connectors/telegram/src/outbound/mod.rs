@@ -18,6 +18,11 @@ use crate::{
     policy::{delivery::Delivery, tracking::MessageRef},
 };
 
+/// Host-only preference for Markdown rendered as native Telegram text/entities.
+/// Paragraph gaps become literal newlines rather than rich-message block layout.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ClassicMarkdown;
+
 /// How an outgoing file is presented in Telegram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Outbound {
@@ -64,7 +69,10 @@ pub(super) async fn send_reply(
     rich_messages: &mut bool,
     delivery: Option<&Delivery<'_>>,
 ) {
-    if !*rich_messages {
+    if !*rich_messages
+        || delivery
+            .is_some_and(|delivery| delivery.envelope.context.get::<ClassicMarkdown>().is_some())
+    {
         send_html(bot, chat, text, delivery).await;
         return;
     }
@@ -91,7 +99,9 @@ pub(super) async fn send_reply(
                     return;
                 }
                 if is_unsupported(e.description()) {
-                    warn!(error = %e, "telegram: server has no rich messages; using the HTML renderer from here on");
+                    warn!(
+                        "telegram: server has no rich messages; using the HTML renderer from here on"
+                    );
                     *rich_messages = false;
                     send_html(bot, chat, &chunk, delivery).await;
                     continue;
@@ -103,7 +113,7 @@ pub(super) async fn send_reply(
                     if delivery.is_some_and(|d| !d.allowed()) {
                         return;
                     }
-                    warn!(error = %e, "telegram rich send with media failed; retrying with the media as links");
+                    warn!("telegram rich send with media failed; retrying with the media as links");
                     let linked = media_as_links(&chunk);
                     match send_rich_markdown(bot, chat, &sanitize_rich(&linked)).await {
                         Ok(sent) => {
@@ -127,13 +137,13 @@ pub(super) async fn send_reply(
                                 }
                                 return;
                             }
-                            warn!(error = %e, "telegram rich send failed; falling back to HTML")
+                            warn!("telegram rich send failed; falling back to HTML")
                         }
                     }
                     send_html(bot, chat, &linked, delivery).await;
                     continue;
                 }
-                warn!(error = %e, "telegram rich send failed; falling back to HTML");
+                warn!("telegram rich send failed; falling back to HTML");
                 send_html(bot, chat, &chunk, delivery).await;
             }
         }
@@ -187,7 +197,7 @@ pub(super) async fn send_html(
                     }
                     return;
                 }
-                warn!(error = %e, "telegram HTML send failed; retrying as plain text");
+                warn!("telegram HTML send failed; retrying as plain text");
                 let plain = strip_tags(&chunk);
                 if delivery.is_some_and(|d| !d.allowed()) {
                     return;
@@ -208,11 +218,11 @@ pub(super) async fn send_html(
                                 .await;
                         }
                     }
-                    Err(e2) => {
+                    Err(_e2) => {
                         if let Some(delivery) = delivery {
                             delivery.report(chat.0, &[], DeliveryStatus::Unknown).await;
                         }
-                        warn!(error = %e2, "telegram plain send failed");
+                        warn!("telegram plain send failed");
                     }
                 }
             }
@@ -233,10 +243,11 @@ mod tests {
     use teloxide::{Bot, types::ChatId};
     use tokio::{net::TcpListener, spawn, task::JoinHandle};
 
-    use super::send_reply;
+    use super::{ClassicMarkdown, send_reply};
     use crate::{
         DeliveryReport, DeliveryStatus, IngressDecision, IngressScope, NativeFrame,
         TelegramHostPolicy, TelegramOutputScope,
+        callbacks::testing::server as accepting_server,
         policy::{delivery::Delivery, tracking::Tracker},
     };
 
@@ -289,6 +300,67 @@ mod tests {
                 },
                 attempt_id: Some("attempt".into()),
             })
+    }
+
+    #[tokio::test]
+    async fn classic_control_preserves_blank_lines_and_formatting_without_disabling_rich_replies() {
+        let server = accepting_server().await;
+        let tracker = Tracker::new(Default::default());
+        let policy = Arc::new(Policy::default());
+        let host: Arc<dyn TelegramHostPolicy> = policy.clone();
+        let text = "Chat opened: example.\n\nLatest recorded message:\n\n**A formatted preview**";
+        let env = Envelope::new(
+            ConnectorId::new("host"),
+            EventKind::new("chat.reply"),
+            text.to_owned(),
+        )
+        .with_context(ClassicMarkdown);
+        let delivery = Delivery {
+            bot: &server.bot,
+            tracker: &tracker,
+            policy: Some(&host),
+            envelope: &env,
+            trusted_notice: false,
+        };
+        let mut rich = true;
+        send_reply(&server.bot, ChatId(7), text, &mut rich, Some(&delivery)).await;
+        assert!(rich);
+        {
+            let requests = server.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].0.ends_with("sendmessage"));
+            assert_eq!(requests[0].1["parse_mode"], "HTML");
+            assert_eq!(
+                requests[0].1["text"],
+                "Chat opened: example.\n\nLatest recorded message:\n\n<b>A formatted preview</b>"
+            );
+            assert!(requests[0].1.get("rich_message").is_none());
+        }
+        assert_eq!(policy.0.lock().unwrap()[0].status, DeliveryStatus::Sent);
+        let ordinary = Envelope::new(
+            ConnectorId::new("host"),
+            EventKind::new("chat.reply"),
+            "**An ordinary answer**".to_owned(),
+        );
+        let delivery = Delivery {
+            envelope: &ordinary,
+            ..delivery
+        };
+        send_reply(
+            &server.bot,
+            ChatId(7),
+            "**An ordinary answer**",
+            &mut rich,
+            Some(&delivery),
+        )
+        .await;
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].0.ends_with("sendrichmessage"));
+        assert_eq!(
+            requests[1].1["rich_message"]["markdown"],
+            "**An ordinary answer**"
+        );
     }
 
     #[tokio::test]

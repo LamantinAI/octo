@@ -11,8 +11,10 @@
 mod aliases;
 mod context;
 mod defaults;
+mod deletion;
 mod journal;
 mod migration;
+mod ownership;
 mod promotion;
 mod public_ids;
 mod requests;

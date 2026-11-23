@@ -30,6 +30,7 @@ const COMMANDS: &[&str] = &[
     "sql.execute",
     "sql.schema.apply",
     "sql.operation.status",
+    "sql.approval.list",
 ];
 const CATALOG: &str = "SQLite application stores (separate from host memory/history). All calls require host-bound identity. \
 Use sql.store.create {name,purpose,tags?,idempotency_key}; list/search {query?,cursor?,limit?}; describe {store_id,tables?}. \
@@ -203,6 +204,7 @@ impl SqlConnector {
             operation_hash: payload["operation_hash"].as_str().unwrap_or("").into(),
             recipient_principal: notice.principal.clone(),
             private_destination: destination.clone(),
+            origin_scope: notice.origin_scope.clone(),
             expires_at: payload["expires_at"].as_i64().unwrap_or(0),
             resource: notice.summary.resource.clone(),
             action: notice.summary.action,

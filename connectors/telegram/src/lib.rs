@@ -29,7 +29,12 @@ mod acl;
 mod api;
 mod approval;
 mod batch;
+mod callbacks;
+mod inline;
+pub use callbacks::{CallbackDecision, CallbackFrame, CallbackLimits, CallbackMessage};
+pub use inline::{InlineButton, InlineKeyboard, InlineKeyboardError};
 mod commands;
+pub use commands::{CommandMenuScope, TelegramCommand};
 mod feedback;
 mod format;
 mod fs;
@@ -55,6 +60,7 @@ mod control;
 mod delivery;
 mod inbound;
 mod outbound;
+pub use outbound::ClassicMarkdown;
 mod runtime;
 mod source;
 #[cfg(test)]
@@ -67,9 +73,10 @@ use self::{
 };
 pub use config::{TelegramConnectorFactory, factory, factory_with_authority, factory_with_policy};
 pub use policy::{
-    AllowReplyContext, CleanupReport, CleanupRequest, DeliveryReport, DeliveryStatus,
-    IngressDecision, IngressScope, NativeBatch, NativeFrame, TelegramHostPolicy,
-    TelegramOutputScope, TrackingLimits,
+    ActorRoleDecision, AllowReplyContext, CleanupReport, CleanupRequest, DeliveryReport,
+    DeliveryStatus, IngressDecision, IngressScope, NativeBatch, NativeFrame, PreflightDecision,
+    PreflightFrame, TelegramHostPolicy, TelegramOutputScope, TrackingLimits, VerifiedActor,
+    VerifiedBot,
 };
 
 /// Default quiet window before a coalescing burst (album / forward) is flushed.
@@ -271,7 +278,7 @@ mod tests {
             "telegram",
             "111222:SECRETTOKEN",
             acl,
-            Some(PathBuf::from("/home/someone/private-acl.json")),
+            Some(PathBuf::from("state/private-acl.json")),
         );
         let bare = TelegramConnector::new("telegram", "333444:OTHERTOKEN");
 
