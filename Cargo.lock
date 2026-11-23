@@ -2503,7 +2503,7 @@ dependencies = [
 
 [[package]]
 name = "octo-approval"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "octo-core",
  "rand 0.8.6",
@@ -2515,7 +2515,7 @@ dependencies = [
 
 [[package]]
 name = "octo-code"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "glob",
  "octo-workspace",
@@ -2531,7 +2531,7 @@ dependencies = [
 
 [[package]]
 name = "octo-connector-browser"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "fs2",
@@ -2549,7 +2549,7 @@ dependencies = [
 
 [[package]]
 name = "octo-connector-caldav"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2571,7 +2571,7 @@ dependencies = [
 
 [[package]]
 name = "octo-connector-forkd"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "libc",
@@ -2587,7 +2587,7 @@ dependencies = [
 
 [[package]]
 name = "octo-connector-http"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "octo-core",
@@ -2604,7 +2604,7 @@ dependencies = [
 
 [[package]]
 name = "octo-connector-imagegen"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -2622,7 +2622,7 @@ dependencies = [
 
 [[package]]
 name = "octo-connector-mail"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-imap",
  "async-trait",
@@ -2644,7 +2644,7 @@ dependencies = [
 
 [[package]]
 name = "octo-connector-petstore"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "octo-core",
@@ -2658,7 +2658,7 @@ dependencies = [
 
 [[package]]
 name = "octo-connector-scheduler"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2675,7 +2675,7 @@ dependencies = [
 
 [[package]]
 name = "octo-connector-search"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "curl",
@@ -2691,7 +2691,7 @@ dependencies = [
 
 [[package]]
 name = "octo-connector-speak"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2711,7 +2711,7 @@ dependencies = [
 
 [[package]]
 name = "octo-connector-sql"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2733,7 +2733,7 @@ dependencies = [
 
 [[package]]
 name = "octo-connector-storage"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -2751,7 +2751,7 @@ dependencies = [
 
 [[package]]
 name = "octo-connector-telegram"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2775,7 +2775,7 @@ dependencies = [
 
 [[package]]
 name = "octo-connector-transcribe"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2792,7 +2792,7 @@ dependencies = [
 
 [[package]]
 name = "octo-connector-web"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2805,7 +2805,7 @@ dependencies = [
 
 [[package]]
 name = "octo-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2824,7 +2824,7 @@ dependencies = [
 
 [[package]]
 name = "octo-history"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2840,7 +2840,7 @@ dependencies = [
 
 [[package]]
 name = "octo-http-auth"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64",
  "reqwest 0.12.28",
@@ -2854,7 +2854,7 @@ dependencies = [
 
 [[package]]
 name = "octo-mcp"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "axum",
  "reqwest 0.13.4",
@@ -2870,7 +2870,7 @@ dependencies = [
 
 [[package]]
 name = "octo-openai-auth"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64",
  "chrono",
@@ -2884,7 +2884,7 @@ dependencies = [
 
 [[package]]
 name = "octo-rig"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "octo-approval",
  "octo-code",
@@ -2898,7 +2898,7 @@ dependencies = [
 
 [[package]]
 name = "octo-workspace"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "tempfile",
