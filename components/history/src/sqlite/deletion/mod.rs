@@ -71,6 +71,10 @@ impl SqliteHistory {
             if session.revision != expected_revision {
                 return Err(HistoryError::RevisionConflict { expected: expected_revision, actual: session.revision });
             }
+            let forks = self.fork_dependents_in(&mut savepoint, id).await?;
+            if !forks.is_empty() {
+                return Err(HistoryError::SessionHasForks(forks.len()));
+            }
             if !self.default_origins_in(&mut savepoint, id).await?.is_empty() {
                 return Err(HistoryError::SessionConflict);
             }

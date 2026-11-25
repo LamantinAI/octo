@@ -1,9 +1,8 @@
 use sqlx::{Sqlite, Transaction, query, query_as};
 
-use super::{SqliteHistory, db, strict_role_from};
+use super::{SqliteHistory, db, forks::visible_sql, strict_role_from};
 use crate::{
-    Compact, ContextWindow, HistoryError, JournalPage, JournalRecord, PageRequest, Result,
-    StoredTurn, Turn,
+    ContextWindow, HistoryError, JournalPage, JournalRecord, PageRequest, Result, StoredTurn, Turn,
 };
 
 impl SqliteHistory {
@@ -36,6 +35,7 @@ impl SqliteHistory {
             .fetch_one(&mut **tx)
             .await
             .map_err(db)?;
+        maximum = maximum.max(self.fork_floor_in(tx, key, turns).await?);
         let identity = identity_if_empty && maximum == 0;
         loop {
             let statement = format!(
@@ -97,24 +97,34 @@ impl SqliteHistory {
         request: PageRequest,
     ) -> Result<JournalPage> {
         request.validate()?;
-        let (head,): (i64,) = query_as(
-            "SELECT COALESCE(MAX(public_id),0) FROM history_public_turns WHERE history_key=?",
-        )
-        .bind(key)
-        .fetch_one(&mut **tx)
-        .await
-        .map_err(db)?;
+        let head = self.effective_turn_head_in(tx, key).await?;
         let through_id = request.through_id.unwrap_or(head);
         if through_id > head {
             return Err(HistoryError::InvalidRequest(
                 "watermark exceeds scoped journal head".into(),
             ));
         }
-        let mut rows: Vec<(i64,String,String,String)> = query_as(
-            "SELECT m.public_id,t.created_at,t.role,t.content FROM history_public_turns m JOIN turns t ON t.id=m.turn_id
-             WHERE m.history_key=? AND m.public_id<=? AND (? IS NULL OR m.public_id<?) ORDER BY m.public_id DESC LIMIT ?")
-            .bind(key).bind(through_id).bind(request.before_id).bind(request.before_id).bind((request.limit+1) as i64)
-            .fetch_all(&mut **tx).await.map_err(db)?;
+        let size = request.limit + 1;
+        let before = request.before_id.map_or(i64::MAX, |id| id - 1);
+        let mut rows: Vec<(i64, String, String, String)> = Vec::with_capacity(size);
+        for (source, boundary) in self.visible_segments_in(tx, key).await? {
+            let upper = through_id.min(boundary).min(before);
+            if upper == 0 || rows.len() == size {
+                break;
+            }
+            let segment = query_as(
+                "SELECT m.public_id,t.created_at,t.role,t.content FROM history_public_turns m
+                 JOIN turns t ON t.id=m.turn_id WHERE m.history_key=? AND m.public_id<=?
+                 ORDER BY m.public_id DESC LIMIT ?",
+            )
+            .bind(source)
+            .bind(upper)
+            .bind((size - rows.len()) as i64)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(db)?;
+            rows.extend(segment);
+        }
         let has_more = rows.len() > request.limit;
         rows.truncate(request.limit);
         let next_before = has_more.then(|| rows.last().expect("nonempty page").0);
@@ -145,27 +155,20 @@ impl SqliteHistory {
         tx: &mut Transaction<'_, Sqlite>,
         key: &str,
     ) -> Result<ContextWindow> {
-        let row: Option<(i64, i64, String)> = query_as(
-            "SELECT mc.public_id,mt.public_id,c.content FROM compacts c
-             JOIN history_public_compacts mc ON mc.compact_id=c.id
-             JOIN history_public_turns mt ON mt.turn_id=c.through_id
-             WHERE mc.history_key=? AND mt.history_key=? ORDER BY c.id DESC LIMIT 1",
-        )
-        .bind(key)
-        .bind(key)
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(db)?;
-        let compact = row.map(|(id, through_id, content)| Compact {
-            id,
-            through_id,
-            content,
-        });
+        let compact = self
+            .effective_compact_in(tx, key, i64::MAX)
+            .await?
+            .map(|(_, checkpoint)| checkpoint);
         let boundary = compact.as_ref().map(|c| c.through_id).unwrap_or(0);
-        let rows:Vec<(i64,String,String)>=query_as(
-            "SELECT m.public_id,t.role,t.content FROM history_public_turns m JOIN turns t ON t.id=m.turn_id
-             WHERE m.history_key=? AND m.public_id>? ORDER BY m.public_id")
-            .bind(key).bind(boundary).fetch_all(&mut **tx).await.map_err(db)?;
+        let sql = visible_sql("SELECT m.public_id,t.role,t.content FROM visible v
+            JOIN history_public_turns m ON m.history_key=v.history_key JOIN turns t ON t.id=m.turn_id
+            WHERE m.public_id<=v.through_id AND m.public_id>? ORDER BY m.public_id");
+        let rows: Vec<(i64, String, String)> = query_as(&sql)
+            .bind(key)
+            .bind(boundary)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(db)?;
         let messages = rows
             .into_iter()
             .map(|(id, role, content)| {
@@ -189,31 +192,30 @@ impl SqliteHistory {
         through: i64,
         content: &str,
     ) -> Result<bool> {
-        let through_row: Option<(i64,)> = query_as(
-            "SELECT turn_id FROM history_public_turns WHERE history_key=? AND public_id=?",
-        )
-        .bind(key)
-        .bind(through)
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(db)?;
-        let Some((physical_through,)) = through_row else {
+        let Some(physical_through) = self.visible_turn_in(tx, key, through).await? else {
             return Ok(false);
         };
-        let physical_previous = if let Some(previous) = previous {
-            let row:Option<(i64,)>=query_as("SELECT compact_id FROM history_public_compacts WHERE history_key=? AND public_id=?")
-                .bind(key).bind(previous).fetch_optional(&mut **tx).await.map_err(db)?;
-            let Some((id,)) = row else { return Ok(false) };
-            Some(id)
-        } else {
-            None
-        };
-        let saved = self
-            .commit_compact_in(tx, key, physical_previous, physical_through, content)
-            .await?;
-        if saved {
-            self.map_public_ids_in(tx, key, false, false).await?;
+        let latest = self.effective_compact_in(tx, key, i64::MAX).await?;
+        if latest.as_ref().map(|(_, checkpoint)| checkpoint.id) != previous
+            || latest
+                .as_ref()
+                .is_some_and(|(_, checkpoint)| through < checkpoint.through_id)
+        {
+            return Ok(false);
         }
-        Ok(saved)
+        if content.trim().is_empty() {
+            return Err(HistoryError::Db("Empty compact refused".into()));
+        }
+        // The journal holds an immediate write transaction across both visibility and CAS.
+        query("INSERT INTO compacts(channel,through_id,previous_id,content) VALUES (?,?,?,?)")
+            .bind(key)
+            .bind(physical_through)
+            .bind(latest.map(|row| row.0))
+            .bind(content)
+            .execute(&mut **tx)
+            .await
+            .map_err(db)?;
+        self.map_public_ids_in(tx, key, false, false).await?;
+        Ok(true)
     }
 }

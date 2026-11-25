@@ -83,6 +83,9 @@ pub enum HistoryError {
         target_key: String,
     },
 
+    #[error("session history is still referenced by {0} fork(s)")]
+    SessionHasForks(usize),
+
     #[error("unknown session")]
     SessionNotFound,
 
