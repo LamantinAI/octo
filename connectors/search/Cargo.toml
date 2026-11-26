@@ -6,24 +6,25 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Web-search connector for the Octo runtime: an env-as-tools `search.web` organ over a swappable backend (DuckDuckGo now, Yandex later), returning clean {title, url, snippet} hits. NOTE: the DuckDuckGo backend requires the `curl` binary on PATH at runtime (DDG's anti-bot rejects reqwest's TLS fingerprint) — no libcurl linkage, no build-time dependency."
+description = "Web search for Octo with Tavily, Yandex, Brave and DuckDuckGo backends."
 
 [dependencies]
 octo-core = { path = "../../octo-core" }
-tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
+octo-browser-runtime = { path = "../../components/browser-runtime" }
+tokio = { workspace = true, features = ["io-util", "process", "sync", "rt", "macros", "time"] }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 toml = { workspace = true }
-# HTML parsing for the DDG backend (html5ever CSS selectors). Kept to this crate —
-# only the search organ needs it.
-scraper = "0.20"
-# libcurl bindings — the DDG backend fetches through the SYSTEM libcurl (see ddg.rs:
-# DDG rejects reqwest's TLS fingerprint, and even a vendored libcurl build). Needs
-# libcurl4-openssl-dev at build time; links libcurl.so.4 at runtime.
-curl = "0.4"
+base64 = { workspace = true }
+reqwest = { workspace = true }
+quick-xml = "0.36"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+axum = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }

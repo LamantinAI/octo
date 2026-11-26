@@ -1,4 +1,4 @@
-//! `octo-connector-forkd` — a sandboxed script-execution organ (forkd v0).
+//! `octo-connector-forkd` — the Linux subprocess runner for executable skills.
 //!
 //! The exec substrate for **executable skills**: a skill's scripts run *here*, in
 //! forkd's own supervised task, not in the cogitator's process/tool-loop. The model
@@ -6,20 +6,19 @@
 //! publishes a command, forkd runs the script and replies with a correlated
 //! `forkd.run.result` (`{ exit_code, stdout, stderr, timed_out }`).
 //!
-//! **v0 isolation** (subprocess; no mount namespace yet):
+//! Process controls:
 //! - `cwd = $OCTO_CODE_WORKSPACE` — the same directory the octo-code file tools use;
-//! - **clean env** — the child never sees the agent's secrets (tokens/keys); only
-//!   `PATH` / `HOME` / `LANG` / `TMPDIR` are set, so host binaries (`python3`,
-//!   `curl`, `wget`, `bash`) still resolve;
-//! - **dropped privileges** — when forkd runs as root and `run_as` names an
-//!   unprivileged user, the child is spawned setuid/setgid to it;
+//! - **cleared environment** — the child receives runner defaults and variables
+//!   explicitly listed in `env_passthrough`;
+//! - **dropped privileges** — a configured `run_as` applies when the service has
+//!   permission to change UID and GID;
 //! - a **wall-clock timeout** kills the whole process group;
 //! - **rlimits** cap CPU time and file size (memory is opt-in — an `RLIMIT_AS` set
 //!   too low breaks interpreters).
 //!
-//! v0 keeps the host filesystem visible and the network inherited, so `curl`/`wget`/
-//! `pip` work. The next step is full `bwrap` (unshare + rw-bind the workspace +
-//! ro-bind the interpreter and skills) with per-skill capabilities gating it.
+//! Subprocesses inherit network access and can access files permitted by their
+//! effective credentials and the deployment's OS sandbox. The workspace is
+//! their working directory and the root for workspace-relative script paths.
 
 use std::{
     path::{Component, Path, PathBuf},
@@ -47,14 +46,14 @@ const RUN: &str = "forkd.run";
 /// later ro-binds this same root into the sandbox.
 pub const SKILLS_ENV: &str = "OCTO_SKILLS_DIR";
 
-const CATALOG: &str = "A sandboxed runner for scripts. Dispatch to this connector's id:
+const CATALOG: &str = "Run a script as a subprocess. Dispatch to this connector's id:
 - forkd.run { skill_path? | path? | script?, interpreter?, args?, stdin?, timeout_secs? } -> { exit_code, stdout, stderr, timed_out }
   `skill_path` runs a skill's bundled script IN PLACE (relative to the skills root, e.g.
   \"fetch-url/scripts/fetch.sh\") — never copy a skill's script into the workspace or the chat.
   `path` runs a script from your workspace; `script` is an inline body. `interpreter`
   (python3 / bash / sh; default bash for inline) runs it; `args` follow the script. cwd is
-  your workspace (outputs land there), clean environment, hard timeout. Network works
-  (curl / wget / pip).";
+  your workspace, with a cleared environment and a wall-clock timeout. Filesystem
+  permissions and network access come from the deployment.";
 
 /// rlimits applied to the child before exec (0 = leave unlimited).
 #[derive(Clone, Copy)]

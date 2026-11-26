@@ -6,7 +6,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Sandboxed script-execution connector (forkd v0): runs a skill's script as a subprocess jailed to the code workspace — clean env (no agent secrets), dropped privileges, a wall-clock timeout that kills the process group, and CPU/file rlimits. The exec substrate for executable skills."
+description = "Linux subprocess runner for executable skills with a scoped environment, optional privilege drop, and process limits."
 
 [dependencies]
 octo-core = { path = "../../octo-core" }

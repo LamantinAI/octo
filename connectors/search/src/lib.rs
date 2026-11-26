@@ -2,68 +2,77 @@
 //!
 //! The cogitator dispatches a command to this connector's `id` and gets a
 //! correlated `search.web.result`. The backend is swappable behind
-//! [`SearchBackend`] — **DuckDuckGo** now (account-free, scrape-based), Yandex
-//! Search API later — so the command surface is stable while the source changes.
+//! [`SearchBackend`]. DuckDuckGo, Tavily, Yandex, and Brave
+//! implement the same query and result contract.
 //!
 //! Command:
-//! - `search.web { query, limit?, engine? }` → `{ engine, query, count, results:
+//! - `search.web { query, limit?, engine?, page? }` → `{ engine, query, count, results:
 //!   [{ title, url, snippet }] }` (limit clamped to `[1, max_limit]`, default
 //!   `default_limit`).
+//! - Browser-backed DuckDuckGo returns `page` and `next_page` (null at the end).
+//! - Provider failure → `{ engine, error, alternatives, setup_options }`.
+//!   Alternatives are enabled providers. Setup options name supported providers
+//!   that can be enabled and what they need.
 //!
 //! **Choosing the search system happens at both levels.** The manifest declares
 //! which engines exist (`[connector.engines.<name>]`, each with its own settings)
 //! and which is `default_engine`; a caller then overrides per call with `engine`.
-//! One connector instance can therefore front several systems — DuckDuckGo today,
-//! Yandex next — and the model picks per query without any config change.
+//! A request selects from the engines enabled on that connector.
 //!
 //! It returns a clean hit list — never raw HTML — so the model spends context on
 //! results, not markup. Fetching a page's content is a separate organ.
 //!
-//! # Dependency: the system libcurl (DuckDuckGo backend only)
+//! # DuckDuckGo runtime
 //!
-//! The `ddg` backend fetches through **libcurl, in-process** (the `curl` crate) —
-//! not reqwest, and specifically **the system libcurl, not a vendored build**. This
-//! is measured, not incidental; [`ddg`] carries the evidence table. In short: DDG's
-//! anti-bot rejects reqwest's TLS fingerprint (`202` + zero results, with rustls and
-//! native-tls alike) *and* a vendored libcurl's (handshake dropped), while the system
-//! libcurl — the very library the working `curl` command is a shell over — gets `200`
-//! and a full page.
-//!
-//! So this crate needs:
-//! - **at build time:** libcurl development files, e.g.
-//!   `sudo apt install libcurl4-openssl-dev` (Debian/Ubuntu). Without them `curl-sys`
-//!   silently vendors its own libcurl and search breaks at runtime.
-//! - **at run time:** `libcurl.so.4`, which is present on every host that has the
-//!   `curl` command (same package), so deployments running the forkd sandbox already
-//!   satisfy it. Build host and target need compatible libcurl, the same way they
-//!   already need compatible glibc.
-//!
-//! **Build trap:** cargo caches `curl-sys`'s build-script decision. If a build ran
-//! before the dev headers were installed, installing them is not enough — run
-//! `cargo clean -p curl-sys` and rebuild, else the vendored copy silently persists.
-//! The linked version is logged when the connector starts (see [`ddg::libcurl_version`]),
-//! so a vendored build is visible rather than a mystery 202 later.
-//!
-//! A TLS-impersonating client (`rquest`/BoringSSL) is the alternative if this
-//! dependency ever needs to go away. Backends that talk to a real API (Yandex Search
-//! API, next) carry no such requirement — this is a DuckDuckGo-specific cost of
-//! having no official API.
+//! DuckDuckGo can use a shared Moli process or a Firefox WebDriver session.
 
+mod api;
+mod backend;
+mod brave;
 mod ddg;
+mod factory;
+mod tavily;
+mod yandex;
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
 use octo_core::{
-    Connector, ConnectorCapabilities, ConnectorContext, ConnectorFactory, ConnectorId, Envelope,
-    EventKind, FactoryContext, Filter, OctoResult, SubscribeOptions,
+    Connector, ConnectorCapabilities, ConnectorContext, ConnectorId, Envelope, EventKind, Filter,
+    OctoResult, SubscribeOptions,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-pub use ddg::DdgBackend;
+pub use backend::{SearchBackend, SearchHit, SearchPage};
+pub use factory::{SearchConnectorFactory, factory, factory_with_moli};
 
 const SEARCH: &str = "search.web";
+
+#[derive(Serialize)]
+struct SetupOption {
+    engine: &'static str,
+    setup: &'static str,
+}
+
+const SETUP_OPTIONS: &[SetupOption] = &[
+    SetupOption {
+        engine: "tavily",
+        setup: "Enable Tavily in keyless mode.",
+    },
+    SetupOption {
+        engine: "yandex",
+        setup: "Add a Yandex Search API key and Folder ID, then enable Yandex.",
+    },
+    SetupOption {
+        engine: "brave",
+        setup: "Add a Brave Search API key with LLM Context access, then enable Brave.",
+    },
+    SetupOption {
+        engine: "ddg",
+        setup: "Enable DuckDuckGo. It uses the application's browser runtime.",
+    },
+];
 
 /// The catalog the model reads. Built per instance so it names the engines this
 /// deployment actually has (and which one answers when `engine` is omitted).
@@ -77,31 +86,17 @@ fn catalog(
     format!(
         "Web search — find pages/URLs for a question. Dispatch a command envelope to this \
          connector's id:\n\
-         - search.web {{ query, limit?, engine? }} -> {{ engine, query, count, results: \
+         - search.web {{ query, limit?, engine?, page? }} -> {{ engine, query, count, results: \
          [{{ title, url, snippet }}] }}\n\
          `limit` is optional (default {default_limit}, max {max_limit}). `engine` picks the \
          search system — available: {}; omit it to use {default_engine}. Use this to discover \
-         sources, then read the promising URLs. Returns a clean hit list, not raw HTML.",
+         sources, then read the promising URLs. DuckDuckGo starts at page 1 \
+         and returns up to 10 results per page. To continue, send next_page as page with the \
+         same query, limit, and engine. Failures return the engine, error, enabled \
+         alternatives, and setup_options for other supported providers. Report the failure \
+         and distinguish ready-to-use alternatives from providers that need setup.",
         names.join(", ")
     )
-}
-
-/// One search result.
-#[derive(Debug, Clone, Serialize)]
-pub struct SearchHit {
-    pub title: String,
-    pub url: String,
-    pub snippet: String,
-}
-
-/// A swappable search source. DuckDuckGo now; Yandex Search API later slots in
-/// behind the same trait with zero change to the connector or the command surface.
-#[async_trait]
-pub trait SearchBackend: Send + Sync {
-    /// Short backend name for logs/telemetry (e.g. `"ddg"`).
-    fn name(&self) -> &str;
-    /// Run `query` and return up to `limit` hits (best-first).
-    async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, String>;
 }
 
 /// The search organ: routes `search.web` to one of its [`SearchBackend`]s.
@@ -165,24 +160,25 @@ impl Connector for SearchConnector {
                 SubscribeOptions::default(),
             )
             .await?;
-        // Log the linked libcurl: a vendored build (see ddg's build trap) shows up
-        // here as an unexpected version, instead of as a puzzling 202 later.
         tracing::info!(
             connector = %self.id,
             engines = %self.engine_names(),
             default_engine = %self.default_engine,
-            libcurl = %ddg::libcurl_version(),
             "search ready"
         );
         loop {
             tokio::select! {
                 next = cmds.next() => match next {
                     Some(env) => self.handle(&env, &ctx).await,
-                    None => return Ok(()),
+                    None => break,
                 },
-                _ = ctx.shutdown.cancelled() => return Ok(()),
+                _ = ctx.shutdown.cancelled() => break,
             }
         }
+        for backend in self.engines.values() {
+            backend.shutdown().await;
+        }
+        Ok(())
     }
 }
 
@@ -194,6 +190,7 @@ struct SearchArgs {
     /// Which search system to use; omitted → the manifest's `default_engine`.
     #[serde(default)]
     engine: Option<String>,
+    page: Option<usize>,
 }
 
 impl SearchConnector {
@@ -222,6 +219,10 @@ impl SearchConnector {
         if query.is_empty() {
             return Err("`query` is required".into());
         }
+        let page = args.page.unwrap_or(1);
+        if page == 0 {
+            return Err("`page` starts at 1".into());
+        }
         let limit = args
             .limit
             .unwrap_or(self.default_limit)
@@ -233,143 +234,44 @@ impl SearchConnector {
                 self.engine_names()
             )
         })?;
-        let hits = backend.search(query, limit).await?;
-        tracing::info!(query, engine, count = hits.len(), "search done");
-        Ok(json!({ "engine": engine, "query": query, "count": hits.len(), "results": hits }))
-    }
-}
-
-/// [`ConnectorFactory`] for `type = "search"`. Register with
-/// `Octo::builder().register_connector_type("search", octo_connector_search::factory())`.
-pub struct SearchConnectorFactory;
-
-impl SearchConnectorFactory {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for SearchConnectorFactory {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ConnectorFactory for SearchConnectorFactory {
-    fn type_name(&self) -> &str {
-        "search"
-    }
-
-    fn create(
-        &self,
-        id: ConnectorId,
-        config: &toml::Value,
-        _ctx: FactoryContext<'_>,
-    ) -> Result<Arc<dyn Connector>, Box<dyn std::error::Error + Send + Sync>> {
-        let table = config
-            .get("connector")
-            .ok_or("search: manifest has no [connector] table")?;
-        let timeout = Duration::from_secs(
-            table
-                .get("timeout_secs")
-                .and_then(|v| v.as_integer())
-                .unwrap_or(15)
-                .max(1) as u64,
-        );
-        let default_limit = table
-            .get("default_limit")
-            .and_then(|v| v.as_integer())
-            .unwrap_or(10)
-            .max(1) as usize;
-        let max_limit = table
-            .get("max_limit")
-            .and_then(|v| v.as_integer())
-            .unwrap_or(25)
-            .max(1) as usize;
-
-        // Preferred form: one `[connector.engines.<name>]` table per search system,
-        // each carrying its own settings. `enabled = false` keeps an engine declared
-        // but out of service.
-        let mut engines: BTreeMap<String, Arc<dyn SearchBackend>> = BTreeMap::new();
-        match table.get("engines").and_then(|v| v.as_table()) {
-            Some(declared) => {
-                for (name, cfg) in declared {
-                    if cfg.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
-                        continue;
-                    }
-                    engines.insert(name.clone(), build_engine(name, cfg, timeout)?);
-                }
+        let result = match backend.search_page(query, limit, page).await {
+            Ok(result) => result,
+            Err(error) => {
+                let alternatives: Vec<_> = self
+                    .engines
+                    .keys()
+                    .filter(|name| name.as_str() != engine)
+                    .collect();
+                let setup_options: Vec<_> = SETUP_OPTIONS
+                    .iter()
+                    .filter(|option| !self.engines.contains_key(option.engine))
+                    .collect();
+                return Ok(json!({
+                    "engine": engine,
+                    "error": error,
+                    "alternatives": alternatives,
+                    "setup_options": setup_options,
+                }));
             }
-            // Shorthand for a single-engine deployment: `backend = "ddg"` with its
-            // settings inline on [connector].
-            None => {
-                let name = table
-                    .get("backend")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("ddg");
-                engines.insert(name.to_string(), build_engine(name, table, timeout)?);
-            }
-        }
-        if engines.is_empty() {
-            return Err("search: no engines enabled — declare at least one".into());
-        }
-
-        // Default engine: explicit, else the only/first one declared.
-        let default_engine = match table.get("default_engine").and_then(|v| v.as_str()) {
-            Some(name) => name.to_string(),
-            None => engines
-                .keys()
-                .next()
-                .cloned()
-                .expect("non-empty checked above"),
         };
-        if !engines.contains_key(&default_engine) {
-            return Err(format!(
-                "search: default_engine `{default_engine}` is not among the enabled engines ({})",
-                engines.keys().cloned().collect::<Vec<_>>().join(", ")
-            )
-            .into());
+        let count = result.hits.len();
+        tracing::info!(engine, count, "search done");
+        let mut response = json!({
+            "engine": engine, "query": query, "count": count, "results": result.hits
+        });
+        if backend.supports_pagination() {
+            response["page"] = json!(page);
+            response["next_page"] = json!(result.next_page);
         }
-        Ok(SearchConnector::new(
-            id.as_str(),
-            engines,
-            default_engine,
-            default_limit,
-            max_limit,
-        ))
+        Ok(response)
     }
-}
-
-/// Build one engine from its config slice. Add a `match` arm per search system —
-/// this is the single place a new backend gets wired in.
-fn build_engine(
-    name: &str,
-    cfg: &toml::Value,
-    timeout: Duration,
-) -> Result<Arc<dyn SearchBackend>, Box<dyn std::error::Error + Send + Sync>> {
-    match name {
-        "ddg" => {
-            // DDG's `kl` locale (region-language), e.g. "ru-ru" / "us-en"; optional.
-            let region = cfg
-                .get("region")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            Ok(Arc::new(DdgBackend::new(timeout, region)?))
-        }
-        other => {
-            Err(format!("search: unknown engine `{other}` (have: ddg; yandex planned)").into())
-        }
-    }
-}
-
-/// Convenience factory handle for registration.
-pub fn factory() -> Arc<dyn ConnectorFactory> {
-    Arc::new(SearchConnectorFactory::new())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use octo_core::FactoryContext;
+    use std::path::Path;
 
     /// A backend that answers with its own name, so a test can see which one ran.
     struct StubBackend(&'static str);
@@ -380,6 +282,13 @@ mod tests {
             self.0
         }
         async fn search(&self, query: &str, _limit: usize) -> Result<Vec<SearchHit>, String> {
+            assert_ne!(self.0, "brave", "alternatives must not run implicitly");
+            if self.0 == "failed" {
+                return Err("fixture provider failure".into());
+            }
+            if query == "no matches" {
+                return Ok(Vec::new());
+            }
             Ok(vec![SearchHit {
                 title: format!("{} answered {query}", self.0),
                 url: "https://example.com/".into(),
@@ -431,6 +340,86 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out["count"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_failure_reports_ready_and_unconfigured_alternatives() {
+        let mut engines: BTreeMap<String, Arc<dyn SearchBackend>> = BTreeMap::new();
+        engines.insert("tavily".into(), Arc::new(StubBackend("failed")));
+        engines.insert("brave".into(), Arc::new(StubBackend("brave")));
+        let payload = json!({"query":"x"});
+        let search = SearchConnector::new("search", engines.clone(), "tavily", 10, 25);
+        let out = search.run_search(payload.clone()).await.unwrap();
+        assert_eq!(out["engine"], "tavily");
+        assert_eq!(out["error"], "fixture provider failure");
+        assert_eq!(out["alternatives"], json!(["brave"]));
+        let setup = out["setup_options"].as_array().unwrap();
+        assert_eq!(setup.len(), 2);
+        assert_eq!(setup[0]["engine"], "yandex");
+        assert!(setup[0]["setup"].as_str().unwrap().contains("Folder ID"));
+        engines.remove("brave");
+        let search = SearchConnector::new("search", engines, "tavily", 10, 25);
+        let out = search.run_search(payload).await.unwrap();
+        assert_eq!(out["alternatives"], json!([]));
+        let setup = out["setup_options"].as_array().unwrap();
+        assert_eq!(setup.len(), 3);
+        assert_eq!(setup[0]["engine"], "yandex");
+        assert_eq!(setup[1]["engine"], "brave");
+        assert!(setup[1]["setup"].as_str().unwrap().contains("API key"));
+    }
+
+    #[tokio::test]
+    async fn an_empty_result_is_successful() {
+        let out = connector("ddg")
+            .run_search(json!({"query":"no matches"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            json!({"engine":"ddg","query":"no matches","count":0,"results":[]})
+        );
+    }
+
+    #[test]
+    fn ddg_is_the_default_and_disabled_engines_need_no_credentials() {
+        for manifest in [
+            "[connector]",
+            "[connector]\n[connector.engines.ddg]\n\
+             [connector.engines.brave]\nenabled = false\n\
+             [connector.engines.yandex]\nenabled = false\n",
+        ] {
+            let config = manifest.parse().unwrap();
+            let search = factory()
+                .create(
+                    ConnectorId::new("search"),
+                    &config,
+                    FactoryContext {
+                        base_dir: Path::new("."),
+                    },
+                )
+                .unwrap();
+            let catalog = search.capabilities().description.as_deref().unwrap();
+            assert!(catalog.contains("available: ddg; omit it to use ddg"));
+        }
+    }
+
+    #[test]
+    fn an_explicit_default_still_wins_when_ddg_is_enabled() {
+        let config = "[connector]\ndefault_engine = 'tavily'\n\
+                      [connector.engines.ddg]\n[connector.engines.tavily]\n"
+            .parse()
+            .unwrap();
+        let search = factory()
+            .create(
+                ConnectorId::new("search"),
+                &config,
+                FactoryContext {
+                    base_dir: Path::new("."),
+                },
+            )
+            .unwrap();
+        let catalog = search.capabilities().description.as_deref().unwrap();
+        assert!(catalog.contains("omit it to use tavily"));
     }
 
     #[test]

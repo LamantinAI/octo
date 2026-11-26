@@ -1,13 +1,23 @@
 # Browser connector
 
-`browser.fetch { url, html?, timeout_secs? }` renders a page using Chrome/CDP.
+`browser.fetch { url, html?, timeout_secs? }` reads a page after running its
+JavaScript. Select Moli with `engine = "moli"` and put `moli` on the service's PATH.
+An application can share one process by passing the same `Arc<MoliRuntime>` to
+the browser and search `factory_with_moli` functions. Call `start_if_configured`
+after loading the connector manifests to start it before serving requests.
+Each fetch opens a separate browser context. Moli runs in its DOM-focused mode, which provides text and
+optional HTML. Pages that depend on visual geometry may behave differently.
+
 `status` reports navigation/execution; `extraction_status` distinguishes empty
 text from extracted text. Extracted text can still be a menu or a challenge,
 so it is not proof that an article was read.
 
+The Chrome backend supports its own executable and managed browser builds.
+
 ```toml
 [connector]
 type = "browser"
+engine = "chrome"
 data_dir = "browser-data"
 headless = true
 # executable = "/usr/bin/chromium" # externally managed, no download or pruning

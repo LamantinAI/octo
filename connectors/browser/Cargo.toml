@@ -6,10 +6,11 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Headless-browser connector for the Octo runtime: a stealth web-fetch organ (browser.fetch) that renders JS-heavy / anti-bot pages via a real Chrome driven over CDP (zendriver). Returns clean {url, title, text} — the parser half of the web organ, paired with the search connector."
+description = "Read JavaScript-rendered pages with Moli or Chrome."
 
 [dependencies]
 octo-core = { path = "../../octo-core" }
+octo-browser-runtime = { path = "../../components/browser-runtime" }
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 async-trait = { workspace = true }
 serde = { workspace = true }
@@ -21,7 +22,7 @@ reqwest = { workspace = true }
 fs2 = "0.4"
 # zendriver — Rust-native stealth browser over CDP (drives real Chrome). `fetcher`
 # auto-provisions a managed Chrome-for-Testing so no system chromium is required.
-zendriver = { version = "0.4", features = ["fetcher"] }
+zendriver = { workspace = true, features = ["fetcher"] }
 
 [dev-dependencies]
 tempfile = "3"

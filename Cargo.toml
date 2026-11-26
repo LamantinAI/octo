@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "octo-core",
     "components/history",
+    "components/browser-runtime",
     "components/approval",
     "components/mcp",
     "components/http-auth",
@@ -74,6 +75,7 @@ bytes = "1.7"
 parking_lot = "0.12"
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+zendriver = "0.5.34"
 toml = "0.8"
 teloxide = "0.17"
 base64 = "0.22"

@@ -160,8 +160,8 @@ not a crate. `connectors/petstore` is a worked example.
 | `storage`   | durable object store (local now, S3-ready) | `storage.put` / `get` / `list` / `delete` / `promote` / `checkout` |
 | `telegram`  | bidirectional chat (teloxide) + file transfer + [chat/sender ACL](connectors/telegram/README.md) | in: `chat.message`; out: `chat.reply` / `chat.send_file` |
 | `scheduler` | reminders / alarms (manageable actor) | control commands mutate persisted state |
-| `forkd`     | sandboxed script execution (executable skills) | `forkd.run` |
-| `search`    | web search over **many engines at once** — manifest declares `[connector.engines.*]` + a `default_engine`, callers override per call with `engine` (DuckDuckGo now, Yandex next). Its DDG engine links the **system libcurl** (`libcurl4-openssl-dev` to build, `libcurl.so.4` to run); see its crate docs for why reqwest can't be used | `search.web { query, limit?, engine? }` |
+| `forkd`     | Linux subprocess runner for executable skills, with optional privilege drop and process limits | `forkd.run` |
+| `search`    | web search via DuckDuckGo (default), Tavily, Yandex or Brave. DuckDuckGo uses Moli or Firefox WebDriver and returns paginated results. The manifest selects a default engine and callers can override it per request | `search.web { query, limit?, engine?, page? }` |
 
 ### Writing one
 

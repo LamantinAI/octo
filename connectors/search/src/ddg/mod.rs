@@ -1,69 +1,162 @@
-//! DuckDuckGo backend — a small engine over **libcurl** (in-process, via the `curl`
-//! crate). No official DDG API exists, so this stays best-effort: a challenge page or
-//! a markup change surfaces as an honest error/empty list, never a panic.
-//!
-//! # Why libcurl and not reqwest — and why the *system* libcurl specifically
-//!
-//! Measured, not guessed. DDG's anti-bot answers reqwest/hyper with `202 Accepted`
-//! and a challenge page carrying zero results — with rustls **and** native-tls (the
-//! very same system OpenSSL curl uses), over HTTP/1.1 **and** HTTP/2, with
-//! browser-like headers. The same request through curl, same IP, same second, gets
-//! `200` and a full result page. The block keys on the TLS/transport fingerprint
-//! (cipher and extension order, ALPN offer), which hyper does not let you reshape —
-//! so every ready-made DDG crate, all of them reqwest wrappers, hits the same wall.
-//!
-//! The curl binary is only a thin shell over `libcurl`, so linking libcurl gives the
-//! same handshake in-process. **But it must be the *system* libcurl.** Verified both
-//! ways on the same box:
-//!
-//! | client | result |
-//! |---|---|
-//! | reqwest (rustls / native-tls, h1 / h2) | `202`, 0 results |
-//! | `curl` crate against a **vendored** build (curl 8.21, no system dev headers) | TLS `CURLE_SSL_CONNECT_ERROR` — peer drops the handshake |
-//! | `curl` crate against the **system** libcurl (8.5.0, OpenSSL 3.0.13, nghttp2) | `200`, 10 results |
-//!
-//! A vendored build is compiled with a different feature set (e.g. no nghttp2, so a
-//! different ALPN offer), which changes the fingerprint enough to be rejected.
-//!
-//! ## Build trap
-//!
-//! `curl-sys` links the system library **only if it can find it** (pkg-config); with
-//! no `libcurl4-openssl-dev` present it silently vendors its own copy, and search
-//! then fails at runtime. Worse, cargo caches that build-script decision: installing
-//! the headers afterwards is not enough — run `cargo clean -p curl-sys` and rebuild.
-//! [`libcurl_version`] is logged at connector start so the linked build is visible.
+mod process;
+mod session;
+mod webdriver;
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use curl::easy::{Easy, List};
-use scraper::{Html, Selector};
-use tokio::task::spawn_blocking;
+use octo_browser_runtime::MoliRuntime;
+use reqwest::Url;
+use serde::Deserialize;
+use tokio::{
+    sync::Mutex,
+    time::{sleep, timeout},
+};
 
-use crate::{SearchBackend, SearchHit};
+use self::{
+    session::{Driver, Session},
+    webdriver::WebDriver,
+};
+use crate::{SearchBackend, SearchHit, SearchPage};
 
-const ENDPOINT: &str = "https://html.duckduckgo.com/html/";
-const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
-(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
-const ACCEPT: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
-const ACCEPT_LANG: &str = "en-US,en;q=0.9,ru;q=0.8";
+const ENDPOINT: &str = "https://duckduckgo.com/";
+const MAX_PAGE_SIZE: usize = 10;
+const MORE_RESULTS: &str = "#more-results";
+const READ_RESULTS: &str = include_str!("results.js");
 
-/// The linked libcurl's version string, e.g. `"8.5.0"`. Logged at startup so a
-/// vendored build (see the module's build trap) is obvious in the logs.
-pub fn libcurl_version() -> String {
-    curl::Version::get().version().to_string()
+pub(super) struct DdgBackend {
+    driver: Driver,
+    timeout: Duration,
+    region: Option<String>,
+    browser: Mutex<Option<Browser>>,
 }
 
-/// DuckDuckGo search over the HTML endpoint, fetched with libcurl.
-pub struct DdgBackend {
-    timeout: Duration,
-    /// DDG `kl` locale (region-language), e.g. `"ru-ru"`; `None` = DDG default.
-    region: Option<String>,
+struct Browser {
+    session: Session,
+    query: String,
 }
 
 impl DdgBackend {
-    pub fn new(timeout: Duration, region: Option<String>) -> Result<Self, String> {
-        Ok(Self { timeout, region })
+    pub(super) fn with_firefox(
+        endpoint: Option<&str>,
+        timeout: Duration,
+        region: Option<String>,
+    ) -> Result<Self, String> {
+        Ok(Self::new(
+            Driver::Firefox(WebDriver::new(endpoint, timeout)?),
+            timeout,
+            region,
+        ))
+    }
+
+    pub(super) fn with_moli(
+        runtime: Arc<MoliRuntime>,
+        timeout: Duration,
+        region: Option<String>,
+    ) -> Self {
+        Self::new(Driver::Moli(runtime), timeout, region)
+    }
+
+    fn new(driver: Driver, timeout: Duration, region: Option<String>) -> Self {
+        Self {
+            driver,
+            timeout,
+            region,
+            browser: Mutex::new(None),
+        }
+    }
+
+    async fn load(
+        &self,
+        browser: &mut Option<Browser>,
+        query: &str,
+        page: usize,
+        range: PageRange,
+    ) -> Result<SearchPage, String> {
+        if let Some(active) = browser.as_ref() {
+            if !self.driver.is_current(&active.session).await {
+                *browser = None;
+            }
+        }
+        if browser.is_none() {
+            *browser = Some(Browser {
+                session: self.driver.start().await?,
+                query: String::new(),
+            });
+        }
+        let browser = browser.as_mut().expect("browser initialized above");
+        if page == 1 || browser.query != query {
+            let mut url = Url::parse(ENDPOINT).expect("valid DuckDuckGo URL");
+            url.query_pairs_mut().append_pair("q", query);
+            if let Some(region) = &self.region {
+                url.query_pairs_mut().append_pair("kl", region);
+            }
+            browser.session.navigate(&url).await?;
+            browser.query = query.to_owned();
+        }
+
+        let mut results = wait_for_results(&browser.session, range, 0).await?;
+        while results.total < range.end && results.more {
+            browser.session.click(MORE_RESULTS).await?;
+            results = wait_for_results(&browser.session, range, results.total).await?;
+        }
+        let more = results.total > range.end || results.more;
+        Ok(SearchPage {
+            hits: results.hits,
+            next_page: page.checked_add(1).filter(|_| more),
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PageRange {
+    offset: usize,
+    end: usize,
+}
+
+impl PageRange {
+    fn new(page: usize, limit: usize) -> Result<Self, String> {
+        let limit = limit.clamp(1, MAX_PAGE_SIZE);
+        let end = page
+            .checked_mul(limit)
+            .filter(|&end| end != 0)
+            .ok_or("ddg: invalid page")?;
+        Ok(Self {
+            offset: end - limit,
+            end,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct Results {
+    valid_origin: bool,
+    challenge: bool,
+    empty: bool,
+    more: bool,
+    total: usize,
+    hits: Vec<SearchHit>,
+}
+
+async fn wait_for_results(
+    session: &Session,
+    range: PageRange,
+    previous_total: usize,
+) -> Result<Results, String> {
+    loop {
+        let results: Results = session
+            .evaluate(READ_RESULTS, range.offset, range.end - range.offset)
+            .await?;
+        if results.challenge {
+            return Err("ddg: DuckDuckGo requested a CAPTCHA".into());
+        }
+        if !results.valid_origin {
+            return Err("ddg: search left DuckDuckGo".into());
+        }
+        if results.total > previous_total || results.empty {
+            return Ok(results);
+        }
+        sleep(Duration::from_millis(150)).await;
     }
 }
 
@@ -73,183 +166,239 @@ impl SearchBackend for DdgBackend {
         "ddg"
     }
 
+    fn supports_pagination(&self) -> bool {
+        true
+    }
+
+    async fn shutdown(&self) {
+        let browser = self.browser.lock().await.take();
+        if let Some(browser) = browser {
+            browser.session.close().await;
+        }
+    }
+
     async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, String> {
-        // libcurl's easy interface is blocking; keep it off the async runtime.
-        let (query_owned, region, timeout) = (query.to_string(), self.region.clone(), self.timeout);
-        let body = spawn_blocking(move || fetch_blocking(&query_owned, region.as_deref(), timeout))
+        Ok(self.search_page(query, limit, 1).await?.hits)
+    }
+
+    async fn search_page(
+        &self,
+        query: &str,
+        limit: usize,
+        page: usize,
+    ) -> Result<SearchPage, String> {
+        let range = PageRange::new(page, limit)?;
+        let mut browser = self.browser.lock().await;
+        let result = timeout(self.timeout, self.load(&mut browser, query, page, range))
             .await
-            .map_err(|e| format!("ddg: fetch task failed: {e}"))??;
-
-        let hits = parse_ddg_html(&body, limit);
-        // Distinguish "DDG served the bot challenge" from "genuinely no matches", so
-        // the agent is told the truth instead of believing nothing exists.
-        if hits.is_empty() && looks_like_challenge(&body) {
-            return Err("ddg: blocked by the anti-bot challenge (no results served)".into());
+            .unwrap_or_else(|_| Err("ddg: timed out waiting for DuckDuckGo results".into()));
+        if result.is_err() {
+            *browser = None;
         }
-        Ok(hits)
+        result
     }
-}
-
-/// One blocking libcurl POST; returns the HTML body.
-fn fetch_blocking(query: &str, region: Option<&str>, timeout: Duration) -> Result<String, String> {
-    let mut easy = Easy::new();
-    easy.url(ENDPOINT).map_err(|e| format!("ddg: url: {e}"))?;
-    easy.timeout(timeout)
-        .map_err(|e| format!("ddg: timeout: {e}"))?;
-    easy.useragent(UA)
-        .map_err(|e| format!("ddg: user-agent: {e}"))?;
-
-    let mut headers = List::new();
-    headers
-        .append(&format!("Accept: {ACCEPT}"))
-        .and_then(|()| headers.append(&format!("Accept-Language: {ACCEPT_LANG}")))
-        .map_err(|e| format!("ddg: headers: {e}"))?;
-    easy.http_headers(headers)
-        .map_err(|e| format!("ddg: headers: {e}"))?;
-
-    // Form body, percent-encoded by libcurl itself.
-    let mut form = format!("q={}", easy.url_encode(query.as_bytes()));
-    if let Some(kl) = region {
-        form.push_str(&format!("&kl={}", easy.url_encode(kl.as_bytes())));
-    }
-    easy.post(true).map_err(|e| format!("ddg: post: {e}"))?;
-    easy.post_fields_copy(form.as_bytes())
-        .map_err(|e| format!("ddg: body: {e}"))?;
-
-    let mut buf = Vec::new();
-    {
-        let mut transfer = easy.transfer();
-        transfer
-            .write_function(|chunk| {
-                buf.extend_from_slice(chunk);
-                Ok(chunk.len())
-            })
-            .map_err(|e| format!("ddg: writer: {e}"))?;
-        transfer
-            .perform()
-            .map_err(|e| format!("ddg: request failed: {e}"))?;
-    }
-
-    let code = easy.response_code().unwrap_or_default();
-    if !(200..300).contains(&code) {
-        return Err(format!("ddg: http {code}"));
-    }
-    Ok(String::from_utf8_lossy(&buf).into_owned())
-}
-
-/// DDG's anomaly/challenge interstitial, as opposed to a real empty result page.
-fn looks_like_challenge(body: &str) -> bool {
-    body.contains("anomaly") || body.contains("challenge-form")
-}
-
-/// Extract hits from the DDG html-endpoint page. Each result is a `div.result`
-/// carrying `a.result__a` (title text + a direct href) and `.result__snippet`.
-fn parse_ddg_html(body: &str, limit: usize) -> Vec<SearchHit> {
-    let doc = Html::parse_document(body);
-    // `unwrap` on static, known-good selectors — a parse failure here is a bug.
-    let result_sel = Selector::parse("div.result").unwrap();
-    let link_sel = Selector::parse("a.result__a").unwrap();
-    let snippet_sel = Selector::parse(".result__snippet").unwrap();
-
-    let mut hits = Vec::new();
-    for result in doc.select(&result_sel) {
-        let Some(link) = result.select(&link_sel).next() else {
-            continue; // ads / "no results" blocks carry no result__a
-        };
-        let url = link
-            .value()
-            .attr("href")
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        if url.is_empty() {
-            continue;
-        }
-        let title = collapse_ws(&link.text().collect::<String>());
-        let snippet = result
-            .select(&snippet_sel)
-            .next()
-            .map(|s| collapse_ws(&s.text().collect::<String>()))
-            .unwrap_or_default();
-        hits.push(SearchHit {
-            title,
-            url,
-            snippet,
-        });
-        if hits.len() >= limit {
-            break;
-        }
-    }
-    hits
-}
-
-/// Trim and collapse internal whitespace runs (DDG markup is heavily indented).
-fn collapse_ws(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed},
+        },
+        time::Duration,
+    };
 
-    const FIXTURE: &str = r#"
-    <div class="result results_links">
-      <h2 class="result__title">
-        <a rel="nofollow" class="result__a" href="https://tokio.rs/tokio/tutorial/async">Tokio async tutorial</a>
-      </h2>
-      <a class="result__snippet" href="https://tokio.rs">Learn async Rust with Tokio, a runtime for writing reliable network apps.</a>
-    </div>
-    <div class="result results_links">
-      <h2 class="result__title">
-        <a rel="nofollow" class="result__a" href="https://github.com/smol-rs/smol">smol-rs/smol</a>
-      </h2>
-      <a class="result__snippet">A small and fast async runtime.</a>
-    </div>
-    <div class="result result--ad"><span>an ad with no result__a</span></div>
-    "#;
+    use axum::{
+        Json, Router,
+        extract::State,
+        response::Html,
+        routing::{delete, get, post},
+        serve,
+    };
+    use octo_browser_runtime::MoliRuntime;
+    use reqwest::Url;
+    use serde_json::{Value, json};
+    use tokio::{
+        net::TcpListener,
+        spawn,
+        task::JoinHandle,
+        time::{sleep, timeout},
+    };
 
-    #[test]
-    fn parses_hits_and_skips_adlike_blocks() {
-        let hits = parse_ddg_html(FIXTURE, 10);
-        assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].url, "https://tokio.rs/tokio/tutorial/async");
-        assert_eq!(hits[0].title, "Tokio async tutorial");
-        assert!(hits[0].snippet.starts_with("Learn async Rust"));
-        assert_eq!(hits[1].url, "https://github.com/smol-rs/smol");
-        assert_eq!(hits[1].snippet, "A small and fast async runtime.");
-    }
+    use super::{DdgBackend, Driver, MORE_RESULTS, PageRange, SearchBackend};
 
-    #[test]
-    fn respects_limit() {
-        assert_eq!(parse_ddg_html(FIXTURE, 1).len(), 1);
-    }
+    const QUERY: &str = "SQLite database format";
+    const SNIPPET: &str = "A detailed excerpt. ";
 
-    #[test]
-    fn detects_the_challenge_page() {
-        assert!(looks_like_challenge("<html>…anomaly-modal…</html>"));
-        assert!(!looks_like_challenge(FIXTURE));
-    }
-
-    /// Live smoke test against DuckDuckGo — needs network and a *system* libcurl, so
-    /// it is ignored by default. Run with
-    /// `cargo test -p octo-connector-search -- --ignored`.
-    ///
-    /// Two ways this fails that are NOT a broken backend:
-    /// - **Rate limiting.** DDG throttles rapid repeats from one IP, so back-to-back
-    ///   runs can come back empty. Wait a moment and re-run before believing it.
-    /// - **A vendored libcurl.** A challenge/`202` failure usually means `curl-sys`
-    ///   vendored its own build (see the module's build trap) rather than DDG changing;
-    ///   the printed libcurl version tells you which build you linked.
     #[tokio::test]
-    #[ignore = "hits the network"]
-    async fn live_ddg_search_returns_hits() {
-        println!("linked libcurl: {}", libcurl_version());
-        let backend = DdgBackend::new(Duration::from_secs(20), None).unwrap();
-        let hits = backend.search("rust async runtime", 5).await.unwrap();
-        assert!(!hits.is_empty(), "expected some hits");
-        assert!(hits.iter().all(|h| h.url.starts_with("http")));
-        for h in &hits {
-            println!("- {} — {}", h.title, h.url);
-        }
+    #[ignore = "requires Moli on PATH"]
+    async fn moli_waits_for_the_next_document_before_reading_results() {
+        let app = Router::new()
+            .route(
+                "/first",
+                get(|| async { Html("<title>First query</title>") }),
+            )
+            .route(
+                "/second",
+                get(|| async {
+                    sleep(Duration::from_millis(300)).await;
+                    Html("<title>Second query</title>")
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = spawn(async move { serve(listener, app).await.unwrap() });
+        timeout(Duration::from_secs(8), async {
+            let browser = Driver::Moli(Arc::new(MoliRuntime::default()));
+            let session = browser.start().await.unwrap();
+            for (path, expected) in [("first", "First query"), ("second", "Second query")] {
+                session
+                    .navigate(&Url::parse(&format!("{base}/{path}")).unwrap())
+                    .await
+                    .unwrap();
+                let title: String = session
+                    .evaluate("return document.title;", 0, 10)
+                    .await
+                    .unwrap();
+                assert_eq!(title, expected);
+            }
+            session.close().await;
+        })
+        .await
+        .expect("navigation fixture timed out");
+        server.abort();
+    }
+
+    #[derive(Default)]
+    struct Calls {
+        started: AtomicUsize,
+        navigated: AtomicUsize,
+        clicked: AtomicUsize,
+        closed: AtomicUsize,
+        challenge: AtomicBool,
+    }
+
+    async fn fixture(challenge: bool) -> (DdgBackend, Arc<Calls>, JoinHandle<()>) {
+        let calls = Arc::new(Calls::default());
+        calls.challenge.store(challenge, Relaxed);
+        let app = Router::new()
+            .route(
+                "/wd/session",
+                post(
+                    |State(calls): State<Arc<Calls>>, Json(body): Json<Value>| async move {
+                        assert_eq!(
+                            body["capabilities"]["alwaysMatch"]["browserName"],
+                            "firefox"
+                        );
+                        calls.started.fetch_add(1, Relaxed);
+                        Json(json!({"value":{"sessionId":"fixture"}}))
+                    },
+                ),
+            )
+            .route(
+                "/wd/session/fixture/url",
+                post(
+                    |State(calls): State<Arc<Calls>>, Json(body): Json<Value>| async move {
+                        let url = Url::parse(body["url"].as_str().unwrap()).unwrap();
+                        assert_eq!(url.host_str(), Some("duckduckgo.com"));
+                        assert_eq!(url.path(), "/");
+                        assert_eq!(url.query_pairs().next().unwrap().1, QUERY);
+                        calls.navigated.fetch_add(1, Relaxed);
+                        Json(json!({"value":null}))
+                    },
+                ),
+            )
+            .route(
+                "/wd/session/fixture/execute/sync",
+                post(
+                    |State(calls): State<Arc<Calls>>, Json(body): Json<Value>| async move {
+                        let origin = body["args"][0].as_u64().unwrap() as usize;
+                        let limit = body["args"][1].as_u64().unwrap() as usize;
+                        let challenge = calls.challenge.load(Relaxed);
+                        let total = if challenge {
+                            0
+                        } else {
+                            10 * (1 + calls.clicked.load(Relaxed))
+                        };
+                        let hits: Vec<_> = (origin..(origin + limit).min(total))
+                            .map(|n| {
+                                json!({
+                                    "url": format!("https://example.com/{n}"),
+                                    "title": format!("Source {n}"),
+                                    "snippet": SNIPPET.repeat(80),
+                                })
+                            })
+                            .collect();
+                        Json(json!({"value":{
+                            "valid_origin":true, "challenge":challenge, "empty":false,
+                            "more":total == 10, "total":total, "hits":hits,
+                        }}))
+                    },
+                ),
+            )
+            .route(
+                "/wd/session/fixture/element",
+                post(|Json(body): Json<Value>| async move {
+                    assert_eq!(body["value"], MORE_RESULTS);
+                    Json(json!({"value":{"element-6066-11e4-a52e-4f735466cecf":"more"}}))
+                }),
+            )
+            .route(
+                "/wd/session/fixture/element/more/click",
+                post(|State(calls): State<Arc<Calls>>| async move {
+                    calls.clicked.fetch_add(1, Relaxed);
+                    Json(json!({"value":null}))
+                }),
+            )
+            .route(
+                "/wd/session/fixture",
+                delete(|State(calls): State<Arc<Calls>>| async move {
+                    calls.closed.fetch_add(1, Relaxed);
+                    Json(json!({"value":null}))
+                }),
+            )
+            .with_state(calls.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/wd/", listener.local_addr().unwrap());
+        let task = spawn(async move { serve(listener, app).await.unwrap() });
+        let backend =
+            DdgBackend::with_firefox(Some(&endpoint), Duration::from_secs(2), None).unwrap();
+        (backend, calls, task)
+    }
+
+    #[tokio::test]
+    async fn pages_reuse_the_browser_and_preserve_full_snippets() {
+        let (backend, calls, server) = fixture(false).await;
+        let first = backend.search_page(QUERY, 25, 1).await.unwrap();
+        assert_eq!(first.hits.len(), 10);
+        assert_eq!(first.hits[0].snippet, SNIPPET.repeat(80));
+        assert_eq!(first.next_page, Some(2));
+        let second = backend.search_page(QUERY, 25, 2).await.unwrap();
+        assert_eq!(second.hits.len(), 10);
+        assert_eq!(second.hits[0].url, "https://example.com/10");
+        assert_eq!(second.next_page, None);
+        assert_eq!(calls.started.load(Relaxed), 1);
+        assert_eq!(calls.navigated.load(Relaxed), 1);
+        assert_eq!(calls.clicked.load(Relaxed), 1);
+        backend.shutdown().await;
+        assert_eq!(calls.closed.load(Relaxed), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn captcha_is_reported_without_attempting_to_continue() {
+        let (backend, calls, server) = fixture(true).await;
+        let error = backend.search_page(QUERY, 10, 2).await.err().unwrap();
+        assert_eq!(error, "ddg: DuckDuckGo requested a CAPTCHA");
+        assert_eq!(calls.started.load(Relaxed), 1);
+        assert_eq!(calls.clicked.load(Relaxed), 0);
+        server.abort();
+    }
+
+    #[test]
+    fn page_range_rejects_overflow_and_page_zero() {
+        assert!(PageRange::new(usize::MAX, 10).is_err());
+        assert!(PageRange::new(0, 10).is_err());
     }
 }
