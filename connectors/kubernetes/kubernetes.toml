@@ -1,0 +1,5 @@
+[connector]
+id = "kubernetes"
+type = "kubernetes"
+# Optional default namespace. Omit to list across all authorized namespaces.
+# namespace = "default"
