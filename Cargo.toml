@@ -16,6 +16,7 @@ members = [
     "connectors/scheduler",
     "connectors/caldav",
     "connectors/storage",
+    "connectors/kubernetes",
     "connectors/sql",
     "connectors/forkd",
     "connectors/mail",
@@ -42,6 +43,7 @@ default-members = [
     "connectors/scheduler",
     "connectors/caldav",
     "connectors/storage",
+    "connectors/kubernetes",
     "connectors/search",
     "connectors/transcribe",
     "connectors/imagegen",
@@ -79,6 +81,8 @@ zendriver = "0.5.34"
 toml = "0.8"
 teloxide = "0.17"
 base64 = "0.22"
+kube = { version = "0.98", default-features = false, features = ["client", "config", "rustls-tls"] }
+k8s-openapi = { version = "0.24", features = ["v1_30"] }
 
 # SQLite connector: one native SQLite binding version shared with SQLx.
 sqlx = { version = "=0.8.6", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "sqlite-preupdate-hook"] }
