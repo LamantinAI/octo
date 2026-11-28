@@ -236,6 +236,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_namespace_rejected_for_nodes_before_object_read() {
+        let (client, server) = mock_client("200 OK", "{}").await;
+        let error = execute(
+            client,
+            GET,
+            &json!({"api_version":"v1","resource":"nodes","namespace":"demo","name":"node"}),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("omit namespace"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cached_discovery_is_reused_until_explicit_refresh() {
+        let (client, server) = mock_client("200 OK", r#"{"items":[],"metadata":{}}"#).await;
+        let cache = Cache::default();
+        for refresh in [false, false, true] {
+            execute_cached(
+                &cache,
+                client.clone(),
+                RESOURCES,
+                &json!({"api_version":"v1","refresh":refresh}),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        execute_cached(&cache, client, LIST, &json!({"resource":"pods"}), None)
+            .await
+            .unwrap();
+        let requests = timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.starts_with("GET /api/v1 "))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_page_preserves_cursor_and_discards_large_specs() {
+        let object = json!({"metadata":{"name":"one","namespace":"dev"},"spec":{"large":"x".repeat(270000)},"status":{"phase":"Running"}});
+        let body = json!({"items":[object],"metadata":{"continue":"next"}}).to_string();
+        let (client, server) = mock_client("200 OK", &body).await;
+        let page = execute(
+            client,
+            LIST,
+            &json!({"resource":"pods","compact":true}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(page["metadata"]["continue"], "next");
+        assert_eq!(
+            page["items"][0],
+            json!({"name":"one","namespace":"dev","phase":"Running"})
+        );
+        assert_eq!(
+            crate::response::bounded(object).unwrap_err().payload()["reason"],
+            "ResponseTooLarge"
+        );
+        timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn list_uses_all_namespace_endpoint_and_returns_continuation() {
         let (client, server) = mock_client(
             "200 OK",
